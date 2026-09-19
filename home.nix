@@ -69,6 +69,29 @@
     };
   };
 
+  # Signal is an Electron app, so its chat UI is web content and no GTK theme
+  # can reach it. The window frame is fixable though: on Wayland mutter draws
+  # no server-side decorations, so Electron falls back to drawing its own
+  # GTK3-styled titlebar, which matches nothing else on the desktop.
+  # --gtk-version=4 makes it load GTK4 and pick up Adwaita colors and metrics.
+  #
+  # This shadows signal.desktop from the package: entries in
+  # ~/.local/share/applications take precedence over the profile's copy.
+  #
+  # Alternative: --ozone-platform=x11 gets a real mutter-drawn Adwaita titlebar
+  # via XWayland, at the cost of screen sharing in calls only seeing XWayland
+  # windows.
+  xdg.desktopEntries.signal = {
+    name = "Signal";
+    comment = "Private messaging from your desktop";
+    exec = "signal-desktop --gtk-version=4 %U";
+    icon = "signal-desktop";
+    terminal = false;
+    categories = [ "Network" "InstantMessaging" "Chat" ];
+    mimeType = [ "x-scheme-handler/sgnl" "x-scheme-handler/signalcaptcha" ];
+    settings.StartupWMClass = "signal";
+  };
+
   home.sessionVariables = {
     EDITOR = "nano";
   };
