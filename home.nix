@@ -28,6 +28,8 @@
     vscode
     discord
     signal-desktop
+    gnome-secrets   # KeePass-format password manager (libadwaita)
+    resources       # system monitor (GNOME Circle)
     bottles
 
     # Nix tooling
