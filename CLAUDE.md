@@ -42,11 +42,6 @@ Examples:
 
 - **This repository is public.** Never commit secrets, tokens, or the user's
   work email address. The git identity here is `lucsoft <mail@lucsoft.de>`.
-- **Steam must stay a system module** (`programs.steam.enable` in
-  `configuration.nix`) and must never move into `home.packages`. It needs
-  32-bit graphics drivers, controller udev rules and firewall ports, none of
-  which Home Manager can provide — there is no `programs.steam` in Home
-  Manager.
 - `stateVersion` in both `home.nix` and `configuration.nix` is a
   compatibility marker, not a version to bump.
 
