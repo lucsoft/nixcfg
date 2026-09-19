@@ -103,8 +103,8 @@
   # Install firefox.
   programs.firefox = {
     enable = true;
-    # Das nixpkgs-Firefox ist ein en-US-Build. Die deutsche Oberflaeche
-    # kommt erst mit dem Sprachpaket + angeforderter Locale.
+    # The nixpkgs Firefox is an en-US build. The German interface needs
+    # both the language pack and a requested locale.
     languagePacks = [ "de" ];
     preferences = {
       "intl.locale.requested" = "de,en-US";
