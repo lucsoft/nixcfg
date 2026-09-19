@@ -10,6 +10,28 @@
 # Options: https://home-manager-options.extranix.com/
 
 { config, pkgs, ... }:
+# Bottles is pulled from a second, separately pinned nixpkgs. The 63.2 that
+# nixos-26.05 ships cannot reach its own servers: Cloudflare now answers the
+# User-Agent-less requests it sends with 403, so it reports itself offline,
+# never installs a runner, and the first-run wizard dies at its last step.
+# 67.4 fixes that upstream — it sends a User-Agent and pings a list of hosts
+# instead of one dead one — and exists only on unstable.
+#
+# Pinned to an exact commit, like system.nix, so it cannot drift. To move it:
+#   1. Pick a commit from github.com/NixOS/nixpkgs/commits/nixos-unstable
+#   2. nix-prefetch-url --unpack https://github.com/NixOS/nixpkgs/archive/<rev>.tar.gz
+#   3. Update rev/sha256 below, then rebuild
+#
+# Drop this whole pin once the stable channel carries 67.4 or newer.
+let
+  unstableRev = "e554fab72f81915600f3f449b786fd9af40439a5";
+
+  unstable = import (builtins.fetchTarball {
+    # nixos-unstable as of 2026-09-19
+    url = "https://github.com/NixOS/nixpkgs/archive/${unstableRev}.tar.gz";
+    sha256 = "08qq3a6ry3sjm916cgwgd5421fddpk5jic8j4ssll9c8zmxm9a34";
+  }) { };
+in
 
 {
   home.username = "lucsoft";
@@ -30,7 +52,10 @@
     signal-desktop
     gnome-secrets   # KeePass-format password manager (libadwaita)
     resources       # system monitor (GNOME Circle)
-    bottles
+    # From the unstable pin above, not this channel's broken 63.2.
+    # removeWarningPopup drops the "unsupported environment" dialog nixpkgs
+    # adds; Bottles upstream only supports its own Flatpak build.
+    (unstable.bottles.override { removeWarningPopup = true; })
 
     # Nix tooling
     nixd        # language server
@@ -40,6 +65,11 @@
     btop
     fastfetch
     claude-code
+
+    # wl-copy/wl-paste. A Wayland session ships no clipboard CLI at all, so
+    # terminal programs cannot read the clipboard — this is what lets
+    # claude-code paste a screenshot instead of silently ignoring Ctrl+V.
+    wl-clipboard
   ];
 
   # NOTE: `steam` is deliberately NOT here. It must stay a system-level module

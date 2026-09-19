@@ -1,7 +1,8 @@
 # nixcfg
 
 Personal Nix configuration for my NixOS machine. NixOS 26.05, channel-free,
-no flakes — nixpkgs is pinned by commit in `system.nix`.
+no flakes — nixpkgs is pinned by commit in `system.nix`, plus a second pin in
+`home.nix` for one package.
 
 ## Layout
 
@@ -35,6 +36,17 @@ drifts on its own. To move forward:
 3. Update `rev`, `sha256` and `versionSuffix` in `system.nix`, then rebuild
 
 Home Manager still tracks its own `release-26.05` channel separately.
+
+### The second pin
+
+`home.nix` pins a *second* nixpkgs, on `nixos-unstable`, used for exactly one
+package: Bottles. The 63.2 that 26.05 ships is unusable — Cloudflare rejects
+the User-Agent-less requests it makes, so it reports itself permanently
+offline and can never install a runner. 67.4 fixes that upstream.
+
+It moves the same way as the main pin, against
+<https://github.com/NixOS/nixpkgs/commits/nixos-unstable>, and the whole `let`
+block should be deleted once the stable channel carries 67.4 or newer.
 
 ## Notes
 
