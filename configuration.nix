@@ -101,7 +101,15 @@
   programs.gamemode.enable = true;
 
   # Install firefox.
-  programs.firefox.enable = true;
+  programs.firefox = {
+    enable = true;
+    # Das nixpkgs-Firefox ist ein en-US-Build. Die deutsche Oberflaeche
+    # kommt erst mit dem Sprachpaket + angeforderter Locale.
+    languagePacks = [ "de" ];
+    preferences = {
+      "intl.locale.requested" = "de,en-US";
+    };
+  };
 
   # Allow unfree packages
   nixpkgs.config.allowUnfree = true;
