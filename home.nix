@@ -52,6 +52,7 @@ in
     signal-desktop
     gnome-secrets   # KeePass-format password manager (libadwaita)
     resources       # system monitor (GNOME Circle)
+
     # From the unstable pin above, not this channel's broken 63.2.
     # removeWarningPopup drops the "unsupported environment" dialog nixpkgs
     # adds; Bottles upstream only supports its own Flatpak build.
@@ -71,6 +72,29 @@ in
     # claude-code paste a screenshot instead of silently ignoring Ctrl+V.
     wl-clipboard
   ];
+
+  # GNOME Shell extensions. This module installs the packages *and* writes
+  # enabled-extensions, taking each UUID from the package's extensionUuid —
+  # a Shell loads nothing that is not in that list, and the UUIDs are not
+  # worth typing by hand.
+  programs.gnome-shell = {
+    enable = true;
+    extensions = [
+      # Wine registers its tray icons over XEmbed. GNOME dropped XEmbed tray
+      # support in 3.26, so with nothing to dock into, Wine parks them in a
+      # standalone floating window — the boxes next to every Bottles prefix.
+      # This brings XEmbed back (trayIconsManager.js, IndicatorStatusTrayIcon)
+      # alongside its nominal job, AppIndicator and KStatusNotifierItem.
+      #
+      # extensions.gnome.org still serves v64, which stops at Shell 50.
+      # Upstream added 51 in July 2026 and tagged it v65; nixpkgs packages
+      # from e.g.o, so it arrives here once that publish goes through.
+      { package = pkgs.gnomeExtensions.appindicator; }
+
+      # Hide and tweak Shell UI elements.
+      { package = pkgs.gnomeExtensions.just-perfection; }
+    ];
+  };
 
   # NOTE: `steam` is deliberately NOT here. It must stay a system-level module
   # (programs.steam.enable) because it needs 32-bit graphics drivers, controller
