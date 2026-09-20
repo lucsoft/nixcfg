@@ -17,6 +17,48 @@
   # Use latest kernel.
   boot.kernelPackages = pkgs.linuxPackages_latest;
 
+  # Suspend/resume workaround. On 2026-09-20 the machine logged
+  # "PM: suspend entry (deep)" at 00:47 and never came back: the board
+  # stayed powered with no display and no input until a hard power-cycle,
+  # and nothing reached the journal because the hang happened before
+  # userspace thawed. Two separate things are handled here.
+  #
+  # mem_sleep_default=s2idle skips the S3 device re-init path altogether.
+  # This box drives two amdgpu devices (a discrete Navi 32 and the Raphael
+  # iGPU), and the firmware already aborts \_SB.ALIB and \_SB.PMF._DSM with
+  # AE_AML_LOOP_TIMEOUT on every boot, so the deep-sleep handoff is not
+  # trustworthy on this board.
+  #
+  # no_console_suspend keeps the console alive across the transition, so a
+  # repeat hang leaves something on screen instead of vanishing silently.
+  boot.kernelParams = [ "mem_sleep_default=s2idle" "no_console_suspend" ];
+
+  # The 2.4 GHz mouse receiver is what woke the machine overnight — a sensor
+  # twitch or RF noise on the dongle is enough. Drop it as a wake source;
+  # the keyboard still wakes the machine.
+  services.udev.extraRules = ''
+    ACTION=="add", SUBSYSTEM=="usb", ATTR{idVendor}=="1ea7", ATTR{idProduct}=="0066", ATTR{power/wakeup}="disabled"
+  '';
+
+  # Arm the PM trace buffer on every boot. When a resume hangs, nothing can
+  # reach the journal — userspace is still frozen — but pm_trace stashes a
+  # hash of the last device resume callback in the RTC, where it survives a
+  # hard power-cycle and is printed on the next boot:
+  #
+  #   sudo dmesg | grep -iE 'hash matches|Magic number'
+  #
+  # The cost is that a hang scrambles the RTC clock; NTP fixes it shortly
+  # after the next boot. Drop this unit once suspend is reliable again.
+  systemd.services.arm-pm-trace = {
+    description = "Arm PM trace to debug resume hangs";
+    wantedBy = [ "multi-user.target" ];
+    serviceConfig = {
+      Type = "oneshot";
+      RemainAfterExit = true;
+    };
+    script = "echo 1 > /sys/power/pm_trace";
+  };
+
   networking.hostName = "nixos"; # Define your hostname.
   # networking.wireless.enable = true;  # Enables wireless support via wpa_supplicant.
 
