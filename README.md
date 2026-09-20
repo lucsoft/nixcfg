@@ -9,7 +9,7 @@ no flakes — nixpkgs is pinned by commit in `system.nix`, plus a second pin in
 | file | what it covers |
 |---|---|
 | `system.nix` | entry point — pins nixpkgs, imports `configuration.nix` |
-| `configuration.nix` | the machine: kernel, GNOME, pipewire, Steam, user account |
+| `configuration.nix` | the machine: boot, GNOME, pipewire, Steam, user account |
 | `hardware-configuration.nix` | generated hardware scan (filesystems, kernel modules) |
 | `power.nix` | suspend/resume workarounds — transitional, see the file |
 | `home.nix` | Home Manager — my packages, dotfiles and user settings |
