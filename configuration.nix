@@ -6,6 +6,7 @@
   imports = [
     ./hardware-configuration.nix
     ./power.nix         # suspend workarounds, all transitional
+    ./performance.nix   # CachyOS-style tuning, as an opt-in boot entry
   ];
 
   boot.loader.systemd-boot.enable = true;
