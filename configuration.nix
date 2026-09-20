@@ -8,6 +8,7 @@
   imports =
     [ # Include the results of the hardware scan.
       ./hardware-configuration.nix
+      ./power.nix
     ];
 
   # Use the systemd-boot EFI boot loader.
@@ -16,48 +17,6 @@
 
   # Use latest kernel.
   boot.kernelPackages = pkgs.linuxPackages_latest;
-
-  # On 2026-09-20 this machine hung resuming from S3. It entered
-  # "PM: suspend entry (deep)" at 00:47 and never came back, sitting powered
-  # with no display and no input until a hard power-cycle. Nothing reached
-  # the journal, because the hang was over before userspace thawed.
-  #
-  # The cause was firmware. BIOS 3.50 aborted \_SB.ALIB and \_SB.PMF._DSM
-  # with AE_AML_LOOP_TIMEOUT on every boot — AMD's own power-handoff ACPI
-  # methods, sitting on exactly the path that failed. BIOS 4.43 clears all
-  # four errors and S3 suspend/resume completes cleanly again, so no
-  # mem_sleep_default override is needed here: deep is the default already.
-  #
-  # no_console_suspend stays for now. It keeps the console alive across the
-  # transition, so a regression leaves something on screen instead of
-  # vanishing silently. Safe to drop once sleep has been reliable a while.
-  boot.kernelParams = [ "no_console_suspend" ];
-
-  # The 2.4 GHz mouse receiver is what woke the machine overnight — a sensor
-  # twitch or RF noise on the dongle is enough. Drop it as a wake source;
-  # the keyboard still wakes the machine.
-  services.udev.extraRules = ''
-    ACTION=="add", SUBSYSTEM=="usb", ATTR{idVendor}=="1ea7", ATTR{idProduct}=="0066", ATTR{power/wakeup}="disabled"
-  '';
-
-  # Arm the PM trace buffer on every boot. When a resume hangs, nothing can
-  # reach the journal — userspace is still frozen — but pm_trace stashes a
-  # hash of the last device resume callback in the RTC, where it survives a
-  # hard power-cycle and is printed on the next boot:
-  #
-  #   sudo dmesg | grep -iE 'hash matches|Magic number'
-  #
-  # The cost is that a hang scrambles the RTC clock; NTP fixes it shortly
-  # after the next boot. Drop this unit once suspend is reliable again.
-  systemd.services.arm-pm-trace = {
-    description = "Arm PM trace to debug resume hangs";
-    wantedBy = [ "multi-user.target" ];
-    serviceConfig = {
-      Type = "oneshot";
-      RemainAfterExit = true;
-    };
-    script = "echo 1 > /sys/power/pm_trace";
-  };
 
   networking.hostName = "nixos"; # Define your hostname.
   # networking.wireless.enable = true;  # Enables wireless support via wpa_supplicant.
