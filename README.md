@@ -12,8 +12,6 @@ no flakes — nixpkgs is pinned by commit in `system.nix`, plus a second pin in
 | `configuration.nix` | the machine: boot, GNOME, pipewire, Steam, user account |
 | `hardware-configuration.nix` | generated hardware scan (filesystems, kernel modules) |
 | `power.nix` | suspend/resume workarounds — transitional, see the file |
-| `performance.nix` | CachyOS-style tuning, as an opt-in `cachy` boot entry |
-| `bench.sh` | A/B benchmark harness for that entry |
 | `home.nix` | Home Manager — my packages, dotfiles and user settings |
 
 `~/.config/home-manager` is a symlink to this repo, so Home Manager picks
@@ -52,37 +50,16 @@ It moves the same way as the main pin, against
 block should be deleted once the stable channel carries 67.4 or newer.
 
 
-## Performance tuning
-
-`performance.nix` carries a CachyOS-style tuning set — sched_ext, zram,
-CachyOS's own ananicy rules, their sysctls, `preempt=full`. It is not applied
-to the running system. It is a `specialisation`, so a rebuild adds a second
-entry to the boot menu:
-
-    NixOS
-    NixOS (cachy)          <- the tuned one
-
-Both entries share one userland, down to the store path of every binary. That
-makes the tuning measurable in a way a CachyOS-vs-NixOS comparison never is,
-because only the tuned knobs differ between the two boots.
-
-    ./bench.sh             # run the suite, tagged with whichever entry booted
-    ./bench.sh compare     # newest baseline run vs newest cachy run
-
-Results land in `bench-results/` (gitignored). The suite takes about four
-minutes and saturates every core, so run it on an idle machine. It opens with
-two control metrics that the tuning does not touch — if those move between
-boots, the run was noisy and nothing else in the table is worth reading.
-
-To promote the tuning to the default once it has earned it, move `tuning` out
-of `specialisation` and into the module's own body; the file is written so
-that is the only edit needed.
-
-`bench-results/baseline-20260920-121826.tsv` is a first baseline measured
-while this was being set up, not on a fully quiet machine. Re-run it before
-trusting a close result.
 ## Notes
 
+- **zram, not a swap partition.** The machine had no swap at all, which
+  means no way to evict anonymous pages — straight from thrashing the page
+  cache to the OOM killer. The `vm.*` sysctls next to it exist to suit zram
+  (`swappiness = 100`, `page-cluster = 0`) and are not meaningful without it.
+- A CachyOS-style tuning specialisation — sched_ext, ananicy, `preempt=full`
+  — lived here briefly and was removed in the commit after it was added. The
+  benchmarks were inconclusive; see that commit message for the numbers, and
+  `git show` it to get `performance.nix` and `bench.sh` back.
 - **Steam must be a system module** (`programs.steam.enable`), never a package
   in `home.packages`. It needs 32-bit graphics drivers, controller udev rules
   and firewall ports — Home Manager has no `programs.steam` and cannot provide
