@@ -123,6 +123,12 @@ in
 
       # Hide and tweak Shell UI elements.
       { package = pkgs.gnomeExtensions.just-perfection; }
+
+      # Blur behind the panel, the overview and the dash.
+      { package = pkgs.gnomeExtensions.blur-my-shell; }
+
+      # Turn the overview dash into a permanent dock.
+      { package = pkgs.gnomeExtensions.dash-to-dock; }
     ];
   };
 
