@@ -1,54 +1,49 @@
 # nixcfg
 
 Personal Nix configuration for my NixOS machine. NixOS 26.05, channel-free,
-no flakes — nixpkgs is pinned by commit in `system.nix`, plus a second pin in
-`home.nix` for one package.
+no flakes — nixpkgs and Home Manager are pinned by [npins](https://github.com/andir/npins)
+in `npins/sources.json`.
+
+## The machine
+
+| part | what |
+|---|---|
+| CPU | AMD Ryzen 7 7800X3D — 8 cores, 16 threads |
+| GPU | Radeon RX 7800 XT, 16 GB (Navi 32) |
+| iGPU | Raphael, on the 7800X3D die — present, not driving anything |
+| RAM | 32 GB |
+| Board | ASRock B650I Lightning WiFi (mini-ITX), BIOS 4.43 |
+| Storage | Samsung 990 PRO 2 TB NVMe — single ext4 root, no swap partition |
+| Network | Realtek 2.5G (`r8169`), MediaTek MT7921 Wi-Fi/Bluetooth (`mt7921e`) |
+| Display | one, over DisplayPort |
+
+Both GPUs are AMD, so both run on in-tree `amdgpu` and Mesa. Nothing in this
+repo configures graphics — there is no proprietary driver to pull in.
+
+What the hardware explains elsewhere in the config:
+
+- `zramSwap.memoryPercent = 50` is a fraction of the 32 GB, so the compressed
+  swap lands at ~15 GiB. The number moves if the RAM does.
+- `power.nix` is entirely about this board's S3 suspend. BIOS 4.43 is the
+  version that fixed it; anything older hangs on resume.
+- `kvm-amd` and the AMD microcode line in `hardware-configuration.nix` come
+  from the hardware scan and follow the CPU.
 
 ## Layout
 
 | file | what it covers |
 |---|---|
-| `system.nix` | entry point — pins nixpkgs, imports `configuration.nix` |
+| `system.nix` | entry point — imports `configuration.nix` against the pinned nixpkgs |
 | `configuration.nix` | the machine: boot, GNOME, pipewire, Steam, user account |
 | `hardware-configuration.nix` | generated hardware scan (filesystems, kernel modules) |
 | `power.nix` | suspend/resume workarounds — transitional, see the file |
 | `home.nix` | Home Manager — my packages, dotfiles and user settings |
+| `npins/sources.json` | the pins: nixpkgs, nixpkgs-unstable, home-manager |
+
+`npins/default.nix` is generated — never edit it by hand.
 
 `~/.config/home-manager` is a symlink to this repo, so Home Manager picks
 `home.nix` up directly.
-
-## Applying changes
-
-```sh
-home-manager switch                      # user config — no sudo
-sudo nixos-rebuild switch --file ~/nixcfg   # system config
-```
-
-The `--file` flag matters: without it, `nixos-rebuild` falls back to
-`/etc/nixos/configuration.nix`, which is not this file.
-
-## Updating nixpkgs
-
-Everything is pinned to one commit in `system.nix`, so the system never
-drifts on its own. To move forward:
-
-1. Pick a commit from <https://github.com/NixOS/nixpkgs/commits/nixos-26.05>
-2. `nix-prefetch-url --unpack https://github.com/NixOS/nixpkgs/archive/<rev>.tar.gz`
-3. Update `rev`, `sha256` and `versionSuffix` in `system.nix`, then rebuild
-
-Home Manager still tracks its own `release-26.05` channel separately.
-
-### The second pin
-
-`home.nix` pins a *second* nixpkgs, on `nixos-unstable`, used for exactly one
-package: Bottles. The 63.2 that 26.05 ships is unusable — Cloudflare rejects
-the User-Agent-less requests it makes, so it reports itself permanently
-offline and can never install a runner. 67.4 fixes that upstream.
-
-It moves the same way as the main pin, against
-<https://github.com/NixOS/nixpkgs/commits/nixos-unstable>, and the whole `let`
-block should be deleted once the stable channel carries 67.4 or newer.
-
 
 ## Notes
 
@@ -64,6 +59,11 @@ block should be deleted once the stable channel carries 67.4 or newer.
   in `home.packages`. It needs 32-bit graphics drivers, controller udev rules
   and firewall ports — Home Manager has no `programs.steam` and cannot provide
   any of that.
+- **A second nixpkgs pin exists for one package.** `nixpkgs-unstable` is there
+  only for Bottles: the 63.2 in 26.05 makes User-Agent-less requests that
+  Cloudflare rejects, so it reports itself permanently offline and can never
+  install a runner. 67.4 fixes it. The pin and the override in `home.nix` go
+  once stable catches up.
 - `home.stateVersion` / `system.stateVersion` are compatibility markers, not
   versions to bump.
 - NixOS 26.05 reaches end of life on 2026-12-31.

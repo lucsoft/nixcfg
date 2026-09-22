@@ -2,6 +2,10 @@
 
 { config, pkgs, ... }:
 
+let
+  sources = import ./npins;
+in
+
 {
   imports = [
     ./hardware-configuration.nix
@@ -105,6 +109,13 @@
   };
 
   nixpkgs.config.allowUnfree = true;
+
+  # Point <nixpkgs> at the pinned tree. NixOS defaults it to root's channel
+  # profile, which nothing in this repo maintains — it holds whatever the
+  # installer fetched and `nix-channel --update` last left there. That path is
+  # what standalone Home Manager builds against, so without this line
+  # `home-manager switch` builds against a different nixpkgs than the system.
+  nix.nixPath = [ "nixpkgs=${sources.nixpkgs}" ];
 
   # Compatibility marker, not a version to bump.
   system.stateVersion = "26.05";

@@ -10,34 +10,35 @@
 # Options: https://home-manager-options.extranix.com/
 
 { config, pkgs, ... }:
-# Bottles is pulled from a second, separately pinned nixpkgs. The 63.2 that
-# nixos-26.05 ships cannot reach its own servers: Cloudflare now answers the
-# User-Agent-less requests it sends with 403, so it reports itself offline,
-# never installs a runner, and the first-run wizard dies at its last step.
-# 67.4 fixes that upstream — it sends a User-Agent and pings a list of hosts
-# instead of one dead one — and exists only on unstable.
-#
-# Pinned to an exact commit, like system.nix, so it cannot drift. To move it:
-#   1. Pick a commit from github.com/NixOS/nixpkgs/commits/nixos-unstable
-#   2. nix-prefetch-url --unpack https://github.com/NixOS/nixpkgs/archive/<rev>.tar.gz
-#   3. Update rev/sha256 below, then rebuild
-#
-# Drop this whole pin once the stable channel carries 67.4 or newer.
-let
-  unstableRev = "e554fab72f81915600f3f449b786fd9af40439a5";
 
-  unstable = import (builtins.fetchTarball {
-    # nixos-unstable as of 2026-09-19
-    url = "https://github.com/NixOS/nixpkgs/archive/${unstableRev}.tar.gz";
-    sha256 = "08qq3a6ry3sjm916cgwgd5421fddpk5jic8j4ssll9c8zmxm9a34";
-  }) { };
+let
+  sources = import ./npins;
+
+  # Bottles comes from a second, separately pinned nixpkgs. The 63.2 that
+  # nixos-26.05 ships cannot reach its own servers: Cloudflare now answers the
+  # User-Agent-less requests it sends with 403, so it reports itself offline,
+  # never installs a runner, and the first-run wizard dies at its last step.
+  # 67.4 fixes that upstream — it sends a User-Agent and pings a list of hosts
+  # instead of one dead one — and exists only on unstable.
+  #
+  # Drop this, its pin (`npins remove nixpkgs-unstable`) and the override
+  # below once the stable channel carries 67.4 or newer.
+  unstable = import sources.nixpkgs-unstable { };
 in
 
 {
   home.username = "lucsoft";
   home.homeDirectory = "/home/lucsoft";
 
-  programs.home-manager.enable = true;
+  # Home Manager itself is pinned too, so `home-manager switch` cannot drift
+  # either. This bakes the path into the installed CLI, which otherwise looks
+  # up <home-manager> in NIX_PATH and finds the nix-channel copy. The channel
+  # is what evaluates the *first* switch after this lands; every one after
+  # that uses the pin, so `nix-channel --remove home-manager` is safe then.
+  programs.home-manager = {
+    enable = true;
+    path = "${sources.home-manager}";
+  };
 
   # vscode and discord are unfree.
   nixpkgs.config.allowUnfree = true;
@@ -59,6 +60,7 @@ in
     (unstable.bottles.override { removeWarningPopup = true; })
 
     # Nix tooling
+    npins       # updates the pins in npins/sources.json
     nixd        # language server
     nixfmt      # formatter
 
