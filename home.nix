@@ -232,6 +232,20 @@ in
     };
   };
 
+  # Discord ships one 256x256 PNG of its logo on a bare circle, the odd one out
+  # in a dock of rounded-square Adwaita icons. These shadow it under the same
+  # icon name, because ~/.local/share/icons is searched before the profile.
+  #
+  # Both directories are needed. Icon lookup scores an exact size match above
+  # a scalable one, so the package's PNG still wins any request for exactly
+  # 256 — which is not what the dock asks for, but is what a few dialogs do.
+  # The second copy takes that slot away; the extension does not have to match
+  # the directory's name, only the size it stands for.
+  xdg.dataFile."icons/hicolor/scalable/apps/discord.svg".source =
+    ./icons/discord.svg;
+  xdg.dataFile."icons/hicolor/256x256/apps/discord.svg".source =
+    ./icons/discord.svg;
+
   home.sessionVariables = {
     EDITOR = "nano";
   };
