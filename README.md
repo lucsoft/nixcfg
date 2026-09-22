@@ -44,26 +44,3 @@ What the hardware explains elsewhere in the config:
 
 `~/.config/home-manager` is a symlink to this repo, so Home Manager picks
 `home.nix` up directly.
-
-## Notes
-
-- **zram, not a swap partition.** The machine had no swap at all, which
-  means no way to evict anonymous pages — straight from thrashing the page
-  cache to the OOM killer. The `vm.*` sysctls next to it exist to suit zram
-  (`swappiness = 100`, `page-cluster = 0`) and are not meaningful without it.
-- A CachyOS-style tuning specialisation — sched_ext, ananicy, `preempt=full`
-  — lived here briefly and was removed in the commit after it was added. The
-  benchmarks were inconclusive; see that commit message for the numbers, and
-  `git show` it to get `performance.nix` and `bench.sh` back.
-- **Steam must be a system module** (`programs.steam.enable`), never a package
-  in `home.packages`. It needs 32-bit graphics drivers, controller udev rules
-  and firewall ports — Home Manager has no `programs.steam` and cannot provide
-  any of that.
-- **A second nixpkgs pin exists for one package.** `nixpkgs-unstable` is there
-  only for Bottles: the 63.2 in 26.05 makes User-Agent-less requests that
-  Cloudflare rejects, so it reports itself permanently offline and can never
-  install a runner. 67.4 fixes it. The pin and the override in `home.nix` go
-  once stable catches up.
-- `home.stateVersion` / `system.stateVersion` are compatibility markers, not
-  versions to bump.
-- NixOS 26.05 reaches end of life on 2026-12-31.

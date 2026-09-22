@@ -95,3 +95,16 @@ To see what a pin actually changed, before switching:
         store diff-closures /run/current-system ./result
 
 `nix-command` is not enabled on this machine, hence the flag.
+
+## Worth knowing
+
+- **NixOS 26.05 reaches end of life on 2026-12-31.** The pins, both
+  `stateVersion` markers and the Bottles workaround are all tied to that
+  release.
+- **A CachyOS-style tuning specialisation has already been tried** —
+  sched_ext, ananicy, `preempt=full`. It lived in the tree briefly and was
+  removed in the commit right after the one that added it, because the
+  benchmarks came out inconclusive; that commit message carries the numbers.
+  `git log --oneline --all -- performance.nix` finds it, and `git show` on
+  that commit brings `performance.nix` and `bench.sh` back. Do not re-add any
+  of it without new measurements.
