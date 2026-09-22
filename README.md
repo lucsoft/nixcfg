@@ -20,15 +20,6 @@ in `npins/sources.json`.
 Both GPUs are AMD, so both run on in-tree `amdgpu` and Mesa. Nothing in this
 repo configures graphics — there is no proprietary driver to pull in.
 
-What the hardware explains elsewhere in the config:
-
-- `zramSwap.memoryPercent = 50` is a fraction of the 32 GB, so the compressed
-  swap lands at ~15 GiB. The number moves if the RAM does.
-- `power.nix` is entirely about this board's S3 suspend. BIOS 4.43 is the
-  version that fixed it; anything older hangs on resume.
-- `kvm-amd` and the AMD microcode line in `hardware-configuration.nix` come
-  from the hardware scan and follow the CPU.
-
 ## Layout
 
 | file | what it covers |
