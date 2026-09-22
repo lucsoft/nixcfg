@@ -69,6 +69,9 @@ in
   services.xserver.xkb.layout = "de";
   console.keyMap = "de";
 
+  # GNOME Web. Firefox is the browser here — see xdg.mimeApps in home.nix.
+  environment.gnome.excludePackages = [ pkgs.epiphany ];
+
   services.printing.enable = true;
 
   services.pulseaudio.enable = false;

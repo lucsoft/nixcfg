@@ -210,6 +210,25 @@ in
     settings.StartupWMClass = "signal";
   };
 
+  # Firefox as the browser. Excluding GNOME Web already leaves it the only
+  # handler for http/https, but that makes the default an accident of
+  # mimeinfo.cache ordering rather than a decision, so state it.
+  #
+  # This module owns ~/.config/mimeapps.list outright, so anything that used
+  # to write that file by hand belongs here now — hence claude-cli, which
+  # Claude Code registered there for its `claude-cli://` links.
+  xdg.mimeApps = {
+    enable = true;
+    defaultApplications = {
+      "text/html" = "firefox.desktop";
+      "x-scheme-handler/http" = "firefox.desktop";
+      "x-scheme-handler/https" = "firefox.desktop";
+      "x-scheme-handler/about" = "firefox.desktop";
+      "x-scheme-handler/unknown" = "firefox.desktop";
+      "x-scheme-handler/claude-cli" = "claude-code-url-handler.desktop";
+    };
+  };
+
   home.sessionVariables = {
     EDITOR = "nano";
   };
