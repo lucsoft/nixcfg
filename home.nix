@@ -130,6 +130,34 @@ in
   # (programs.steam.enable) because it needs 32-bit graphics drivers, controller
   # udev rules and firewall ports — none of which Home Manager can provide.
 
+  # Background update check. `npins-ui --check` probes a throwaway copy of the
+  # lock file, so it writes nothing and needs no privileges. It exits 10 when
+  # a pin can move, and only that exit code becomes a notification — a real
+  # failure (no network, forge down) stays in the journal instead of nagging.
+  systemd.user.services.npins-check = {
+    Unit.Description = "Check whether the npins pins can move";
+    Service = {
+      Type = "oneshot";
+      ExecStart = toString (pkgs.writeShellScript "npins-check" ''
+        out=$(${npins-ui}/bin/npins-ui --check ${config.home.homeDirectory}/nixcfg)
+        [ $? -eq 10 ] || exit 0
+        ${pkgs.libnotify}/bin/notify-send \
+          --app-name=Pins --icon=de.lucsoft.NpinsUi \
+          "Updates available" "$out"
+      '');
+    };
+  };
+
+  systemd.user.timers.npins-check = {
+    Unit.Description = "Check whether the npins pins can move";
+    Timer = {
+      OnStartupSec = "10m";      # not during login, the session is busy
+      OnUnitActiveSec = "6h";
+      Persistent = true;         # catch up after the machine was asleep
+    };
+    Install.WantedBy = [ "timers.target" ];
+  };
+
   # ---------------------------------------------------------------------------
   # Dotfiles
   # ---------------------------------------------------------------------------
