@@ -464,7 +464,11 @@ def rebuild_steps(repo):
             PKEXEC, NIXOS_REBUILD, "switch",
             "--file", str(repo), "--log-format", "internal-json",
         ]),
-        ("Building your home", ["home-manager", "switch"]),
+        # -f matters as much as --file above. Without it home-manager takes
+        # ~/.config/home-manager/home.nix no matter which repo this window is
+        # pointed at, so the two steps would build from different trees.
+        ("Building your home", ["home-manager", "switch",
+                                "-f", str(Path(repo) / "home.nix")]),
     ]
 
 
