@@ -96,6 +96,35 @@ To see what a pin actually changed, before switching:
 
 `nix-command` is not enabled on this machine, hence the flag.
 
+## Previewing the boot splash
+
+The theme in `plymouth/` can be looked at without rebooting: `plymouthd`
+picks its X11 renderer whenever `DISPLAY` is set, and draws into a window
+instead of the framebuffer. It insists on being root and on `/run/plymouth`,
+both of which a user namespace can fake:
+
+    bwrap --dev-bind / / --unshare-user --uid 0 --gid 0 \
+      --tmpfs /run --bind /run/user/1000 /run/user/1000 \
+      --tmpfs /etc --bind /etc/fonts /etc/fonts --bind "$conf" /etc/plymouth \
+      sh -c 'mkdir -p /run/plymouth
+             ln -s "$theme"/share/plymouth/themes /run/plymouth/themes
+             ln -s "$plymouth"/lib/plymouth /run/plymouth/plugins
+             plymouthd --no-daemon --mode=boot'
+
+`$conf` is a directory holding a `plymouthd.conf` with `Theme=nixos` and the
+`logo.png`; `/run` has to be a tmpfs because the real one is root-owned, which
+also means `PATH` loses `/run/current-system/sw/bin`. Then, from outside:
+
+    plymouth show-splash
+    plymouth update --status=NetworkManager.service   # what systemd sends
+    plymouth display-message --text="..."
+    plymouth quit
+
+Screenshot the window with `import -window "$(xwininfo -root -children |
+grep plymouthd)"`. Errors from the theme script only show up with
+`--kernel-command-line='splash plymouth.debug=stream:/tmp/plyd.log'`, because
+`--debug` alone tries to write to `/dev/tty`.
+
 ## Worth knowing
 
 - **NixOS 26.05 reaches end of life on 2026-12-31.** The pins, both

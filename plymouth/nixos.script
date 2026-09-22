@@ -1,0 +1,145 @@
+# The boot splash: logo, progress bar, and the unit systemd is bringing up.
+#
+# systemd hands plymouth every unit id as that unit finishes starting
+# (manager_send_unit_plymouth in src/core/unit.c), and plymouth passes it to
+# the theme as an update status. The stock graphical themes — bgrt, spinner,
+# spinfinity — all run on the two-step plugin, whose update_status() is an
+# empty function, so those names go nowhere. Only the script plugin forwards
+# them, which is the whole reason this theme exists.
+
+Window.SetBackgroundTopColor(0, 0, 0);
+Window.SetBackgroundBottomColor(0, 0, 0);
+
+screen.x = Window.GetX();
+screen.y = Window.GetY();
+screen.width = Window.GetWidth();
+screen.height = Window.GetHeight();
+
+#------------------------------- Logo ---------------------------------
+
+# "special://logo" resolves to /etc/plymouth/logo.png, which NixOS fills
+# from boot.plymouth.logo — so the option still decides what is drawn here.
+logo.image = Image("special://logo");
+logo.sprite = Sprite(logo.image);
+logo.sprite.SetPosition(
+  screen.x + Math.Int((screen.width  - logo.image.GetWidth())  / 2),
+  screen.y + Math.Int((screen.height - logo.image.GetHeight()) * 0.38),
+  0);
+
+#---------------------------- Progress bar ----------------------------
+
+bar.width  = Math.Int(screen.width / 5);
+bar.height = 6;
+bar.x = screen.x + Math.Int((screen.width - bar.width) / 2);
+bar.y = screen.y + Math.Int(screen.height * 0.64);
+bar.filled = 0;
+
+track.image = Image("bar-track.png");
+track.sprite = Sprite(track.image.Scale(bar.width, bar.height));
+track.sprite.SetPosition(bar.x, bar.y, 1);
+track.sprite.SetOpacity(0.2);
+
+fill.image = Image("bar-fill.png");
+fill.sprite = Sprite();
+fill.sprite.SetPosition(bar.x, bar.y, 2);
+
+fun progress_callback (duration, progress)
+  {
+    # Plymouth times the previous boot and interpolates against it, so this
+    # is a self-correcting estimate, not a count of finished units.
+    filled = Math.Int(bar.width * progress);
+    if (filled < 1) filled = 1;
+    if (filled > bar.width) filled = bar.width;
+
+    if (filled != bar.filled)
+      {
+        bar.filled = filled;
+        fill.sprite.SetImage(fill.image.Scale(filled, bar.height));
+      }
+  }
+
+Plymouth.SetBootProgressFunction(progress_callback);
+
+#----------------------------- Unit label -----------------------------
+
+line.y = bar.y + bar.height + 28;   # where the unit name sits
+line.font = "Sans 11";
+
+status.sprite = Sprite();
+status.sprite.SetPosition(screen.x, line.y, 3);
+
+fun update_status_callback (unit)
+  {
+    # The ids arrive as "NetworkManager.service". The suffix is noise on a
+    # service; mounts, swaps and targets keep theirs, where it is the point.
+    label = unit;
+    if (label.SubString(label.Length() - 8, label.Length()) == ".service")
+      label = label.SubString(0, label.Length() - 8);
+
+    status.image = Image.Text(label, 1, 1, 1, 0.75, line.font);
+    status.sprite.SetImage(status.image);
+    status.sprite.SetX(screen.x + Math.Int((screen.width - status.image.GetWidth()) / 2));
+  }
+
+Plymouth.SetUpdateStatusFunction(update_status_callback);
+
+#------------------------------ Messages ------------------------------
+
+# Anything plymouth is told to display outright — fsck progress, "Press ESC
+# for details", whatever a unit writes with `plymouth display-message`.
+message.sprite = Sprite();
+message.sprite.SetOpacity(0);
+
+fun display_message_callback (message_text)
+  {
+    message.image = Image.Text(message_text, 1, 1, 1, 1, line.font);
+    message.sprite.SetImage(message.image);
+    message.sprite.SetPosition(
+      screen.x + Math.Int((screen.width - message.image.GetWidth()) / 2),
+      line.y + 30,
+      4);
+    message.sprite.SetOpacity(1);
+  }
+
+fun hide_message_callback (message_text)
+  {
+    message.sprite.SetOpacity(0);
+  }
+
+Plymouth.SetDisplayMessageFunction(display_message_callback);
+Plymouth.SetHideMessageFunction(hide_message_callback);
+
+#--------------------------- Password prompt ---------------------------
+
+# Nothing on this machine asks for one — the root filesystem is plain ext4.
+# A theme that drew nothing here would make any future prompt (LUKS, an ssh
+# key in the initrd) look exactly like a hang, so draw it anyway.
+prompt.sprite = Sprite();
+prompt.sprite.SetOpacity(0);
+
+fun display_password_callback (prompt_text, bullets)
+  {
+    entry = prompt_text;
+    if (!entry) entry = "Password";
+    entry += ": ";
+    for (i = 0; i < bullets; i++)
+      entry += "*";
+
+    prompt.image = Image.Text(entry, 1, 1, 1, 1, line.font);
+    prompt.sprite.SetImage(prompt.image);
+    prompt.sprite.SetPosition(
+      screen.x + Math.Int((screen.width - prompt.image.GetWidth()) / 2),
+      line.y,
+      5);
+    prompt.sprite.SetOpacity(1);
+    status.sprite.SetOpacity(0);
+  }
+
+fun display_normal_callback ()
+  {
+    prompt.sprite.SetOpacity(0);
+    status.sprite.SetOpacity(1);
+  }
+
+Plymouth.SetDisplayPasswordFunction(display_password_callback);
+Plymouth.SetDisplayNormalFunction(display_normal_callback);

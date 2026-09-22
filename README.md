@@ -28,6 +28,7 @@ repo configures graphics — there is no proprietary driver to pull in.
 | `configuration.nix` | the machine: boot, GNOME, pipewire, Steam, user account |
 | `hardware-configuration.nix` | generated hardware scan (filesystems, kernel modules) |
 | `power.nix` | suspend/resume workarounds — transitional, see the file |
+| `plymouth/` | the boot splash theme — logo, progress bar, unit names |
 | `home.nix` | Home Manager — my packages, dotfiles and user settings |
 | `npins/sources.json` | the pins: nixpkgs, nixpkgs-unstable, home-manager |
 

@@ -16,6 +16,31 @@ in
   boot.loader.efi.canTouchEfiVariables = true;
   boot.kernelPackages = pkgs.linuxPackages_latest;
 
+  # Boot splash instead of the log: the logo, a progress bar, and the name of
+  # the unit systemd has just brought up. The theme lives in this repository
+  # because every stock graphical theme runs on plymouth's two-step plugin,
+  # which drops the unit names systemd sends it — see plymouth/nixos.script.
+  boot.plymouth = {
+    enable = true;
+    themePackages = [ (pkgs.callPackage ./plymouth { }) ];
+    theme = "nixos";
+    logo = "${pkgs.nixos-icons}/share/icons/hicolor/256x256/apps/nix-snowflake.png";
+  };
+
+  # A splash is only a splash if nothing prints over it. `quiet` does double
+  # duty here: the kernel holds its console output down to warnings, and
+  # systemd drops its own status lines to failures only — while still handing
+  # plymouth every unit name, which is a separate path. The udev settings do
+  # the same for stage 1 and stage 2. Nothing is lost, it all stays in the
+  # journal.
+  boot.consoleLogLevel = 3;
+  boot.kernelParams = [
+    "quiet"
+    "udev.log_level=3"
+    "rd.udev.log_level=3"
+    "vt.global_cursor_default=0"   # no blinking cursor over the splash
+  ];
+
   # This machine shipped with no swap at all, so the kernel could not evict
   # anonymous pages and went straight from thrashing page cache to OOM. zstd
   # gets roughly 3:1, so ~15 GiB of swap costs ~5 GiB of RAM and never touches
