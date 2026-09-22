@@ -2,3 +2,6 @@
 result
 result-*
 bench-results/
+
+# python bytecode from running npins-ui.py directly
+__pycache__/

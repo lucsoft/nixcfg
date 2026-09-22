@@ -1,0 +1,36 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+  <defs>
+    <linearGradient id="plate" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#62a0ea"/>
+      <stop offset="1" stop-color="#1a5fb4"/>
+    </linearGradient>
+    <linearGradient id="sheen" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffffff" stop-opacity="0.25"/>
+      <stop offset="0.5" stop-color="#ffffff" stop-opacity="0"/>
+    </linearGradient>
+    <linearGradient id="cap" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffffff"/>
+      <stop offset="1" stop-color="#c0bfbc"/>
+    </linearGradient>
+  </defs>
+
+  <rect x="8" y="8" width="112" height="112" rx="28" fill="url(#plate)"/>
+  <rect x="8" y="8" width="112" height="112" rx="28" fill="url(#sheen)"/>
+
+  <!-- A thumbtack, front on: wide cap, short neck, blunt needle. Thin
+       strokes disappear at 32px, so nothing here is thinner than the cap
+       is tall divided by three. The app is called Pins; the update
+       metaphor comes from where it lives, not from a second glyph. -->
+  <g transform="rotate(-12 64 64) translate(0 2)">
+    <g fill="#0a3470" opacity="0.30" transform="translate(3 5)">
+      <rect x="32" y="24" width="64" height="20" rx="10"/>
+      <path d="M46 44h36l-9 26H55z"/>
+      <path d="M55 70h18l-9 30z"/>
+    </g>
+
+    <path d="M46 44h36l-9 26H55z" fill="url(#cap)"/>
+    <path d="M55 70h18l-9 30z" fill="#c0bfbc"/>
+    <rect x="32" y="24" width="64" height="20" rx="10" fill="url(#cap)"/>
+    <rect x="56" y="47" width="6" height="20" rx="3" fill="#ffffff" opacity="0.7"/>
+  </g>
+</svg>

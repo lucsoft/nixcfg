@@ -24,6 +24,8 @@ let
   # Drop this, its pin (`npins remove nixpkgs-unstable`) and the override
   # below once the stable channel carries 67.4 or newer.
   unstable = import sources.nixpkgs-unstable { };
+
+  npins-ui = pkgs.callPackage ./npins-ui { };
 in
 
 {
@@ -85,6 +87,7 @@ in
     })
 
     # Nix tooling
+    npins-ui    # Adwaita front end for npins
     npins       # updates the pins in npins/sources.json
     nixd        # language server
     nixfmt      # formatter
