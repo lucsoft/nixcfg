@@ -59,6 +59,31 @@ in
     # adds; Bottles upstream only supports its own Flatpak build.
     (unstable.bottles.override { removeWarningPopup = true; })
 
+    # Lutris runs inside an FHS sandbox, because the Wine builds and runtimes
+    # it downloads are ordinary dynamically-linked binaries. Everything it
+    # composes into a launch command has to exist inside that sandbox too:
+    # extraPkgs adds binaries, extraLibraries adds .so's for both bitnesses.
+    #
+    # Each one is found by a bare PATH lookup, and the matching toggle in
+    # System options is *hidden* when the lookup fails — a missing binary is
+    # not an error, the checkbox simply is not there.
+    (lutris.override {
+      extraPkgs = pkgs: with pkgs; [
+        gamescope     # "Enable Gamescope"
+        mangohud      # "Show FPS"; also supplies mangoapp for --mangoapp
+        gamemode      # gamemoderun, for "Enable Feral GameMode"
+
+        # Without vulkaninfo, Lutris names GPUs via lspci, which is installed
+        # nowhere here. That dropdown is what picks the card gamescope renders
+        # on, and this machine has the iGPU sitting next to the dGPU.
+        vulkan-tools
+      ];
+
+      # gamemoderun LD_PRELOADs libgamemodeauto.so.0, so the library has to be
+      # on the sandbox's lib paths, not just the binary on PATH.
+      extraLibraries = pkgs: with pkgs; [ gamemode ];
+    })
+
     # Nix tooling
     npins       # updates the pins in npins/sources.json
     nixd        # language server
