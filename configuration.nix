@@ -72,6 +72,47 @@ in
   # GNOME Web. Firefox is the browser here — see xdg.mimeApps in home.nix.
   environment.gnome.excludePackages = [ pkgs.epiphany ];
 
+  fonts.packages = [ pkgs.twitter-color-emoji ];
+
+  # Twemoji instead of Noto's emoji. This has to be the option and not a
+  # <prefer> in localConf below: the option rewrites
+  # 52-nixos-default-fonts.conf, while <prefer> only inserts a family that is
+  # not in the list yet — Noto is already first by then, so a later rule
+  # cannot displace it.
+  #
+  # noto-fonts-color-emoji stays installed. It rides along with
+  # fonts.enableDefaultPackages and covers what Twemoji is missing.
+  fonts.fontconfig.defaultFonts.emoji = [ "Twitter Color Emoji" ];
+
+  # Web UI font stacks name the platform faces first and reach a font that
+  # exists only at the end. GitHub asks for
+  #
+  #     -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans", Helvetica, …
+  #
+  # Nothing here provides the first four — only the CJK Notos are installed,
+  # and those are a different family name — so it fell through to Helvetica,
+  # which 30-metric-aliases.conf maps to TeX Gyre Heros: a print face with no
+  # screen hinting. That was the wrong-looking text.
+  #
+  # Point the two missing UI families at Adwaita Sans, which GNOME already
+  # uses for the Shell and every GTK app, so web UIs match the desktop.
+  # Helvetica is deliberately left alone — its alias is metric-compatible and
+  # documents should keep it.
+  fonts.fontconfig.localConf = ''
+    <?xml version="1.0"?>
+    <!DOCTYPE fontconfig SYSTEM "urn:fontconfig:fonts.dtd">
+    <fontconfig>
+      <alias binding="same">
+        <family>Segoe UI</family>
+        <prefer><family>Adwaita Sans</family></prefer>
+      </alias>
+      <alias binding="same">
+        <family>Noto Sans</family>
+        <prefer><family>Adwaita Sans</family></prefer>
+      </alias>
+    </fontconfig>
+  '';
+
   services.printing.enable = true;
 
   services.pulseaudio.enable = false;
