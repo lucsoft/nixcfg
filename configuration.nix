@@ -99,6 +99,18 @@ in
 
   programs.gamemode.enable = true;
 
+  # gamescope must be a system module, not a package: capSysNice needs
+  # security.wrappers. Lutris and Steam both find it by a bare PATH lookup.
+  #
+  # capSysNice stays off (the default). It only buys --rt, and file
+  # capabilities put the binary in AT_SECURE mode, where glibc strips
+  # LD_PRELOAD and LD_LIBRARY_PATH from the environment — which is how
+  # MangoHud and gamemode reach the game in the first place.
+  #
+  # No global args: Lutris emits its own --prefer-vk-device from the GPU
+  # dropdown, and passing it twice leaves which one wins undefined.
+  programs.gamescope.enable = true;
+
   # nixpkgs ships an en-US Firefox; German needs both the pack and a locale.
   programs.firefox = {
     enable = true;
