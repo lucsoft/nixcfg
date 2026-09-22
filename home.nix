@@ -9,7 +9,7 @@
 #
 # Options: https://home-manager-options.extranix.com/
 
-{ config, pkgs, ... }:
+{ config, lib, pkgs, ... }:
 
 let
   sources = import ./npins;
@@ -26,6 +26,55 @@ let
   unstable = import sources.nixpkgs-unstable { };
 
   npins-ui = pkgs.callPackage ./npins-ui { };
+
+  # Makes a switch visible to the session that is already running, instead of
+  # at the next login.
+  #
+  # The session watches ~/.nix-profile/share/applications for new apps, but
+  # inotify resolves that path once, when the watch is set up, down to the
+  # store directory behind it. A switch swaps the profile symlink and leaves
+  # that directory untouched, so no event ever arrives and GIO never re-reads
+  # the path — measured, not assumed. ~/.local/share/applications is a real
+  # directory that changes in place, so a link appearing there does fire.
+  # Mirroring the profile's entries into it is what makes a new app show up
+  # right away; equal file names mean equal desktop IDs, so nothing is listed
+  # twice and window-to-app matching still works.
+  #
+  # Icons need the other half. They go stale the same way, and mirroring does
+  # not help because GTK caches the theme as a whole rather than per file.
+  # Renaming the theme and renaming it back is what makes every client drop
+  # that cache; the cost is a brief flicker across the desktop.
+  xdg-mirror = pkgs.writeShellScript "xdg-mirror" ''
+    set -u
+    profile="$HOME/.nix-profile/share/applications"
+    mirror="$HOME/.local/share/applications"
+    mkdir -p "$mirror"
+
+    # Pointing into the profile is the ownership mark. Nothing else in here
+    # does, so this drops the last run's mirror and only that.
+    ${pkgs.findutils}/bin/find "$mirror" -maxdepth 1 -type l \
+      -lname "$profile/*" -delete
+
+    [ "$1" = clean ] && exit 0
+
+    for entry in "$profile"/*.desktop; do
+      [ -e "$entry" ] || continue
+      name=''${entry##*/}
+      # A name Home Manager writes itself wins. xdg.desktopEntries is there to
+      # override the package's copy, not to be shadowed by it.
+      [ -e "$mirror/$name" ] || ln -s "$entry" "$mirror/$name"
+    done
+
+    ${pkgs.desktop-file-utils}/bin/update-desktop-database "$mirror"
+
+    # No session bus, no session to tell.
+    [ -n "''${DBUS_SESSION_BUS_ADDRESS:-}" ] || exit 0
+    key="org.gnome.desktop.interface icon-theme"
+    theme=$(${pkgs.glib}/bin/gsettings get $key)
+    if [ "$theme" = "'hicolor'" ]; then other="'Adwaita'"; else other="'hicolor'"; fi
+    ${pkgs.glib}/bin/gsettings set $key "$other"
+    ${pkgs.glib}/bin/gsettings set $key "$theme"
+  '';
 in
 
 {
@@ -163,6 +212,14 @@ in
     };
     Install.WantedBy = [ "timers.target" ];
   };
+
+  # Two halves of the same job: the mirror has to be gone before Home Manager
+  # checks whether its own links would clobber anything, and rebuilt once the
+  # new generation and its packages are in place.
+  home.activation.clearXdgMirror =
+    lib.hm.dag.entryBefore [ "checkLinkTargets" ] "run ${xdg-mirror} clean";
+  home.activation.syncXdgMirror =
+    lib.hm.dag.entryAfter [ "linkGeneration" ] "run ${xdg-mirror} sync";
 
   # ---------------------------------------------------------------------------
   # Dotfiles
