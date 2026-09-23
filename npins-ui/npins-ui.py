@@ -197,6 +197,21 @@ def compare(repo, old_rev, new_rev):
     return {"total": total, "subjects": subjects, "complete": len(commits) >= total}
 
 
+# Which pins can explain what is installed. versions.nix evaluates the two
+# configs against nixpkgs and home-manager and against nothing else, so a
+# commit from any other pin cannot be attributed to a package on this
+# machine. nixpkgs-unstable is the reason this matters: it feeds one
+# sandboxed program, but its commits name the same packages the stable tree
+# carries, and matching those against the closure reports a bump that is not
+# coming. Leaving them out hides nothing — the pin still shows as moved.
+CLOSURE_PINS = ("nixpkgs", "home-manager")
+
+
+def closure_subjects(by_pin):
+    """The commit subjects that may be matched against this machine."""
+    return [subject for pin in CLOSURE_PINS for subject in by_pin.get(pin, [])]
+
+
 def commit_age(repo, rev):
     stamp = github(f"/repos/{repo}/commits/{rev}")["commit"]["committer"]["date"]
     when = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
@@ -382,12 +397,16 @@ def dependency_changes(subjects, already_shown):
     package — so the evidence is the commit itself. Heuristic, and it says
     so: it rests on nixpkgs' `package: old -> new` convention and on the
     closure that is installed *now*, not the one being built.
+
+    `already_shown` is every package the configs name, not just the ones
+    whose version moved: a declared package that did not change is still
+    declared, and claiming otherwise is what this category must not do.
     """
     prefixes, installed = closure_contents()
     found = {}
     for subject in subjects:
         name, body = subject_package(subject)
-        if not name or name in already_shown:
+        if not name or name.lower() in already_shown:
             continue
         if name.lower() not in prefixes:
             continue
@@ -412,8 +431,10 @@ def dependency_changes(subjects, already_shown):
 def package_changes(repo, old_lockfile, new_lockfile, subjects=()):
     """Per category, what actually changes for this machine.
 
-    Apps, System and Drivers come from comparing versions; Dependencies come
-    from the commit range, because they are invisible to a top-level diff.
+    Two kinds of evidence feed the same four categories: a version pair from
+    comparing the two evaluations, and a commit subject for everything that
+    comparison cannot see. Which category an entry lands in is decided by
+    whether the configs declare it — never by which evidence found it.
     """
     before = package_versions(*store_paths(old_lockfile), repo)
     after = package_versions(*store_paths(new_lockfile), repo)
@@ -436,8 +457,23 @@ def package_changes(repo, old_lockfile, new_lockfile, subjects=()):
         bucket = "apps" if entry["name"].lower() in launchers else "system"
         changes[bucket].append(entry)
 
-    shown = {e["name"] for bucket in changes.values() for e in bucket}
-    changes["dependencies"] = dependency_changes(subjects, shown)
+    # What the version diff could not speak for. diff() needs a version
+    # string on both sides and a change between them, so it is blind to a
+    # declared package carrying no version at all (nixos-enter) and to one
+    # patched without a bump (gnome-shell). Those are not dependencies —
+    # the configs name them — so route the subject match by whether the
+    # package is declared, rather than filtering it and losing the news.
+    declared = {p["name"].lower() for p in after.get("declared", [])}
+    reported = {e["name"].lower() for bucket in changes.values() for e in bucket}
+
+    for entry in dependency_changes(subjects, reported):
+        name = entry["name"]
+        if name.lower() not in declared:
+            changes["dependencies"].append(entry)
+        elif name in driver_names:
+            changes["drivers"].append(entry)
+        else:
+            changes["apps" if name.lower() in launchers else "system"].append(entry)
     return changes
 
 
@@ -598,7 +634,10 @@ def worth_notifying(changes):
     # one dependency among dozens — but it is exactly the thing not to miss.
     # Counted in packages, not commits — two commits fixing one library is
     # one thing to know about, and the window counts it the same way.
-    cves = sum(1 for entry in changes.get("dependencies", [])
+    # Every category, not just Dependencies: a subject-matched entry is
+    # filed by whether the configs declare it, and a CVE fix can land in a
+    # declared package just as easily.
+    cves = sum(1 for key, _ in CATEGORIES for entry in changes.get(key, [])
                if any("cve-" in s.lower() for s in entry.get("subjects", [])))
     if cves:
         parts.append(f"{cves} with a CVE fix")
@@ -619,14 +658,16 @@ def run_check(repo):
         # The commit range is what surfaces dependency and CVE changes, so
         # the headless check pays for it too. A forge that is down costs the
         # dependency half, not the whole answer.
-        subjects = []
+        by_pin = {}
         for update in updates:
             if update["repo"] and update["old_rev"] and update["new_rev"]:
                 try:
-                    subjects += compare(update["repo"], update["old_rev"],
-                                        update["new_rev"])["subjects"]
+                    by_pin[update["name"]] = compare(
+                        update["repo"], update["old_rev"],
+                        update["new_rev"])["subjects"]
                 except (urllib.error.URLError, KeyError, ValueError):
                     pass
+        subjects = closure_subjects(by_pin)
 
         try:
             changes = package_changes(repo, repo / LOCKFILE,
@@ -891,9 +932,10 @@ class Window(Adw.ApplicationWindow):
                 continue
             group = boxed_list()
             for entry in entries:
-                # Dependencies have no version pair — they are not top-level
-                # packages, so the commit subjects are all the evidence there
-                # is. Say that in the subtitle rather than showing "→".
+                # An entry the version diff could not speak for has no pair
+                # to show — a package carrying no version, or one patched
+                # without a bump. The commits are the evidence there, so say
+                # that in the subtitle rather than showing "→".
                 log = entry.get("subjects") or changelog_for(entry["name"], subjects)
                 if entry.get("old"):
                     subtitle = f"{entry['old']}  →  {entry['new']}"
@@ -1044,7 +1086,7 @@ class Window(Adw.ApplicationWindow):
             updates, text = probe_updates(self.lockfile, self.workdir)
             detail = {}
             if updates:
-                subjects = []
+                by_pin = {}
                 for update in updates:
                     if not (update["repo"] and update["old_rev"] and update["new_rev"]):
                         continue
@@ -1055,10 +1097,13 @@ class Window(Adw.ApplicationWindow):
                             "behind": result["total"],
                             "age": commit_age(update["repo"], update["new_rev"]),
                         }
-                        subjects += result["subjects"]
+                        by_pin[update["name"]] = result["subjects"]
                     except (urllib.error.URLError, KeyError, ValueError):
                         # The forge is a nicety; the pin diff already stands.
                         pass
+                # Scoped once, here: the changelog shown per package reads
+                # from the same list the dependency match does.
+                subjects = closure_subjects(by_pin)
                 detail["subjects"] = subjects
                 try:
                     detail["changes"] = package_changes(
