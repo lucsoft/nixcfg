@@ -29,8 +29,9 @@ from gi.repository import Adw, Gio, GLib, Gtk  # noqa: E402
 
 APP_ID = "de.lucsoft.NpinsUi"
 LOCKFILE = "npins/sources.json"
-CATEGORIES = [("apps", "Apps"), ("drivers", "Drivers"),
-              ("system", "System"), ("dependencies", "Dependencies")]
+CATEGORIES = [("apps", "Apps"), ("kernel", "Kernel and firmware"),
+              ("graphics", "Graphics and fonts"), ("system", "System"),
+              ("dependencies", "Dependencies")]
 CACHE = Path(GLib.get_user_cache_dir()) / "npins-ui"
 
 
@@ -426,19 +427,163 @@ def package_changes(repo, old_lockfile, new_lockfile, subjects=()):
                 for name in sorted(old)
                 if name in new and old[name] != new[name]]
 
-    driver_names = {p["name"] for p in after.get("drivers", [])}
-    changes = {"apps": [], "system": [], "drivers": diff("drivers"),
-               "dependencies": []}
+    changes = {"apps": [], "system": [], "dependencies": [],
+               "kernel": diff("kernel"), "graphics": diff("graphics")}
+
+    # Anything carried by one of those two is reported there, and more
+    # precisely: under a heading that says what to do about it.
+    claimed = {p["name"] for key in ("kernel", "graphics")
+               for p in after.get(key, [])}
 
     for entry in diff("declared"):
-        if entry["name"] in driver_names:
-            continue          # already reported, and more precisely
+        if entry["name"] in claimed:
+            continue
         bucket = "apps" if entry["name"].lower() in launchers else "system"
         changes[bucket].append(entry)
 
-    shown = {e["name"] for bucket in changes.values() for e in bucket}
+    shown = {e["name"] for key, _ in CATEGORIES for e in changes[key]}
     changes["dependencies"] = dependency_changes(subjects, shown)
+
+    # Not categories — the verdict, measured rather than inferred from the
+    # version numbers above, which is what makes it right even when a kernel
+    # is rebuilt without its version moving. Two baselines because the window
+    # and a notification are asking different things; see update_tier.
+    boot = after.get("boot", {})
+    changes["reboot"] = reboot_needed(boot)
+    changes["reboot_added"] = reboot_needed(boot, "/run/current-system")
     return changes
+
+
+# -----------------------------------------------------------------------------
+# taking effect — nothing, log out, or reboot
+# -----------------------------------------------------------------------------
+# Three tiers, because there are only three answers. Almost everything a pin
+# move brings is live the moment the rebuild finishes: a new binary is picked
+# up the next time it starts, and switch-to-configuration has already
+# restarted the services it had to. Two things outlast the switch — what the
+# session loaded at login, and what the kernel came up with — and those are
+# the only two the user has to do anything about.
+NOTHING, SESSION, REBOOT = 0, 1, 2
+
+TIER_ACTION = {
+    NOTHING: "",
+    SESSION: "Log out and back in to finish",
+    REBOOT: "Reboot to finish",
+}
+TIER_ICON = {
+    NOTHING: "object-select-symbolic",
+    SESSION: "system-log-out-symbolic",
+    REBOOT: "system-reboot-symbolic",
+}
+
+STORE_ROOT = re.compile(r"^(/nix/store/[a-z0-9]{32}-[^/]+)")
+
+# The four things in a system generation that only a reboot can swap.
+BOOT_PARTS = ("kernel", "initrd", "kernel-modules", "firmware")
+
+
+def boot_paths(generation):
+    """The store paths a generation would boot from.
+
+    Cut back to the store path, because the links do not agree on depth:
+    `kernel` points at the bzImage *inside* the kernel while `kernel-modules`
+    points at the package itself. versions.nix reports packages, so both
+    sides have to be packages to compare at all.
+    """
+    found = {}
+    for part in BOOT_PARTS:
+        match = STORE_ROOT.match(str(Path(generation, part).resolve()))
+        if match:
+            found[part] = match.group(1)
+    return found
+
+
+def reboot_needed(target, baseline="/run/booted-system"):
+    """Which boot components `target` has that `baseline` does not.
+
+    Against /run/booted-system, the default, the answer is what a reboot
+    would still be for — the only honest record of how this kernel came up,
+    and cumulative: a rebuild done last week and never rebooted still counts.
+    That is what lets the answer survive the app being closed without any
+    bookkeeping of its own.
+
+    Against /run/current-system it is the narrower question of what an
+    update adds on top of what is already installed.
+    """
+    have = boot_paths(baseline)
+    if not have:
+        return []          # nothing to compare against; do not invent one
+    return [part for part in BOOT_PARTS
+            if part in have and target.get(part)
+            and have[part] != target[part]]
+
+
+def session_marker():
+    """A "you still have to log out" flag with exactly the right lifetime.
+
+    XDG_RUNTIME_DIR is wiped when the user's last session ends, so the flag
+    clears itself on logout and survives everything shorter, the app being
+    closed and reopened included.
+
+    The alternative was to measure it the way the reboot half is measured, by
+    looking for outdated store paths in the maps of running processes. That
+    does not work here: home.nix takes one package from a second nixpkgs, and
+    its private copy of mesa would read as a stale session forever.
+    """
+    base = os.environ.get("XDG_RUNTIME_DIR")
+    return Path(base, "npins-ui-session-stale") if base else None
+
+
+def mark_session_stale():
+    marker = session_marker()
+    if marker:
+        marker.touch()
+
+
+def session_stale():
+    marker = session_marker()
+    return bool(marker and marker.exists())
+
+
+def change_tier(changes):
+    """What will be owed once a change set has been applied.
+
+    The reboot half does not come from the version diff — `changes["reboot"]`
+    was measured against the running kernel when the change set was built,
+    which also catches a kernel rebuilt at an unchanged version.
+    """
+    if not changes:
+        return NOTHING
+    if changes.get("reboot"):
+        return REBOOT
+    if changes.get("graphics"):
+        return SESSION
+    return NOTHING
+
+
+def update_tier(changes):
+    """What an update costs by itself, rather than what will be owed after it.
+
+    The two differ once a reboot is already owed. That one belongs in the
+    window, where it is the answer to "what do I have to do" — but not in a
+    notification, which would then repeat it every time the timer runs, and
+    not in a commit message, which is read on days and machines where this
+    one's booted kernel means nothing.
+    """
+    if not changes:
+        return NOTHING
+    if changes.get("reboot_added"):
+        return REBOOT
+    if changes.get("graphics"):
+        return SESSION
+    return NOTHING
+
+
+def pending_tier():
+    """What is owed right now, with nothing pending to apply."""
+    if reboot_needed(boot_paths("/run/current-system")):
+        return REBOOT
+    return SESSION if session_stale() else NOTHING
 
 
 # -----------------------------------------------------------------------------
@@ -529,7 +674,44 @@ class NixProgress:
 # -----------------------------------------------------------------------------
 # git
 # -----------------------------------------------------------------------------
-def commit_message(updates):
+def table(rows):
+    """Name and version pair per line, names padded to one column."""
+    width = max(len(name) for name, _, _ in rows)
+    return "\n".join(f"  {name:<{width}}  {old} -> {new}" for name, old, new in rows)
+
+
+def change_blocks(changes):
+    """What this pin move does to the machine, for the commit body.
+
+    Everything the config names gets its own line — a year on, that list is
+    the reason to reach for this commit at all. Dependencies are the one
+    exception: they run to dozens of packages nobody asked for, and a name
+    without context is no help, so they get the same one-line summary the
+    window shows.
+    """
+    blocks = []
+    for key, label in CATEGORIES:
+        entries = changes.get(key, [])
+        if not entries:
+            continue
+        if key == "dependencies":
+            cves = sum(1 for e in entries
+                       if any("cve-" in s.lower() for s in e.get("subjects", [])))
+            line = f"{len(entries)} package{'' if len(entries) == 1 else 's'}"
+            if cves:
+                line += f", {cves} with a CVE fix"
+            blocks.append(f"{label}:\n  {line}")
+            continue
+        blocks.append(f"{label}:\n" + table(
+            [(e["name"], e["old"], e["new"]) for e in entries]))
+
+    action = TIER_ACTION[update_tier(changes)]
+    if action:
+        blocks.append(f"{action}.")
+    return blocks
+
+
+def commit_message(updates, changes=None):
     names = [u["name"] for u in updates]
     if len(names) == 1:
         subject = f"npins: update {names[0]}"
@@ -540,12 +722,17 @@ def commit_message(updates):
     if len(subject) > 60:
         subject = f"npins: update {len(names)} pins"
 
+    # The pins moved and that is the diff; what follows is what the diff
+    # does, which the diff itself cannot show.
     width = max(len(n) for n in names)
-    body = "\n".join(f"{u['name']:<{width}}  {u['old']} -> {u['new']}" for u in updates)
-    return f"{subject}\n\n{body}\n"
+    body = ["\n".join(f"{u['name']:<{width}}  {u['old']} -> {u['new']}"
+                      for u in updates)]
+    if changes:
+        body += change_blocks(changes)
+    return f"{subject}\n\n" + "\n\n".join(body) + "\n"
 
 
-def commit_lockfile(repo, updates):
+def commit_lockfile(repo, updates, changes=None):
     """Commit the lock file and nothing else.
 
     The pathspec is not optional. This repo regularly carries unrelated
@@ -554,7 +741,7 @@ def commit_lockfile(repo, updates):
     content and leaves both the index and every other file alone.
     """
     subprocess.run(
-        ["git", "-C", str(repo), "commit", "-m", commit_message(updates),
+        ["git", "-C", str(repo), "commit", "-m", commit_message(updates, changes),
          "--", LOCKFILE],
         check=True, capture_output=True, text=True,
     )
@@ -577,7 +764,8 @@ NOUNS = {
     "dependencies": ("dependency", "dependencies"),
     "apps": ("app", "apps"),
     "system": ("system package", "system packages"),
-    "drivers": ("driver", "drivers"),
+    "kernel": ("kernel package", "kernel packages"),
+    "graphics": ("graphics package", "graphics packages"),
 }
 
 
@@ -603,9 +791,17 @@ def worth_notifying(changes):
     if cves:
         parts.append(f"{cves} with a CVE fix")
 
-    worth = (counts["apps"] or counts["drivers"] or cves
+    worth = (counts["apps"] or counts["kernel"] or counts["graphics"] or cves
              or counts["system"] >= SYSTEM_NOISE_FLOOR)
-    return bool(worth), ", ".join(parts) or "nothing you installed"
+    summary = ", ".join(parts) or "nothing you installed"
+
+    # An update that ends in a reboot is worth saying so up front: that is
+    # the one the reader might want to postpone rather than take now.
+    action = TIER_ACTION[update_tier(changes)]
+    if action:
+        summary += f" · {action.lower()}"
+        worth = True
+    return bool(worth), summary
 
 
 def run_check(repo):
@@ -675,6 +871,10 @@ class Window(Adw.ApplicationWindow):
         self.cancelled = False
         self.steps = []
         self.step_index = 0
+        # Whether the update being applied touches the session. Recorded at
+        # apply time because after the rebuild there is nothing left to read
+        # it off; see session_marker.
+        self.applied_session = False
 
         self.check_button = Gtk.Button(icon_name="view-refresh-symbolic",
                                        tooltip_text="Check for Updates")
@@ -854,6 +1054,18 @@ class Window(Adw.ApplicationWindow):
             self.stack.set_visible_child_name("status")
             return
 
+        # Whether a reboot is owed takes no check, no network and no
+        # evaluation — it is four symlinks — so it is the one thing the
+        # window can answer the moment it opens.
+        pending = pending_tier()
+        if pending:
+            self.status.set_icon_name(TIER_ICON[pending])
+            self.status.set_title(TIER_ACTION[pending])
+            self.status.set_description(
+                "An earlier rebuild is waiting on it. Whether the pins have "
+                "moved is a separate question."
+            )
+
         changes = self.detail.get("changes")
         if changes is not None:
             self.render_changes(changes)
@@ -874,13 +1086,34 @@ class Window(Adw.ApplicationWindow):
         subjects = self.detail.get("subjects", [])
         total = sum(len(changes.get(key, [])) for key, _ in CATEGORIES)
 
-        if not total:
-            self.status.set_icon_name("object-select-symbolic")
+        # A kernel rebuilt at an unchanged version moves no version number,
+        # so the categories can all be empty while a reboot is still owed.
+        # That is the whole reason the reboot half is measured, and bailing
+        # out on the count alone would throw the measurement away.
+        if not total and not changes.get("reboot_added"):
+            pending = pending_tier()
+            self.status.set_icon_name(TIER_ICON[pending])
             self.status.set_title("Nothing you installed changes")
-            self.status.set_description(
-                "The pins moved, but not through any of your packages."
-            )
+            description = "The pins moved, but not through any of your packages."
+            if pending:
+                description += f"\n\n{TIER_ACTION[pending]} an earlier rebuild."
+            self.status.set_description(description)
             return
+
+        # One row at the top for the only part that is not automatic. It
+        # names the components as well, because a kernel rebuilt at an
+        # unchanged version leaves the section below empty and the verdict
+        # would otherwise look like it came from nowhere.
+        tier = change_tier(changes)
+        if tier:
+            named = (changes.get("reboot") if tier == REBOOT
+                     else [e["name"] for e in changes.get("graphics", [])])
+            row = Adw.ActionRow(title=TIER_ACTION[tier],
+                                subtitle=", ".join(named))
+            row.add_prefix(Gtk.Image(icon_name=TIER_ICON[tier]))
+            group = boxed_list()
+            group.append(row)
+            self.content.append(group)
 
         for key, label in CATEGORIES:
             entries = changes.get(key, [])
@@ -1088,10 +1321,15 @@ class Window(Adw.ApplicationWindow):
         self.sync_apply()
 
         if not self.updates:
-            self.say("Everything is current")
-            self.status.set_icon_name("object-select-symbolic")
-            self.status.set_title("Everything is current")
-            self.status.set_description("No pin has moved since you last applied.")
+            pending = pending_tier()
+            headline = TIER_ACTION[pending] or "Everything is current"
+            self.say(headline)
+            self.status.set_icon_name(TIER_ICON[pending])
+            self.status.set_title(headline)
+            description = "No pin has moved since you last applied."
+            if pending:
+                description += "\n\nAn earlier rebuild is still waiting on it."
+            self.status.set_description(description)
             return
 
         changes = self.detail.get("changes", {})
@@ -1106,6 +1344,9 @@ class Window(Adw.ApplicationWindow):
             verdict = f"{commits} commits, none of them touch your packages"
         else:
             verdict = f"{affected} of your packages change"
+        action = TIER_ACTION[change_tier(changes)]
+        if action:
+            verdict += f" · {action.lower()}"
         self.say(verdict)
 
 
@@ -1114,10 +1355,13 @@ class Window(Adw.ApplicationWindow):
         if not text:
             return
 
+        changes = self.detail.get("changes")
+        self.applied_session = bool(changes and changes.get("graphics"))
+
         def work():
             write_lockfile(self.lockfile, text)
             if commit:
-                commit_lockfile(self.repo, updates)
+                commit_lockfile(self.repo, updates, changes)
             return commit
 
         self.busy(True, "Writing pins…")
@@ -1255,12 +1499,26 @@ class Window(Adw.ApplicationWindow):
             self.fail(error)
             return
 
-        self.say("Installed")
-        self.status.set_icon_name("object-select-symbolic")
-        self.status.set_title("Installed")
-        self.status.set_description(
-            "The new system and home generations are live."
-        )
+        # The switch is what moved /run/current-system, so from here the
+        # reboot half is measured rather than predicted. The session half
+        # cannot be: nothing on disk records what the running session was
+        # built from, so it gets written down while it is still known.
+        if self.applied_session:
+            mark_session_stale()
+
+        tier = pending_tier()
+        headline = TIER_ACTION[tier] or "Installed"
+        self.say(headline)
+        self.status.set_icon_name(TIER_ICON[tier])
+        self.status.set_title(headline)
+        description = "The new system and home generations are live."
+        if tier == REBOOT:
+            description += ("\n\nThe running kernel is still the one this "
+                            "machine booted with.")
+        elif tier == SESSION:
+            description += ("\n\nThe session is still running the graphics "
+                            "stack and fonts it started with.")
+        self.status.set_description(description)
 
     def about(self):
         Adw.AboutDialog(

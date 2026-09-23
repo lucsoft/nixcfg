@@ -36,6 +36,8 @@ let
   # and a list in others.
   asList = x: if builtins.isList x then x else [ x ];
 
+  firmware = asList sys.hardware.firmware;
+
   ident = p: {
     name = p.pname or p.name or "?";
     version = p.version or "";
@@ -48,13 +50,35 @@ in
   # apps and system happens outside, on better evidence.
   declared = idents (hm.home.packages ++ sys.environment.systemPackages);
 
-  # Graphics and kernel are worth their own category, and both are real
-  # options rather than dependencies — hardware.graphics.package is mesa, so
-  # a mesa bump shows up here as an honest version comparison.
-  drivers = idents ([ sys.boot.kernelPackages.kernel
-                      sys.hardware.graphics.package
-                      sys.hardware.graphics.package32 ]
+  # The two things a rebuild cannot put into use on its own get a bag each,
+  # because "what changed" and "what you have to do about it" are different
+  # questions. A mesa bump is settled by logging out; a kernel bump is
+  # settled by nothing short of a reboot.
+  kernel = idents ([ sys.boot.kernelPackages.kernel ] ++ firmware);
+
+  graphics = idents ([ sys.hardware.graphics.package
+                       sys.hardware.graphics.package32 ]
     ++ asList sys.hardware.graphics.extraPackages
     ++ asList sys.hardware.graphics.extraPackages32
-    ++ asList sys.hardware.firmware);
+    ++ asList sys.fonts.packages);
+
+  # What a reboot would put into use, as store paths. A system generation
+  # keeps the same four under the same names, so comparing these against
+  # /run/booted-system answers "reboot?" outright — where a version diff
+  # cannot: a kernel can be rebuilt without its version moving, and the
+  # firmware derivation carries no version at all.
+  #
+  # These are the only outPaths forced anywhere in this file, and they are
+  # nearly free: the system evaluation they need has already happened above.
+  boot = {
+    kernel = sys.boot.kernelPackages.kernel.outPath;
+    initrd = sys.system.build.initialRamdisk.outPath;
+    kernel-modules = sys.system.modulesTree.outPath;
+    # One merged derivation is also what /run/*/firmware points at. Were a
+    # revision to hand back a real list, the merge happens during activation
+    # and cannot be reproduced from here — so say nothing rather than guess.
+    firmware = if builtins.length firmware == 1
+               then (builtins.head firmware).outPath
+               else "";
+  };
 }
