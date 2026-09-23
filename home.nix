@@ -158,6 +158,9 @@ in
     Unit.Description = "Check whether the npins pins can move";
     Timer = {
       OnStartupSec = "10m";      # not during login, the session is busy
+      # The window opens on whatever this last found and only fetches again
+      # once that is older than this interval, so npins-ui's FRESH_FOR is
+      # this number. Moving one means moving the other.
       OnUnitActiveSec = "6h";
       Persistent = true;         # catch up after the machine was asleep
     };

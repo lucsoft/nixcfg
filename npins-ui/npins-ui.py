@@ -14,6 +14,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone
@@ -451,6 +452,10 @@ def package_changes(repo, old_lockfile, new_lockfile, subjects=()):
     boot = after.get("boot", {})
     changes["reboot"] = reboot_needed(boot)
     changes["reboot_added"] = reboot_needed(boot, "/run/current-system")
+    # Kept so that a stored check can redo those two comparisons later: they
+    # are the one part of a change set that goes out of date on its own, by
+    # the machine being rebooted rather than by anything moving.
+    changes["boot"] = boot
     return changes
 
 
@@ -584,6 +589,118 @@ def pending_tier():
     if reboot_needed(boot_paths("/run/current-system")):
         return REBOOT
     return SESSION if session_stale() else NOTHING
+
+
+# -----------------------------------------------------------------------------
+# a check, and what the last one found
+# -----------------------------------------------------------------------------
+def survey(repo, lockfile, workdir):
+    """Everything a check finds: which pins moved, how far, and what the two
+    together change for this machine.
+
+    One function for both callers, the window and the timer, because they
+    now share the result — and two copies of this loop would quietly grow
+    apart into two shapes of it.
+    """
+    updates, text = probe_updates(lockfile, workdir)
+    detail = {"subjects": []}
+    if not updates:
+        return updates, text, detail
+
+    for update in updates:
+        if not (update["repo"] and update["old_rev"] and update["new_rev"]):
+            continue
+        try:
+            result = compare(update["repo"], update["old_rev"], update["new_rev"])
+            detail[update["name"]] = {
+                "behind": result["total"],
+                "age": commit_age(update["repo"], update["new_rev"]),
+            }
+            detail["subjects"] += result["subjects"]
+        except (urllib.error.URLError, KeyError, ValueError):
+            # The forge is a nicety; the pin diff already stands.
+            pass
+
+    try:
+        detail["changes"] = package_changes(
+            repo, lockfile, Path(workdir) / "sources.json", detail["subjects"])
+    except (OSError, subprocess.CalledProcessError, ValueError) as error:
+        # A lock file without the configs next to it still has a usable pin
+        # diff; only the "affects you" part is lost.
+        detail["changes_error"] = describe_error(error)
+    return updates, text, detail
+
+
+# The timer runs the same check every six hours and used to throw the answer
+# away, so the window opened blank and fetched it again. It is written down
+# instead. Only the parts that cost network are in here: the nix evaluation
+# has its own cache already, keyed by the pins it ran against.
+STATE = CACHE / "last-check.json"
+
+# How long the stored answer counts as current — the timer's own interval
+# from home.nix, because that is the promise being leaned on. Past it the
+# state is not stale by a little, it is unattended, and the window goes and
+# looks for itself.
+FRESH_FOR = 6 * 3600
+
+
+def lockfile_digest(lockfile):
+    """What the stored answer was computed from. The pins moving underneath
+    it — an apply, an edit, a checkout — is what makes it wrong rather than
+    merely old."""
+    try:
+        return hashlib.sha256(Path(lockfile).read_bytes()).hexdigest()
+    except OSError:
+        return ""
+
+
+def save_check(repo, lockfile, updates, text, detail):
+    try:
+        CACHE.mkdir(parents=True, exist_ok=True)
+        tmp = STATE.with_suffix(".json.new")
+        tmp.write_text(json.dumps({
+            "stamp": int(time.time()), "repo": str(repo),
+            "digest": lockfile_digest(lockfile),
+            "updates": updates, "text": text, "detail": detail,
+        }))
+        os.replace(tmp, STATE)
+    except OSError:
+        pass          # a cache that will not be written is not worth an error
+
+
+def load_check(repo, lockfile):
+    """The last check, if it still describes this repo's pins.
+
+    Returns (age in seconds, updates, probed lock file, detail), or None.
+    """
+    try:
+        state = json.loads(STATE.read_text())
+    except (OSError, ValueError):
+        return None
+    if (state.get("repo") != str(repo)
+            or state.get("digest") != lockfile_digest(lockfile)):
+        return None
+
+    detail = state.get("detail", {})
+    changes = detail.get("changes")
+    if changes is not None:
+        # Redone rather than restored: these were measured against the
+        # running system, which may have been rebooted since.
+        boot = changes.get("boot", {})
+        changes["reboot"] = reboot_needed(boot)
+        changes["reboot_added"] = reboot_needed(boot, "/run/current-system")
+
+    age = max(0, int(time.time()) - state.get("stamp", 0))
+    return age, state.get("updates", []), state.get("text"), detail
+
+
+def ago(seconds):
+    """A rough age, for a line that only has to say recent or not."""
+    for size, unit in ((86400, "day"), (3600, "hour"), (60, "minute")):
+        if seconds >= size:
+            count = int(seconds / size)
+            return f"{count} {unit}{'' if count == 1 else 's'} ago"
+    return "just now"
 
 
 # -----------------------------------------------------------------------------
@@ -806,35 +923,28 @@ def worth_notifying(changes):
 
 def run_check(repo):
     repo = Path(repo)
+    lockfile = repo / LOCKFILE
     with tempfile.TemporaryDirectory() as workdir:
-        updates, _ = probe_updates(repo / LOCKFILE, workdir)
-        if not updates:
-            print("All pins current.")
-            return 0
-
         # The commit range is what surfaces dependency and CVE changes, so
         # the headless check pays for it too. A forge that is down costs the
         # dependency half, not the whole answer.
-        subjects = []
-        for update in updates:
-            if update["repo"] and update["old_rev"] and update["new_rev"]:
-                try:
-                    subjects += compare(update["repo"], update["old_rev"],
-                                        update["new_rev"])["subjects"]
-                except (urllib.error.URLError, KeyError, ValueError):
-                    pass
+        updates, text, detail = survey(repo, lockfile, workdir)
 
-        try:
-            changes = package_changes(repo, repo / LOCKFILE,
-                                      Path(workdir) / "sources.json", subjects)
-        except (OSError, subprocess.CalledProcessError, ValueError):
+        # Written down whether or not anything moved: "all current" is an
+        # answer the window can open on too, and is the common case.
+        save_check(repo, lockfile, updates, text, detail)
+
+        if not updates:
+            print("All pins current.")
+            return 0
+        if "changes" not in detail:
             # Without the version diff there is no way to judge, so say the
             # pins moved and let the user decide.
             for update in updates:
                 print(f"{update['name']}: {update['old']} -> {update['new']}")
             return 10
 
-        worth, summary = worth_notifying(changes)
+        worth, summary = worth_notifying(detail["changes"])
         print(summary)
         return 10 if worth else 0
 
@@ -862,7 +972,6 @@ class Window(Adw.ApplicationWindow):
         self.repo = Path(repo)
         self.lockfile = self.repo / LOCKFILE
         self.workdir = Path(tempfile.mkdtemp(prefix="npins-ui-"))
-        self.probe = self.workdir / "sources.json"
         self.pending_text = None
         self.updates = []
         self.detail = {}
@@ -971,7 +1080,25 @@ class Window(Adw.ApplicationWindow):
             action.connect("activate", handler)
             self.add_action(action)
 
+        # Open on what the timer already found rather than on nothing. It ran
+        # the same check this window would, so repeating it on every launch
+        # was two fetches for one answer.
+        restored = load_check(self.repo, self.lockfile)
+        if restored:
+            age, self.updates, text, self.detail = restored
+            self.pending_text = text if self.updates else None
+
         self.render()
+        self.sync_apply()
+
+        if not restored or age > FRESH_FOR:
+            # Nothing kept, or kept longer than the timer promises to keep it
+            # current. Either way the answer on screen is not one to stand on.
+            self.check()
+        elif self.updates:
+            self.say(f"{self.verdict()} · checked {ago(age)}")
+        else:
+            self.show_current(age)
 
     # -- helpers --------------------------------------------------------------
     def toast(self, text):
@@ -1274,33 +1401,9 @@ class Window(Adw.ApplicationWindow):
         self.busy(True, "Checking pins…")
 
         def work():
-            updates, text = probe_updates(self.lockfile, self.workdir)
-            detail = {}
-            if updates:
-                subjects = []
-                for update in updates:
-                    if not (update["repo"] and update["old_rev"] and update["new_rev"]):
-                        continue
-                    try:
-                        result = compare(update["repo"], update["old_rev"],
-                                         update["new_rev"])
-                        detail[update["name"]] = {
-                            "behind": result["total"],
-                            "age": commit_age(update["repo"], update["new_rev"]),
-                        }
-                        subjects += result["subjects"]
-                    except (urllib.error.URLError, KeyError, ValueError):
-                        # The forge is a nicety; the pin diff already stands.
-                        pass
-                detail["subjects"] = subjects
-                try:
-                    detail["changes"] = package_changes(
-                        self.repo, self.lockfile, self.probe, subjects)
-                except (OSError, subprocess.CalledProcessError, ValueError) as error:
-                    # A lock file without the configs next to it still has a
-                    # usable pin diff; only the "affects you" part is lost.
-                    detail["changes_error"] = describe_error(error)
-            return updates, text, detail
+            found = survey(self.repo, self.lockfile, self.workdir)
+            save_check(self.repo, self.lockfile, *found)
+            return found
 
         self.run_async(work, self.checked)
 
@@ -1321,33 +1424,44 @@ class Window(Adw.ApplicationWindow):
         self.sync_apply()
 
         if not self.updates:
-            pending = pending_tier()
-            headline = TIER_ACTION[pending] or "Everything is current"
-            self.say(headline)
-            self.status.set_icon_name(TIER_ICON[pending])
-            self.status.set_title(headline)
-            description = "No pin has moved since you last applied."
-            if pending:
-                description += "\n\nAn earlier rebuild is still waiting on it."
-            self.status.set_description(description)
+            self.show_current()
             return
 
+        self.say(self.verdict())
+
+    def show_current(self, age=None):
+        """The status page for having nothing to apply. `age` says how long
+        ago that was established, when it was not established just now."""
+        pending = pending_tier()
+        headline = TIER_ACTION[pending] or "Everything is current"
+        self.say(headline if age is None else f"{headline} · checked {ago(age)}")
+        self.status.set_icon_name(TIER_ICON[pending])
+        self.status.set_title(headline)
+        description = "No pin has moved since you last applied."
+        if pending:
+            description += "\n\nAn earlier rebuild is still waiting on it."
+        self.status.set_description(description)
+
+    def verdict(self):
+        """One line on what was found.
+
+        The headline is the noise ratio: most of those commits are for
+        packages this machine does not have.
+        """
         changes = self.detail.get("changes", {})
         affected = sum(len(changes.get(key, [])) for key, _ in CATEGORIES)
         commits = sum(v["behind"] for k, v in self.detail.items()
                       if isinstance(v, dict) and v.get("behind"))
-        # The headline is the noise ratio: most of those commits are for
-        # packages this machine does not have.
         if commits and affected:
-            verdict = f"{affected} of your packages change, out of {commits} commits"
+            line = f"{affected} of your packages change, out of {commits} commits"
         elif commits:
-            verdict = f"{commits} commits, none of them touch your packages"
+            line = f"{commits} commits, none of them touch your packages"
         else:
-            verdict = f"{affected} of your packages change"
+            line = f"{affected} of your packages change"
         action = TIER_ACTION[change_tier(changes)]
         if action:
-            verdict += f" · {action.lower()}"
-        self.say(verdict)
+            line += f" · {action.lower()}"
+        return line
 
 
     def apply(self, commit, rebuild):
