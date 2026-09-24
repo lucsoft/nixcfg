@@ -863,10 +863,27 @@ class NixProgress:
 # -----------------------------------------------------------------------------
 # git
 # -----------------------------------------------------------------------------
+def entry_detail(entry):
+    """What an entry changed, in words.
+
+    Not every entry has a version pair. One that the version diff could not
+    speak for is here because a commit subject named it — a package carrying
+    no version, or one patched without a bump — and for those the commits
+    are the whole of the evidence. The window says this in a subtitle; the
+    commit body says it in the same order for the same reason.
+    """
+    if entry.get("old"):
+        return f"{entry['old']} -> {entry['new']}"
+    if entry.get("installed"):
+        return f"{entry['installed']} installed, patched"
+    count = len(entry.get("subjects", []))
+    return f"{count} commit{'' if count == 1 else 's'}"
+
+
 def table(rows):
-    """Name and version pair per line, names padded to one column."""
-    width = max(len(name) for name, _, _ in rows)
-    return "\n".join(f"  {name:<{width}}  {old} -> {new}" for name, old, new in rows)
+    """Name and detail per line, names padded to one column."""
+    width = max(len(name) for name, _ in rows)
+    return "\n".join(f"  {name:<{width}}  {detail}" for name, detail in rows)
 
 
 def change_blocks(changes):
@@ -892,7 +909,7 @@ def change_blocks(changes):
             blocks.append(f"{label}:\n  {line}")
             continue
         blocks.append(f"{label}:\n" + table(
-            [(e["name"], e["old"], e["new"]) for e in entries]))
+            [(e["name"], entry_detail(e)) for e in entries]))
 
     action = TIER_ACTION[update_tier(changes)]
     if action:
