@@ -52,6 +52,7 @@ stdenvNoCC.mkDerivation {
       --replace-fail '#!/usr/bin/env python3' '#!${pythonEnv}/bin/python3'
 
     install -Dm644 versions.nix $out/share/npins-ui/versions.nix
+    install -Dm644 sizes.nix $out/share/npins-ui/sizes.nix
     install -Dm644 de.lucsoft.NpinsUi.svg \
       $out/share/icons/hicolor/scalable/apps/de.lucsoft.NpinsUi.svg
     mkdir -p $out/share
