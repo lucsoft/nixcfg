@@ -199,6 +199,21 @@ def compare(repo, old_rev, new_rev):
     return {"total": total, "subjects": subjects, "complete": len(commits) >= total}
 
 
+# Which pins can explain what is installed. versions.nix evaluates the two
+# configs against nixpkgs and home-manager and against nothing else, so a
+# commit from any other pin cannot be attributed to a package on this
+# machine. nixpkgs-unstable is the reason this matters: it feeds one
+# sandboxed program, but its commits name the same packages the stable tree
+# carries, and matching those against the closure reports a bump that is not
+# coming. Leaving them out hides nothing — the pin still shows as moved.
+CLOSURE_PINS = ("nixpkgs", "home-manager")
+
+
+def closure_subjects(by_pin):
+    """The commit subjects that may be matched against this machine."""
+    return [subject for pin in CLOSURE_PINS for subject in by_pin.get(pin, [])]
+
+
 def commit_age(repo, rev):
     stamp = github(f"/repos/{repo}/commits/{rev}")["commit"]["committer"]["date"]
     when = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
@@ -378,18 +393,22 @@ def subject_package(subject):
 
 
 def dependency_changes(subjects, already_shown):
-    """Packages that are only in the closure, matched by commit subject.
+    """Packages in the closure that a commit subject names, matched by name.
 
-    Version comparison cannot see these — a library is nobody's top-level
-    package — so the evidence is the commit itself. Heuristic, and it says
-    so: it rests on nixpkgs' `package: old -> new` convention and on the
-    closure that is installed *now*, not the one being built.
+    Version comparison cannot see most of these — a library is nobody's
+    top-level package — so the evidence is the commit itself. Heuristic, and
+    it says so: it rests on nixpkgs' `package: old -> new` convention and on
+    the closure that is installed *now*, not the one being built.
+
+    `already_shown` is what the version diff has already reported, so that
+    a package is not listed twice. Everything else comes back, declared or
+    not; the caller is what decides which heading it belongs under.
     """
     prefixes, installed = closure_contents()
     found = {}
     for subject in subjects:
         name, body = subject_package(subject)
-        if not name or name in already_shown:
+        if not name or name.lower() in already_shown:
             continue
         if name.lower() not in prefixes:
             continue
@@ -414,8 +433,10 @@ def dependency_changes(subjects, already_shown):
 def package_changes(repo, old_lockfile, new_lockfile, subjects=()):
     """Per category, what actually changes for this machine.
 
-    Apps, System and Drivers come from comparing versions; Dependencies come
-    from the commit range, because they are invisible to a top-level diff.
+    Two kinds of evidence feed the same four categories: a version pair from
+    comparing the two evaluations, and a commit subject for everything that
+    comparison cannot see. Which category an entry lands in is decided by
+    whether the configs declare it — never by which evidence found it.
     """
     before = package_versions(*store_paths(old_lockfile), repo)
     after = package_versions(*store_paths(new_lockfile), repo)
@@ -433,17 +454,37 @@ def package_changes(repo, old_lockfile, new_lockfile, subjects=()):
 
     # Anything carried by one of those two is reported there, and more
     # precisely: under a heading that says what to do about it.
-    claimed = {p["name"] for key in ("kernel", "graphics")
+    carried = {p["name"]: key for key in ("kernel", "graphics")
                for p in after.get(key, [])}
 
     for entry in diff("declared"):
-        if entry["name"] in claimed:
+        if entry["name"] in carried:
             continue
         bucket = "apps" if entry["name"].lower() in launchers else "system"
         changes[bucket].append(entry)
 
-    shown = {e["name"] for key, _ in CATEGORIES for e in changes[key]}
-    changes["dependencies"] = dependency_changes(subjects, shown)
+    # What the version diff could not speak for. diff() needs a version
+    # string on both sides and a change between them, so it is blind to a
+    # declared package carrying no version at all (nixos-enter) and to one
+    # patched without a bump (gnome-shell). Those are not dependencies —
+    # something names them — so route the subject match by where the package
+    # comes from, rather than filtering it and losing the news.
+    #
+    # Most specific first. A driver is named by hardware.graphics or
+    # boot.kernelPackages and never by the two package lists, so testing
+    # `declared` ahead of `carried` would file every one of them as a
+    # dependency and never reach the heading it belongs under.
+    declared = {p["name"].lower() for p in after.get("declared", [])}
+    reported = {e["name"].lower() for key, _ in CATEGORIES for e in changes[key]}
+
+    for entry in dependency_changes(subjects, reported):
+        name = entry["name"]
+        if name in carried:
+            changes[carried[name]].append(entry)
+        elif name.lower() in declared:
+            changes["apps" if name.lower() in launchers else "system"].append(entry)
+        else:
+            changes["dependencies"].append(entry)
 
     # Not categories — the verdict, measured rather than inferred from the
     # version numbers above, which is what makes it right even when a kernel
@@ -607,6 +648,10 @@ def survey(repo, lockfile, workdir):
     if not updates:
         return updates, text, detail
 
+    # Kept per pin while gathering, because how far a pin moved is reported
+    # for every pin while its commits may only be matched against the
+    # closure for some; see CLOSURE_PINS.
+    by_pin = {}
     for update in updates:
         if not (update["repo"] and update["old_rev"] and update["new_rev"]):
             continue
@@ -616,10 +661,14 @@ def survey(repo, lockfile, workdir):
                 "behind": result["total"],
                 "age": commit_age(update["repo"], update["new_rev"]),
             }
-            detail["subjects"] += result["subjects"]
+            by_pin[update["name"]] = result["subjects"]
         except (urllib.error.URLError, KeyError, ValueError):
             # The forge is a nicety; the pin diff already stands.
             pass
+
+    # Scoped once, here: the changelog shown per package reads from the same
+    # list the dependency match does.
+    detail["subjects"] = closure_subjects(by_pin)
 
     try:
         detail["changes"] = package_changes(
@@ -903,7 +952,10 @@ def worth_notifying(changes):
     # one dependency among dozens — but it is exactly the thing not to miss.
     # Counted in packages, not commits — two commits fixing one library is
     # one thing to know about, and the window counts it the same way.
-    cves = sum(1 for entry in changes.get("dependencies", [])
+    # Every category, not just Dependencies: a subject-matched entry is
+    # filed by whether the configs declare it, and a CVE fix can land in a
+    # declared package just as easily.
+    cves = sum(1 for key, _ in CATEGORIES for entry in changes.get(key, [])
                if any("cve-" in s.lower() for s in entry.get("subjects", [])))
     if cves:
         parts.append(f"{cves} with a CVE fix")
@@ -1251,9 +1303,10 @@ class Window(Adw.ApplicationWindow):
                 continue
             group = boxed_list()
             for entry in entries:
-                # Dependencies have no version pair — they are not top-level
-                # packages, so the commit subjects are all the evidence there
-                # is. Say that in the subtitle rather than showing "→".
+                # An entry the version diff could not speak for has no pair
+                # to show — a package carrying no version, or one patched
+                # without a bump. The commits are the evidence there, so say
+                # that in the subtitle rather than showing "→".
                 log = entry.get("subjects") or changelog_for(entry["name"], subjects)
                 if entry.get("old"):
                     subtitle = f"{entry['old']}  →  {entry['new']}"
