@@ -632,6 +632,29 @@ def pending_tier():
     return SESSION if session_stale() else NOTHING
 
 
+# gnome-session rather than logind, for both of these. Its Reboot() puts up
+# the confirmation everyone expects from the system menu and lets an app with
+# unsaved work inhibit it; calling logind directly would walk past both.
+#
+# CanReboot() is not asked first. It answers with a uint whose values this
+# code has no way to pin down, and guessing at an enum to grey out a button
+# is worse than letting the call fail and saying why.
+SESSION_MANAGER = ("org.gnome.SessionManager", "/org/gnome/SessionManager",
+                   "org.gnome.SessionManager")
+
+# Logout(0) is the mode that asks; 1 and 2 skip the dialog and force it.
+LOGOUT_ASKING = 0
+
+
+def end_session(tier):
+    """Hand the session manager what the tier says is left to do."""
+    method, args = (("Reboot", None) if tier == REBOOT
+                    else ("Logout", GLib.Variant("(u)", (LOGOUT_ASKING,))))
+    bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+    bus.call_sync(*SESSION_MANAGER, method, args, None,
+                  Gio.DBusCallFlags.NONE, -1, None)
+
+
 # -----------------------------------------------------------------------------
 # a check, and what the last one found
 # -----------------------------------------------------------------------------
@@ -1066,6 +1089,14 @@ class Window(Adw.ApplicationWindow):
             title="Pins",
             description="Check whether nixpkgs or Home Manager have moved.",
         )
+        # The status page is the only place this belongs: it is where the
+        # window says something is still owed, and it is never on screen at
+        # the same time as a list of updates that ought to be applied first.
+        self.finish_tier = NOTHING
+        self.finish_button = Gtk.Button(halign=Gtk.Align.CENTER, visible=False,
+                                        css_classes=["suggested-action", "pill"])
+        self.finish_button.connect("clicked", lambda _b: self.finish())
+        self.status.set_child(self.finish_button)
         # The rebuild page: a real progress bar fed by nix's own counters,
         # over the log it is counting.
         self.progress = Gtk.ProgressBar(show_text=True, margin_top=12,
@@ -1156,6 +1187,23 @@ class Window(Adw.ApplicationWindow):
     def toast(self, text):
         self.toasts.add_toast(Adw.Toast(title=text))
 
+    def offer(self, tier):
+        """Put what is owed on the status page as something to press."""
+        self.finish_tier = tier
+        self.finish_button.set_visible(tier != NOTHING)
+        if tier == REBOOT:
+            self.finish_button.set_label("Restart")
+        elif tier == SESSION:
+            self.finish_button.set_label("Log Out")
+
+    def finish(self):
+        # gnome-session takes it from here, confirmation dialog and all, so
+        # there is nothing to do but hand it over and report a refusal.
+        try:
+            end_session(self.finish_tier)
+        except GLib.Error as error:
+            self.fail(error)
+
     def fail(self, error):
         """Errors carry a command's stderr, which a toast would truncate."""
         dialog = Adw.AlertDialog(heading="Something went wrong",
@@ -1228,6 +1276,7 @@ class Window(Adw.ApplicationWindow):
         try:
             read_pins(self.lockfile)
         except (OSError, ValueError, KeyError) as error:
+            self.offer(NOTHING)
             self.status.set_title("Cannot read the pins")
             self.status.set_description(str(error))
             self.stack.set_visible_child_name("status")
@@ -1237,6 +1286,7 @@ class Window(Adw.ApplicationWindow):
         # evaluation — it is four symlinks — so it is the one thing the
         # window can answer the moment it opens.
         pending = pending_tier()
+        self.offer(pending)
         if pending:
             self.status.set_icon_name(TIER_ICON[pending])
             self.status.set_title(TIER_ACTION[pending])
@@ -1271,6 +1321,7 @@ class Window(Adw.ApplicationWindow):
         # out on the count alone would throw the measurement away.
         if not total and not changes.get("reboot_added"):
             pending = pending_tier()
+            self.offer(pending)
             self.status.set_icon_name(TIER_ICON[pending])
             self.status.set_title("Nothing you installed changes")
             description = "The pins moved, but not through any of your packages."
@@ -1488,6 +1539,7 @@ class Window(Adw.ApplicationWindow):
         pending = pending_tier()
         headline = TIER_ACTION[pending] or "Everything is current"
         self.say(headline if age is None else f"{headline} · checked {ago(age)}")
+        self.offer(pending)
         self.status.set_icon_name(TIER_ICON[pending])
         self.status.set_title(headline)
         description = "No pin has moved since you last applied."
@@ -1554,6 +1606,10 @@ class Window(Adw.ApplicationWindow):
         # "Apply" reads like "installed".
         self.say("Pins written — nothing is installed until you rebuild",
                  seconds=0)
+        # No offer here even with a reboot owed from before: the page says
+        # to rebuild, and a Restart button next to it would read as the way
+        # to finish what was just written, which it is not.
+        self.offer(NOTHING)
         self.status.set_icon_name("software-update-available-symbolic")
         self.status.set_title("Rebuild to install")
         self.status.set_description(
@@ -1656,6 +1712,7 @@ class Window(Adw.ApplicationWindow):
 
         if cancelled:
             self.say("Rebuild cancelled")
+            self.offer(NOTHING)
             self.status.set_icon_name("software-update-available-symbolic")
             self.status.set_title("Rebuild cancelled")
             self.status.set_description("The pins are written; nothing was "
@@ -1663,6 +1720,7 @@ class Window(Adw.ApplicationWindow):
             return
         if error:
             self.say("Rebuild failed")
+            self.offer(NOTHING)
             self.fail(error)
             return
 
@@ -1676,6 +1734,7 @@ class Window(Adw.ApplicationWindow):
         tier = pending_tier()
         headline = TIER_ACTION[tier] or "Installed"
         self.say(headline)
+        self.offer(tier)
         self.status.set_icon_name(TIER_ICON[tier])
         self.status.set_title(headline)
         description = "The new system and home generations are live."
