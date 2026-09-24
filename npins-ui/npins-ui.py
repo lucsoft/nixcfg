@@ -5,6 +5,8 @@ Answers three questions, cheapest first: has anything moved, how far, and
 which of the packages I actually installed does it change.
 """
 
+import contextlib
+import fcntl
 import hashlib
 import json
 import os
@@ -709,6 +711,56 @@ def survey(repo, lockfile, workdir):
 # has its own cache already, keyed by the pins it ran against.
 STATE = CACHE / "last-check.json"
 
+# A check running outside the window — the timer's — is something the window
+# has to be able to see, or its own Check button would start a second one
+# racing the first for this same file, and one of the two answers would be
+# thrown away. The marker is renamed into place already locked, so it never
+# shows up unheld; and the lock is what a killed check cannot leave behind,
+# because the kernel drops it. A file nobody holds therefore reads as free.
+RUNNING = CACHE / "check.lock"
+
+
+@contextlib.contextmanager
+def marker():
+    """Hold the file that says a check is running, for as long as it runs."""
+    fd, tmp = None, CACHE / "check.lock.new"
+    try:
+        CACHE.mkdir(parents=True, exist_ok=True)
+        fd = os.open(tmp, os.O_CREAT | os.O_WRONLY, 0o644)
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        os.replace(tmp, RUNNING)
+    except OSError:
+        # A marker that will not be written is a hint the window does not
+        # get, not a reason to skip the check.
+        if fd is not None:
+            os.close(fd)
+            fd = None
+        with contextlib.suppress(OSError):
+            tmp.unlink()
+    try:
+        yield
+    finally:
+        if fd is not None:
+            with contextlib.suppress(OSError):
+                RUNNING.unlink()
+            os.close(fd)
+
+
+def check_running():
+    """Whether a check is in flight somewhere other than this process."""
+    try:
+        fd = os.open(RUNNING, os.O_RDONLY)
+    except OSError:
+        return False
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        return True
+    finally:
+        os.close(fd)
+    return False
+
+
 # How long the stored answer counts as current — the timer's own interval
 # from home.nix, because that is the promise being leaned on. Past it the
 # state is not stale by a little, it is unattended, and the window goes and
@@ -743,7 +795,9 @@ def save_check(repo, lockfile, updates, text, detail):
 def load_check(repo, lockfile):
     """The last check, if it still describes this repo's pins.
 
-    Returns (age in seconds, updates, probed lock file, detail), or None.
+    Returns (stamp, updates, probed lock file, detail), or None. The stamp
+    rather than an age because the window also uses it to tell a check it
+    wrote itself from one that landed underneath it.
     """
     try:
         state = json.loads(STATE.read_text())
@@ -762,8 +816,8 @@ def load_check(repo, lockfile):
         changes["reboot"] = reboot_needed(boot)
         changes["reboot_added"] = reboot_needed(boot, "/run/current-system")
 
-    age = max(0, int(time.time()) - state.get("stamp", 0))
-    return age, state.get("updates", []), state.get("text"), detail
+    return (state.get("stamp", 0), state.get("updates", []),
+            state.get("text"), detail)
 
 
 def ago(seconds):
@@ -1016,7 +1070,7 @@ def worth_notifying(changes):
 def run_check(repo):
     repo = Path(repo)
     lockfile = repo / LOCKFILE
-    with tempfile.TemporaryDirectory() as workdir:
+    with tempfile.TemporaryDirectory() as workdir, marker():
         # The commit range is what surfaces dependency and CVE changes, so
         # the headless check pays for it too. A forge that is down costs the
         # dependency half, not the whole answer.
@@ -1044,6 +1098,11 @@ def run_check(repo):
 # -----------------------------------------------------------------------------
 # UI
 # -----------------------------------------------------------------------------
+# Said while a check the window did not start is running. A constant because
+# the window also takes the line back down by recognising it.
+CHECKING_ELSEWHERE = "Checking in the background…"
+
+
 def boxed_list():
     box = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE)
     box.add_css_class("boxed-list")
@@ -1067,6 +1126,10 @@ class Window(Adw.ApplicationWindow):
         self.pending_text = None
         self.updates = []
         self.detail = {}
+        # When the check on screen was made, so a state file written while
+        # the window is open can be told from the one it already shows.
+        self.state_stamp = 0
+        self.working = False
         self._banner_timer = 0
         self.proc = None
         self.cancelled = False
@@ -1185,8 +1248,7 @@ class Window(Adw.ApplicationWindow):
         # was two fetches for one answer.
         restored = load_check(self.repo, self.lockfile)
         if restored:
-            age, self.updates, text, self.detail = restored
-            self.pending_text = text if self.updates else None
+            age = self.adopt(restored)
 
         self.render()
         self.sync_apply()
@@ -1199,6 +1261,8 @@ class Window(Adw.ApplicationWindow):
             self.say(f"{self.verdict()} · checked {ago(age)}")
         else:
             self.show_current(age)
+
+        self.watch_state()
 
     # -- helpers --------------------------------------------------------------
     def toast(self, text):
@@ -1252,8 +1316,9 @@ class Window(Adw.ApplicationWindow):
         return GLib.SOURCE_REMOVE
 
     def busy(self, active, message=None):
+        self.working = active
         self.spinner.set_visible(active)
-        self.check_button.set_sensitive(not active)
+        self.sync_check()
         self.sync_apply(busy=active)
         if message:
             self.say(message, seconds=0)
@@ -1518,7 +1583,84 @@ class Window(Adw.ApplicationWindow):
         dialog.present(self)
 
     # -- actions --------------------------------------------------------------
+    def adopt(self, restored):
+        """Take a stored check as what the window holds. Returns its age."""
+        self.state_stamp, self.updates, text, self.detail = restored
+        self.pending_text = text if self.updates else None
+        return max(0, int(time.time()) - self.state_stamp)
+
+    def watch_state(self):
+        """Follow what happens outside the window, for as long as it is open:
+        the answer the timer writes, and the marker it holds while it is
+        still working one out.
+
+        The timer writes what it finds to the same file the window opened
+        on, so a check landing while it sits there is already the better
+        answer — without this the window keeps showing the older one until
+        it is told to check again, or reopened.
+        """
+        try:
+            CACHE.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            return          # nothing is going to be written there either
+        self.state_watch = Gio.File.new_for_path(str(STATE)).monitor_file(
+            Gio.FileMonitorFlags.WATCH_MOVES, None)
+        self.state_watch.connect("changed", self.state_changed)
+        self.check_watch = Gio.File.new_for_path(str(RUNNING)).monitor_file(
+            Gio.FileMonitorFlags.WATCH_MOVES, None)
+        self.check_watch.connect(
+            "changed", lambda *_args: self.sync_check())
+        self.sync_check()       # one may be running already
+
+    def sync_check(self):
+        """Checking is off while a check is running, this window's own or the
+        timer's underneath it: a second one would race the first for the
+        state file, and one of the two answers would be dropped.
+        """
+        # A rebuild counts too: it is the window busy in its own way, and
+        # a marker dropped mid-build would otherwise hand the button back.
+        busy = self.working or self.proc is not None
+        elsewhere = not busy and check_running()
+        self.check_button.set_sensitive(not busy and not elsewhere)
+        if elsewhere:
+            self.say(CHECKING_ELSEWHERE, seconds=0)
+        elif self.banner.get_title() == CHECKING_ELSEWHERE:
+            # What it found comes in through the state watch and puts its own
+            # line up. Only one still standing unanswered is the window's to
+            # take back down.
+            self.say("")
+
+    def state_changed(self, _monitor, _file, _other, _event):
+        """Every event is read back, rather than only the ones that mean a
+        finished write: save_check renames the file into place, and a state
+        that is half written, for another repo, or for pins that have moved
+        since is one load_check turns down anyway."""
+        if self.working or self.proc:
+            # A rebuild owns the window, and a check of the window's own is
+            # about to arrive carrying this same answer.
+            return
+        restored = load_check(self.repo, self.lockfile)
+        if not restored or restored[0] <= self.state_stamp:
+            return
+        self.adopt(restored)
+        self.present_check()
+
+    def present_check(self):
+        """Put what the window holds on screen, however it got there."""
+        self.render()
+        self.sync_apply()
+        if self.updates:
+            self.say(self.verdict())
+        else:
+            self.show_current()
+
     def check(self):
+        if check_running():
+            # The timer got there first — the same check, whose answer
+            # arrives through the watch. A second one would only race it.
+            self.sync_check()
+            return
+
         self.busy(True, "Checking pins…")
 
         def work():
@@ -1541,14 +1683,10 @@ class Window(Adw.ApplicationWindow):
         # pending_text has to mean "there is something to write", or the
         # Apply button reappears on the next check with nothing to apply.
         self.pending_text = text if updates else None
-        self.render()
-        self.sync_apply()
-
-        if not self.updates:
-            self.show_current()
-            return
-
-        self.say(self.verdict())
+        # save_check has just written this one; dated here so the watch does
+        # not read it straight back in as news.
+        self.state_stamp = int(time.time())
+        self.present_check()
 
     def show_current(self, age=None):
         """The status page for having nothing to apply. `age` says how long
@@ -1724,7 +1862,7 @@ class Window(Adw.ApplicationWindow):
         self.proc = None
         self.cancelled = False
         self.cancel_button.set_visible(False)
-        self.check_button.set_sensitive(True)
+        self.sync_check()
         self.stack.set_visible_child_name("status")
 
         if cancelled:
