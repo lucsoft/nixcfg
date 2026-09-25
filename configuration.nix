@@ -153,7 +153,11 @@ in
   users.users."lucsoft" = {
     isNormalUser = true;
     description = "lucsoft";
-    extraGroups = [ "networkmanager" "wheel" ];
+    # input/uinput are Sunshine's. It reads force feedback back off the virtual
+    # gamepads it creates, and upstream asks for `input` outright. /dev/uinput
+    # already carries a uaccess ACL, but that comes from Steam's udev rules —
+    # the group is what keeps Sunshine working independently of Steam.
+    extraGroups = [ "networkmanager" "wheel" "input" "uinput" ];
   };
 
   # Steam must be a system module, not a package: it needs 32-bit graphics
@@ -179,6 +183,28 @@ in
   # No global args: Lutris emits its own --prefer-vk-device from the GPU
   # dropdown, and passing it twice leaves which one wins undefined.
   programs.gamescope.enable = true;
+
+  # The host half of Moonlight. Moonlight is the client and is not installed
+  # here; Sunshine is what streams this desktop out to one.
+  #
+  # capSysAdmin is not optional on this machine. The session is GNOME on
+  # Wayland, where the only capture path left is kmsgrab, and reading another
+  # process' framebuffer through drmModeGetFB2 needs CAP_SYS_ADMIN. Without it
+  # Sunshine still starts, pairs, and streams a black screen.
+  #
+  # The wrapper avoids the AT_SECURE trap that keeps capSysNice off for
+  # gamescope above: sunshine finds its libraries through a baked-in RUNPATH,
+  # so losing LD_LIBRARY_PATH costs it nothing.
+  #
+  # `settings` stays empty on purpose. The module only passes sunshine a config
+  # file once some setting other than the port is set, and a config file on the
+  # command line locks the web UI read-only — which is where pairing, the
+  # credentials and the app list all live.
+  services.sunshine = {
+    enable = true;
+    openFirewall = true;   # TCP 47984/47989/47990/48010, UDP 47998-48000/48002/48010
+    capSysAdmin = true;
+  };
 
   # nixpkgs ships an en-US Firefox; German needs both the pack and a locale.
   programs.firefox = {
