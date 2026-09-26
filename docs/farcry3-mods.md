@@ -311,6 +311,29 @@ the first place.
 Under DX9 no such buffer exists: the widest candidate was 2560×1440 against a
 3440×1440 image, which has to be picked by hand and never matches.
 
+### Motion vectors have to be produced, and ordered
+
+ReShade never receives motion vectors from the game — it sees a finished frame
+and a depth buffer, nothing else. A separate effect has to estimate them and
+write them into a shared texture.
+
+`dh_uber_rt` picks its source by preprocessor definition:
+`USE_MARTY_LAUNCHPAD_MOTION`, `USE_VORT_MOTION`, or — with both left at `0`,
+which is the default — a texture called `texMotionVectors`. AlucardDH's pack
+already ships the matching producer, `dh_uber_motion.fx`, declaring that exact
+name in the same `RG16F` format, so nothing extra needs installing. It just
+has to be enabled.
+
+**Order matters**: ReShade runs techniques in list order, so
+`DH_UBER_MOTION_020` has to sit above `dh_uber_rt`, or the vectors read are
+the ones not yet written this frame. Check it with the shader's own
+Debug → `Display` → `Motion` view: panning the camera should tint the frame
+evenly; a black field means the wiring is not live.
+
+Without them, temporal accumulation cannot reproject, so every camera movement
+restarts the estimate — which is most of the noise that denoiser settings get
+blamed for.
+
 ### The d3dcompiler trap
 
 First launch produced 66 red entries in the overlay — every single effect
