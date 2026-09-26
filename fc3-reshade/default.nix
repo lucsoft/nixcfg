@@ -131,12 +131,21 @@ let
 
   # ReShade reads this from next to the DLL. Without the search paths it
   # starts with an empty effect list and looks broken.
+  #
+  # RESHADE_DEPTH_INPUT_IS_REVERSED defaults to 1 in ReShade.fxh, and Far Cry 3
+  # — a 2012 title, from before reversed-Z was common — does not use it. Left
+  # at the default, `depth = 1.0 - depth` pushes every value to the end of the
+  # range: the depth view is a flat white field, while surface normals still
+  # look right, because those are built from differences between neighbouring
+  # pixels and survive the flip. That combination reads like "no depth buffer"
+  # and is really "depth read backwards", which cost a lot of time here.
   iniFile = writeText "ReShade.ini" ''
     [GENERAL]
     EffectSearchPaths=.\reshade-shaders\Shaders\**
     TextureSearchPaths=.\reshade-shaders\Textures\**
     PresetPath=.\ReShadePreset.ini
     PerformanceMode=0
+    PreprocessorDefinitions=RESHADE_DEPTH_INPUT_IS_REVERSED=0
 
     [INPUT]
     KeyOverlay=36,0,0,0

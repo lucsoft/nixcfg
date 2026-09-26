@@ -190,26 +190,26 @@ Lesson: when a mod author ships a config and says it is required, test it
 verbatim before reasoning about which parts matter. Reasoning first cost
 several launches here, and one of the arguments was based on a bad grep.
 
-### The ReShade conflict that remains
+### What of his profile was actually needed
 
-His profile carries `MSAALevel="4"`, and a multisampled depth buffer cannot be
-read at all — so as it stands, the configuration that keeps the game alive is
-also the one that denies ReShade the depth buffer, and with it ambient
-occlusion and GI.
+His file also carries `MSAALevel="4"`, which ReShade cannot work with — a
+multisampled depth buffer is unreadable. So the configuration that kept the
+game alive looked like the one that ruled out ambient occlusion and GI.
 
-That is the open question, and it is decided by testing rather than argument:
-start from his file, which works, and walk settings back toward ours one at a
-time until either the crash returns or nothing of his is left that we need.
+It was resolved by walking his settings back toward ours one at a time,
+each step verified by loading the same savegame:
 
-Order of the walk, each verified by loading the same savegame:
+| step | changed | result |
+|---|---|---|
+| 0 | his file verbatim | loads |
+| 1 | resolution to 3440×1440, language to German | loads |
+| 2 | `MSAALevel` to `0`, ReShade re-installed as `dxgi.dll` | loads |
 
-1. Resolution back to 3440×1440 and the language back to German. Everything
-   else stays his.
-2. `MSAALevel` to `0`, and ReShade re-installed as `dxgi.dll`.
-
-If step 2 brings the crash back, MSAA is load-bearing and the choice is real:
-HD textures under DX11 without depth effects, or DX9 with them. If it does
-not, all of it fits together.
+So neither the resolution nor MSAA was load-bearing, and neither is ReShade.
+What remains of his that we do not otherwise set: **`Borderless="1"`**,
+`GPUMaxBufferedFrames="0"`, `VSync="0"`. Exclusive fullscreen is a known
+irritant under DXVK, which makes `Borderless` the likely one — though that was
+not isolated further, because the configuration works.
 
 ## For lighting and textures
 
@@ -230,25 +230,33 @@ the texture work, which avoids a Gibbed merge.
 
 ## If ReShade is added later
 
-Ambient occlusion and any screen-space GI need the depth buffer, and Far Cry 3
-is unusual here:
+Ambient occlusion and any screen-space GI need the depth buffer, which is the
+whole reason the renderer mattered here.
 
-- **The depth buffer is only readable in DX9 mode**; in DX11 it stays
-  empty.[^depth] DX11 is also reported broken under Proton for this
-  game.[^protondb] So `UseD3D11="0"`, and hook `bin/farcry3.exe`, not
-  `farcry3_d3d11.exe`.
-- **MSAA has to be off.** ReShade cannot read a multisampled depth buffer, and
-  DXVK additionally corrupts this game's waterfalls with MSAA on.[^msaa] Set
-  `MSAALevel="0"` and use SMAA inside ReShade.
-- The injected DLL is `d3d9.dll` and must be **ReShade32.dll** renamed. Launch
-  option: `WINEDLLOVERRIDES="d3d9=n,b" %command%`.
+**The widely repeated claim that Far Cry 3's depth buffer only works in DX9 is
+wrong**, at least with ReShade 6 under DXVK. It comes from a 2013 forum
+post[^depth] and was taken at face value for most of this work. Tested on
+2026-09-26: under DX11 the buffer is populated, `DisplayDepth` shows real
+geometry, and the buffer matches the 3440×1440 swap chain instead of the
+2560×1440 mismatch DX9 produced. ProtonDB's "DX11 is broken under Proton" for
+this game[^protondb] did not reproduce either.
+
+What does hold:
+
+- **MSAA has to be off** in either mode — a multisampled depth buffer cannot
+  be read, and DXVK additionally corrupts this game's waterfalls with MSAA
+  on.[^msaa] `MSAALevel="0"`, and SMAA inside ReShade instead.
+- The injected DLL is **ReShade32.dll** renamed — 32-bit, since both
+  executables are — as `dxgi.dll` for DX11 or `d3d9.dll` for DX9.
+
+DX9 is still a working fallback (`fc3-reshade dx9`), but it costs the shader
+model 3 ceiling: `dh_ahoh.fx` fails there on `X3535: Bitwise operations not
+supported on target ps_3_0`, 65 of 66 effects instead of all of them. And it
+pulls against the texture pack, which is built for DX11.
 
 `GamerProfile.xml` lives in the Proton prefix:
 
     ~/.steam/steam/steamapps/compatdata/220240/pfx/drive_c/users/steamuser/Documents/My Games/Far Cry 3/GamerProfile.xml
-
-This pulls against Mud's Mod, which is built for DX11. Textures via DX11 or
-depth-buffer effects via DX9 — not both.
 
 On shaders: Marty McFly's **RTGI** is paid (Patreon). Free screen-space
 alternatives are **YASSGI**, **dh_rtgi** from
@@ -257,6 +265,51 @@ alternatives are **YASSGI**, **dh_rtgi** from
 [RTShade](https://github.com/DHYCIX/RTShade). Expect mixed results: a 2012
 jungle full of volumetric fog gives screen-space GI little to work with, since
 light leaving the frame stops existing for it.
+
+### The depth buffer reads backwards by default
+
+Finding a depth buffer is not the same as reading it correctly. With the right
+buffer selected, `DisplayDepth` still showed **surface normals but a blank
+depth map** — and switching between buffers changed nothing, which is the tell
+that the buffer is not the problem.
+
+`RESHADE_DEPTH_INPUT_IS_REVERSED` defaults to `1` in `ReShade.fxh`, and Far Cry
+3 does not use reversed-Z; it predates the practice. Left at the default,
+`depth = 1.0 - depth` pushes every value against the end of the range and the
+depth view goes flat white. Normals survive it, because they are built from
+differences between neighbouring pixels — so the picture looks like "there is
+depth here" while every distance the GI computes is wrong.
+
+    RESHADE_DEPTH_INPUT_IS_REVERSED=0
+
+set under "Edit global preprocessor definitions", and seeded into the
+`ReShade.ini` that `fc3-reshade` writes. The live preview in `DisplayDepth`
+deliberately *ignores* preprocessor definitions, so getting the preview right
+changes nothing for `dh_uber_rt` until the global definition is set too.
+
+`RESHADE_DEPTH_INPUT_IS_LOGARITHMIC` makes no visible difference here, and the
+arithmetic says why: with `C = 0.01`, the transform is
+`(exp(d·log(1.01)) − 1) / 0.01`, and since `log(1.01) ≈ 0.00995` with
+`exp(x) ≈ 1 + x` at that scale, the whole thing reduces to about `d × 0.995`.
+Near enough to the identity to see nothing. Leave it off.
+
+### Picking the depth buffer
+
+The Generic Depth add-on lists candidates by resolution and draw calls, and
+draw-call count alone is misleading: a 1024×1024 shadow map can carry more
+draw calls than the scene buffer, because it redraws much of the world from a
+light's point of view. Selecting one renders a landscape from an unfamiliar
+angle — recognisable once seen.
+
+Take the entry matching the swap chain. Under DX11 that is
+`3440x1440 | D24S8 | 1102 draw calls | 2663919 vertices`, and because it
+matches the aspect ratio, `Aspect ratio heuristic` can stay on "Similar aspect
+ratio" and will find it again by itself after a restart. Setting that
+heuristic to "None" is what surfaces the square shadow maps as candidates in
+the first place.
+
+Under DX9 no such buffer exists: the widest candidate was 2560×1440 against a
+3440×1440 image, which has to be picked by hand and never matches.
 
 ### The d3dcompiler trap
 
