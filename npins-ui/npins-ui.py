@@ -503,25 +503,38 @@ def package_changes(repo, old_lockfile, new_lockfile, subjects=()):
 
 
 # -----------------------------------------------------------------------------
-# taking effect — nothing, log out, or reboot
+# taking effect — nothing, log out, reboot, or build
 # -----------------------------------------------------------------------------
-# Three tiers, because there are only three answers. Almost everything a pin
-# move brings is live the moment the rebuild finishes: a new binary is picked
-# up the next time it starts, and switch-to-configuration has already
-# restarted the services it had to. Two things outlast the switch — what the
-# session loaded at login, and what the kernel came up with — and those are
-# the only two the user has to do anything about.
-NOTHING, SESSION, REBOOT = 0, 1, 2
+# What is left to do, in four answers. Almost everything a pin move brings is
+# live the moment the rebuild finishes: a new binary is picked up the next
+# time it starts, and switch-to-configuration has already restarted the
+# services it had to. Two things outlast the switch — what the session loaded
+# at login, and what the kernel came up with. BUILD is the odd one out: not a
+# rebuild that has yet to take effect, but one that never ran.
+NOTHING, SESSION, REBOOT, BUILD = 0, 1, 2, 3
 
 TIER_ACTION = {
     NOTHING: "",
     SESSION: "Log out and back in to finish",
     REBOOT: "Reboot to finish",
+    BUILD: "Rebuild to install",
 }
 TIER_ICON = {
     NOTHING: "object-select-symbolic",
     SESSION: "system-log-out-symbolic",
     REBOOT: "system-reboot-symbolic",
+    BUILD: "software-update-available-symbolic",
+}
+
+# Why the status page is asking. The session tiers are about a rebuild that
+# happened; BUILD is about one that did not.
+EARLIER_REBUILD = ("An earlier rebuild is waiting on it. Whether the pins "
+                   "have moved is a separate question.")
+TIER_PENDING = {
+    SESSION: EARLIER_REBUILD,
+    REBOOT: EARLIER_REBUILD,
+    BUILD: ("The pins on disk have never been built — applying was "
+            "interrupted, or npins moved them from a terminal."),
 }
 
 STORE_ROOT = re.compile(r"^(/nix/store/[a-z0-9]{32}-[^/]+)")
@@ -627,8 +640,58 @@ def update_tier(changes):
     return NOTHING
 
 
-def pending_tier():
-    """What is owed right now, with nothing pending to apply."""
+# What the running system was built from. /run/current-system is a symlink,
+# so this reads as the new value the moment a switch lands.
+SYSTEM_VERSION = Path("/run/current-system/nixos-version")
+
+
+def system_revision():
+    """Which nixpkgs commit /run/current-system came from.
+
+    The pin is the Hydra channel release, whose tarball carries
+    .version-suffix, so this file ends in the short revision of the very
+    commit the lock file names: 26.05.10529.c508844df6c2.
+    """
+    try:
+        label = SYSTEM_VERSION.read_text().strip()
+    except OSError:
+        return None
+    return label.rsplit(".", 1)[-1] or None
+
+
+def rebuild_owed(lockfile):
+    """Whether what the lock file says has never been built.
+
+    This is what a dismissed password dialog leaves behind. The pins are
+    written before the rebuild starts, because nixos-rebuild reads them off
+    the disk, so cancelling at the prompt keeps the write and loses the
+    install; `npins update` in a terminal leaves the same state. Both halves
+    of the comparison are read off the machine, so the answer survives the
+    window being closed, the way the reboot one does.
+
+    Only nixpkgs is asked about: it is the only pin the system is built
+    from, and the system is the half that needs a password and so the half
+    that gets abandoned. A home-manager move on its own goes unnoticed here.
+    """
+    try:
+        pinned = pin_revision(read_pins(lockfile).get("nixpkgs", {}))
+    except (OSError, ValueError, KeyError):
+        return False
+    running = system_revision()
+    if not pinned or not running:
+        return False
+    # Channel pins carry the short revision, git pins the full one.
+    return not (pinned.startswith(running) or running.startswith(pinned))
+
+
+def pending_tier(lockfile=None):
+    """What is owed right now, with nothing pending to apply.
+
+    A rebuild outranks the other two: logging out of or rebooting into a
+    system that was never built finishes nothing.
+    """
+    if lockfile and rebuild_owed(lockfile):
+        return BUILD
     if reboot_needed(boot_paths("/run/current-system")):
         return REBOOT
     return SESSION if session_stale() else NOTHING
@@ -1081,7 +1144,9 @@ def run_check(repo):
         save_check(repo, lockfile, updates, text, detail)
 
         if not updates:
-            print("All pins current.")
+            # Current pins and an installed system are different claims.
+            print("All pins current, but not installed — a rebuild is owed."
+                  if rebuild_owed(lockfile) else "All pins current.")
             return 0
         if "changes" not in detail:
             # Without the version diff there is no way to judge, so say the
@@ -1276,8 +1341,16 @@ class Window(Adw.ApplicationWindow):
             self.finish_button.set_label("Restart")
         elif tier == SESSION:
             self.finish_button.set_label("Log Out")
+        elif tier == BUILD:
+            self.finish_button.set_label("Rebuild")
 
     def finish(self):
+        if self.finish_tier == BUILD:
+            # The pins are written already, so this is the rebuild half of
+            # apply on its own. What the interrupted run knew about the
+            # session it could not keep is gone if the window was reopened.
+            self.start_rebuild()
+            return
         # gnome-session takes it from here, confirmation dialog and all, so
         # there is nothing to do but hand it over and report a refusal.
         try:
@@ -1364,18 +1437,15 @@ class Window(Adw.ApplicationWindow):
             self.stack.set_visible_child_name("status")
             return
 
-        # Whether a reboot is owed takes no check, no network and no
-        # evaluation — it is four symlinks — so it is the one thing the
+        # What is owed takes no check, no network and no evaluation — four
+        # symlinks and two version strings — so it is the one thing the
         # window can answer the moment it opens.
-        pending = pending_tier()
+        pending = pending_tier(self.lockfile)
         self.offer(pending)
         if pending:
             self.status.set_icon_name(TIER_ICON[pending])
             self.status.set_title(TIER_ACTION[pending])
-            self.status.set_description(
-                "An earlier rebuild is waiting on it. Whether the pins have "
-                "moved is a separate question."
-            )
+            self.status.set_description(TIER_PENDING[pending])
 
         changes = self.detail.get("changes")
         if changes is not None:
@@ -1402,6 +1472,9 @@ class Window(Adw.ApplicationWindow):
         # That is the whole reason the reboot half is measured, and bailing
         # out on the count alone would throw the measurement away.
         if not total and not changes.get("reboot_added"):
+            # No lock file on purpose: an update is pending here, and an
+            # owed rebuild would offer to build the very pins this page is
+            # asking to replace.
             pending = pending_tier()
             self.offer(pending)
             self.status.set_icon_name(TIER_ICON[pending])
@@ -1691,15 +1764,22 @@ class Window(Adw.ApplicationWindow):
     def show_current(self, age=None):
         """The status page for having nothing to apply. `age` says how long
         ago that was established, when it was not established just now."""
-        pending = pending_tier()
+        pending = pending_tier(self.lockfile)
         headline = TIER_ACTION[pending] or "Everything is current"
         self.say(headline if age is None else f"{headline} · checked {ago(age)}")
         self.offer(pending)
         self.status.set_icon_name(TIER_ICON[pending])
         self.status.set_title(headline)
-        description = "No pin has moved since you last applied."
-        if pending:
-            description += "\n\nAn earlier rebuild is still waiting on it."
+        # "Nothing new to write" and "what is written is installed" are two
+        # claims, and this page used to make the second on the strength of
+        # the first.
+        if pending == BUILD:
+            description = ("No pin has moved since these were written, and "
+                           "what is written has not been built.")
+        else:
+            description = "No pin has moved since you last applied."
+            if pending:
+                description += "\n\nAn earlier rebuild is still waiting on it."
         self.status.set_description(description)
 
     def verdict(self):
@@ -1865,17 +1945,26 @@ class Window(Adw.ApplicationWindow):
         self.sync_check()
         self.stack.set_visible_child_name("status")
 
+        # Both of these leave the pins written and the rebuild part way
+        # through, which is what BUILD is for. Offered without asking
+        # rebuild_owed() first: a run that stopped in its home half leaves a
+        # system already matching the pin, and is still unfinished.
         if cancelled:
             self.say("Rebuild cancelled")
-            self.offer(NOTHING)
-            self.status.set_icon_name("software-update-available-symbolic")
+            self.offer(BUILD)
+            self.status.set_icon_name(TIER_ICON[BUILD])
             self.status.set_title("Rebuild cancelled")
-            self.status.set_description("The pins are written; nothing was "
-                                        "installed.")
+            self.status.set_description("The pins are written and the rebuild "
+                                        "stopped part way. Rebuild picks it up "
+                                        "from the top.")
             return
         if error:
             self.say("Rebuild failed")
-            self.offer(NOTHING)
+            self.offer(BUILD)
+            self.status.set_icon_name(TIER_ICON[BUILD])
+            self.status.set_title("Rebuild failed")
+            self.status.set_description("The pins are written and the rebuild "
+                                        "stopped part way.")
             self.fail(error)
             return
 
@@ -1886,7 +1975,7 @@ class Window(Adw.ApplicationWindow):
         if self.applied_session:
             mark_session_stale()
 
-        tier = pending_tier()
+        tier = pending_tier(self.lockfile)
         headline = TIER_ACTION[tier] or "Installed"
         self.say(headline)
         self.offer(tier)
