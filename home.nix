@@ -50,19 +50,28 @@ let
     mirror="$HOME/.local/share/applications"
     mkdir -p "$mirror"
 
-    # Pointing into the profile is the ownership mark. Nothing else in here
-    # does, so this drops the last run's mirror and only that.
-    ${pkgs.findutils}/bin/find "$mirror" -maxdepth 1 -type l \
-      -lname "$profile/*" -delete
+    # A link that goes away and comes back is an app uninstalled and installed
+    # again as far as the session is concerned: the Shell drops the object
+    # that owns that app's open windows and builds a fresh one, and the dash
+    # icon loses its running dot until the app is restarted. So the mirror is
+    # never wiped and laid down again — an entry that is already right is left
+    # alone, and only the difference is applied.
 
-    [ "$1" = clean ] && exit 0
+    # Pointing into the profile is the ownership mark. Nothing else in here
+    # does, so this drops entries of uninstalled apps and only those.
+    for link in "$mirror"/*.desktop; do
+      [ -L "$link" ] || continue
+      case "$(readlink "$link")" in "$profile"/*) ;; *) continue ;; esac
+      [ -e "$profile/''${link##*/}" ] || rm "$link"
+    done
 
     for entry in "$profile"/*.desktop; do
       [ -e "$entry" ] || continue
       name=''${entry##*/}
       # A name Home Manager writes itself wins. xdg.desktopEntries is there to
       # override the package's copy, not to be shadowed by it.
-      [ -e "$mirror/$name" ] || ln -s "$entry" "$mirror/$name"
+      [ -e "$mirror/$name" ] || [ -L "$mirror/$name" ] || \
+        ln -s "$entry" "$mirror/$name"
     done
 
     ${pkgs.desktop-file-utils}/bin/update-desktop-database "$mirror"
@@ -223,13 +232,10 @@ in
     Install.WantedBy = [ "timers.target" ];
   };
 
-  # Two halves of the same job: the mirror has to be gone before Home Manager
-  # checks whether its own links would clobber anything, and rebuilt once the
-  # new generation and its packages are in place.
-  home.activation.clearXdgMirror =
-    lib.hm.dag.entryBefore [ "checkLinkTargets" ] "run ${xdg-mirror} clean";
+  # After linkGeneration: the entries being mirrored only exist once the new
+  # generation and its packages are in place.
   home.activation.syncXdgMirror =
-    lib.hm.dag.entryAfter [ "linkGeneration" ] "run ${xdg-mirror} sync";
+    lib.hm.dag.entryAfter [ "linkGeneration" ] "run ${xdg-mirror}";
 
   # ---------------------------------------------------------------------------
   # Dotfiles
