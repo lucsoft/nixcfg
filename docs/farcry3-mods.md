@@ -316,6 +316,34 @@ The LAA patch was left in place; it is harmless and may help DX9 too. It lives
 in the executable, so a Steam file verification reverts it — along with the
 mods.
 
+### Overrides belong in the prefix, not in the launch options
+
+`WINEDLLOVERRIDES` in Steam's launch options has to be rewritten every time
+the renderer changes, and it is easy to leave pointing at the wrong DLL. The
+same thing goes into the prefix registry once, scoped per executable, and then
+never needs touching:
+
+    [Software\\Wine\\AppDefaults\\farcry3.exe\\DllOverrides]
+    "d3d9"="native,builtin"
+    "d3dcompiler_47"="native"
+
+    [Software\\Wine\\AppDefaults\\farcry3_d3d11.exe\\DllOverrides]
+    "dxgi"="native,builtin"
+    "d3dcompiler_47"="native"
+
+Whichever executable runs picks up the override that belongs to it, so
+switching renderer is only `fc3-reshade dx9` or `dx11` — the file on disk
+decides, and the registry is right either way.
+
+Two things to know when editing `user.reg` by hand:
+
+- Wine holds the registry in memory and writes it out when the **last**
+  process in the prefix exits. Editing under a live prefix loses the edit
+  silently, and Uplay lingers after the game closes — wait for that too.
+- **An environment variable beats the registry.** Leaving
+  `WINEDLLOVERRIDES` in the launch options overrides these entries, so it has
+  to be cleared or the registry rules are dead weight.
+
 ### How it is packaged
 
 No `reshade` attribute exists in the pin, so `fc3-reshade` in `home.nix` does
