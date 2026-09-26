@@ -209,6 +209,30 @@ alternatives are **YASSGI**, **dh_rtgi** from
 jungle full of volumetric fog gives screen-space GI little to work with, since
 light leaving the frame stops existing for it.
 
+### The d3dcompiler trap
+
+First launch produced 66 red entries in the overlay — every single effect
+failing with
+
+    E5002: Static variables cannot have both numeric and resource components
+
+which reads like 66 broken shaders and is one missing DLL. ReShade's D3D9
+backend calls `D3DCompile` out of `d3dcompiler_47.dll`, and the Proton prefix
+carries only Wine's stub: 370 547 bytes against Microsoft's 3 681 592. What
+makes it easy to miss is that `d3dcompiler_43.dll` *is* native in the same
+`system32`, so nothing looks absent.
+
+`fc3-reshade` now installs the real one next to the executable, lifted out of
+a Firefox installer the way winetricks does it. The launch options must name
+it too:
+
+    WINEDLLOVERRIDES="d3d9=n,b;d3dcompiler_47=n" %command%
+
+After that: 65 of 66 effects compile. The one holdout is `dh_ahoh.fx`, on
+`error X3535: Bitwise operations not supported on target ps_3_0` — the DX9
+shader model, not something to fix. Anything reaching for bitwise operations
+will fail the same way, which is the standing cost of the DX9 route.
+
 ### How it is packaged
 
 No `reshade` attribute exists in the pin, so `fc3-reshade` in `home.nix` does
