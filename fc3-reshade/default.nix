@@ -46,6 +46,40 @@ let
     '';
   };
 
+  # Without this, every single effect fails to compile with
+  #
+  #   E5002: Static variables cannot have both numeric and resource components
+  #
+  # which reads like broken shaders but is not: ReShade's D3D9 backend calls
+  # D3DCompile out of d3dcompiler_47.dll, and Proton's prefix carries only
+  # Wine's built-in stub of it — 370 KB against Microsoft's 3.7 MB. Oddly
+  # d3dcompiler_43 *is* native in there, just not the one that gets used.
+  #
+  # Microsoft does not redistribute the DLL on its own, so winetricks lifts it
+  # out of a Firefox installer, which ships it legitimately. Same trick here,
+  # with the version winetricks pins.
+  d3dcompiler47 = stdenvNoCC.mkDerivation {
+    pname = "d3dcompiler_47";
+    version = "62.0.3";
+
+    src = fetchurl {
+      url = "https://download-installer.cdn.mozilla.net/pub/firefox/releases/62.0.3/win32/ach/Firefox%20Setup%2062.0.3.exe";
+      sha256 = "1jharivk78v6iknp6v2ax12nwz2j0zzfvfhrpmz42gvi1bzv9vfn";
+    };
+
+    nativeBuildInputs = [ p7zip ];
+    dontUnpack = true;
+    dontFixup = true;
+
+    installPhase = ''
+      runHook preInstall
+      mkdir -p "$out"
+      7z e -y -o"$out" "$src" core/d3dcompiler_47.dll >/dev/null
+      test -s "$out/d3dcompiler_47.dll"
+      runHook postInstall
+    '';
+  };
+
   # Which packs to take is not guesswork: ReShade's installer drives itself
   # from EffectPackages.ini in the repository's `list` branch, and these are
   # four of the entries it offers.
@@ -129,6 +163,10 @@ writeShellApplication {
         install -Dm644 ${reshade}/ReShade32.dll "$bin/d3d9.dll"
         install -Dm644 ${iniFile} "$bin/ReShade.ini"
 
+        # Next to the executable, so Wine finds it ahead of its own stub in
+        # system32 — and so a Proton prefix rebuild cannot take it away.
+        install -Dm644 ${d3dcompiler47}/d3dcompiler_47.dll "$bin/d3dcompiler_47.dll"
+
         rm -rf "$bin/reshade-shaders"
         mkdir -p "$bin/reshade-shaders/Shaders" "$bin/reshade-shaders/Textures"
 
@@ -152,13 +190,16 @@ writeShellApplication {
         echo "Two things the game itself still needs:"
         echo "  1. GamerProfile.xml: UseD3D11=\"0\" and MSAALevel=\"0\""
         echo "     (DX11 has no readable depth buffer; MSAA depth cannot be read at all)"
-        echo "  2. Steam launch options: WINEDLLOVERRIDES=\"d3d9=n,b\" %command%"
+        echo "  2. Steam launch options:"
+        echo "     WINEDLLOVERRIDES=\"d3d9=n,b;d3dcompiler_47=n\" %command%"
+        echo "     Both halves matter — without the second, every effect fails to"
+        echo "     compile against Wine's stub compiler."
         echo
         echo "The overlay opens with Home."
         ;;
 
       uninstall)
-        rm -fv "$bin/d3d9.dll" "$bin/ReShade.ini"
+        rm -fv "$bin/d3d9.dll" "$bin/ReShade.ini" "$bin/d3dcompiler_47.dll"
         rm -rf "$bin/reshade-shaders"
         echo "fc3-reshade: removed"
         ;;
