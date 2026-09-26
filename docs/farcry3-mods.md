@@ -118,6 +118,50 @@ The only visual entries are `E3 Ocean`, `Realistic Water`, `Rain`, `Wind`,
 for textures.** If the goal is how the game looks, Rakyat is the wrong tool,
 however convenient its installer is.
 
+## The texture pack that is installed
+
+**Mud's Mod v5.3, "Vanilla Game HD Textures only"** — the variant matters:
+the other builds bundle gameplay changes, this one is textures and nothing
+else. It replaces `data_win32/patch.fat` and `patch.dat`, the latter growing
+from 202 MB to 970 MB. The 1.05 originals are kept in
+`~/fc3-backup-textures`.
+
+The German localisation lives in its own `patch_german.*` pair and is not
+touched.
+
+### Why its GamerProfile.xml was not used
+
+The archive ships one, and the README calls replacing it "VERY IMPORTANT ...
+THIS PREVENTS THE MOD FROM CRASHING". It was deliberately not installed,
+because it sets `UseD3D11="1"` and `MSAALevel="4"` — exactly what the depth
+buffer cannot work with. Taking it would trade ReShade's ambient occlusion
+and GI away.
+
+Comparing it against the existing profile shows most of it is simply the
+author's own setup: English, gamepad on, his FOV, his contrast and gamma,
+VSync off, HUD hints disabled. The parts that plausibly relate to the mod:
+
+| setting | his | kept here |
+|---|---|---|
+| `GeometryQuality` | ultrahigh | high |
+| `ShadowQuality` | veryhigh | high |
+| `WaterQuality` | veryhigh | high |
+| `PostFxQuality` | ultrahigh | high |
+| `DeferredAmbientQuality` | high | medium |
+| `SSAOLevel` | 1 | 6 |
+| `Quality` | High | ultrahigh |
+
+Note the shape of it: sub-qualities raised, overall `Quality` and `SSAO`
+lowered. A plausible reading is memory pressure — **the game is 32-bit, so it
+has roughly 4 GB of address space**, and a 970 MB texture set eats into that.
+That is a hypothesis, not something established here, which is why none of
+these were applied to a working configuration on spec.
+
+If the game crashes or stutters, they are the dials, in this order: `Quality`
+to `High`, then `SSAOLevel` to `1` — the latter is worth doing anyway once
+`dh_uber_rt` runs, since two ambient-occlusion passes stacked on each other
+look wrong.
+
 ## For lighting and textures
 
 These are mechanism 2 — raw archive drops — and all of them are on Nexus,
@@ -227,18 +271,21 @@ Done:
 - `fc-mod-installer` packaged and working, though the visuals-only decision
   means it is not needed for now.
 
+- Mud's Mod v5.3 "Vanilla Game HD Textures only" installed; originals in
+  `~/fc3-backup-textures`.
+
 Open:
 
 1. **Steam launch options** — `WINEDLLOVERRIDES="d3d9=n,b" %command%`, set in
    the client. Cannot be written to `localconfig.vdf` from outside while
    Steam is running, because it rewrites that file on exit.
-2. **The texture pack** — [Mud's Mod Ultra HD
-   v5.3](https://www.nexusmods.com/farcry3/mods/200), a Nexus download and so
-   an account is needed.
-3. **Untested**: Mud's Mod advertises itself as DX11, and the depth buffer
-   forces DX9. Whether its textures still load in DX9 has to be tried; the
-   textures live in the Dunia archives rather than the renderer, so there is
-   reason to expect they do.
+2. **Nothing has actually been run yet.** Every check so far was on file
+   sizes and logs, and two questions only launching answers:
+   - Do the HD textures load in DX9? They live in the Dunia archives rather
+     than in the renderer, so they should, but the pack advertises DX11 and
+     its author ships a DX11 profile.
+   - Does a 32-bit process hold 970 MB of textures at `ultrahigh` without
+     running out of address space? If not, see the table above.
 
 [^downgrade]: [Downgrade to 1.05 to enable mods](https://steamcommunity.com/sharedfiles/filedetails/?id=3360740938), and [Far Cry 3 Downgrade v1.06 to v1.05](https://www.nexusmods.com/farcry3/mods/196).
 [^conflict]: [Ziggy's Mod comments](https://www.nexusmods.com/farcry3/mods/63?tab=posts) and [Far Cry 3 Redux discussion](https://steamcommunity.com/app/220240/discussions/0/1642043732655502658/).
