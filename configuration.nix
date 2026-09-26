@@ -91,8 +91,11 @@ in
 
   services.displayManager.gdm.enable = true;
   services.desktopManager.gnome.enable = true;
+  # The keyboard is a Mac one, so the layout has to be Apple's German: @ on
+  # Alt+L, | on Alt+7, {} on Alt+8/9, ~ on Alt+N. Dead keys as in plain `de`.
   services.xserver.xkb.layout = "de";
-  console.keyMap = "de";
+  services.xserver.xkb.variant = "mac";
+  console.keyMap = "mac-de-latin1";
 
   # GNOME Web. Firefox is the browser here — see xdg.mimeApps in home.nix.
   environment.gnome.excludePackages = [ pkgs.epiphany ];

@@ -181,6 +181,13 @@ in
     ];
   };
 
+  # GNOME keeps its own copy of the keyboard layout. It is seeded from the
+  # system default at first login and never re-read, so the `de(mac)` in
+  # configuration.nix would otherwise only reach GDM and the TTY.
+  dconf.settings."org/gnome/desktop/input-sources".sources = [
+    (lib.hm.gvariant.mkTuple [ "xkb" "de+mac" ])
+  ];
+
   # NOTE: `steam` is deliberately NOT here. It must stay a system-level module
   # (programs.steam.enable) because it needs 32-bit graphics drivers, controller
   # udev rules and firewall ports — none of which Home Manager can provide.
