@@ -1,7 +1,8 @@
 # Far Cry 3 mods
 
-The tooling is installed and works; no mod is applied yet, because the game
-still has to be downgraded first. See [Where this stands](#where-this-stands).
+The game is downgraded to 1.05 and ReShade is installed. What is still open is
+the texture pack and one Steam setting — see
+[Where this stands](#where-this-stands).
 
 Far Cry 3 is Steam app `220240`, installed at
 `~/.local/share/Steam/steamapps/common/Far Cry 3`.
@@ -48,11 +49,22 @@ With Steam **running** (the console is part of the client), open
     download_depot 220240 220241 7362101836779063707
 
 That command is quoted verbatim from the guide, not reconstructed.[^downgrade]
-It writes ~11 GB to
-`~/.local/share/Steam/steamapps/content/app_220240/depot_220241`, leaving the
-installation untouched. Copy that over
-`~/.local/share/Steam/steamapps/common/Far Cry 3`, replacing — with the game
-closed.
+It writes ~12 GB and leaves the installation untouched.
+
+**It does not land where the guides say.** They all name
+`steamapps/content/app_220240/depot_220241`; this client actually wrote to
+
+    ~/.local/share/Steam/ubuntu12_32/steamapps/content/app_220240/depot_220241
+
+Take the path from the console's own "Depot download complete" line rather
+than from any guide. Then, with the game closed:
+
+    cp -a "<that path>/." ~/.local/share/Steam/steamapps/common/"Far Cry 3"/
+
+Done here on 2026-09-26, with the replaced files kept in `~/fc3-backup-1.06`
+(315 files, 12 GB). Verified afterwards: `bin/FC3.dll` dropped from 40 720 424
+to 29 994 856 bytes and `farcry3.exe` from 203 816 to 202 088 — that size
+change is the cheapest proof that 1.05 is really in place.
 
 Nothing needs to be told to Steam afterwards: copying files does not touch
 `appmanifest_220240.acf`, so Steam still believes 1.06 is installed and will
@@ -153,18 +165,40 @@ alternatives are **YASSGI**, **dh_rtgi** from
 jungle full of volumetric fog gives screen-space GI little to work with, since
 light leaving the frame stops existing for it.
 
-### Packaging ReShade, if it comes to that
+### How it is packaged
 
-No `reshade` attribute exists in the pin. Two routes, both checked:
+No `reshade` attribute exists in the pin, so `fc3-reshade` in `home.nix` does
+it: `fetchurl` on `ReShade_Setup_6.6.0_Addon.exe`, `p7zip` to pull
+`ReShade32.dll` out of the zip appended to that self-extracting installer, and
+four shader packs via `fetchFromGitHub`.
 
-- `programs.steam.extraCompatPackages = [ pkgs.steamtinkerlaunch ]` —
-  SteamTinkerLaunch (12.12 in the pin) has a ReShade installer, handles the
-  32/64-bit DLL split, and pulls its shader-repository list from PCGamingWiki.
-  Imperative, but immediate.
-- Our own derivation, in the shape of `fc-mod-installer`: `fetchurl` on
-  `https://reshade.me/downloads/ReShade_Setup_6.6.0_Addon.exe` (reachable and
-  hash-pinnable), `p7zip` to extract `ReShade32.dll`, shader repos via
-  `fetchFromGitHub`.
+    fc3-reshade             # install, or re-install after a Steam verify
+    fc3-reshade uninstall
+
+It is a command, not a Home Manager activation, because Steam owns the game
+directory and "verify integrity" clears whatever is put there — a file
+activation would fight it on every switch.
+
+Which shader packs to take is not guesswork: ReShade's installer drives itself
+from `EffectPackages.ini` on the `list` branch of `crosire/reshade-shaders`,
+and these are four of its entries.
+
+| pack | why |
+|---|---|
+| `crosire/reshade-shaders` @ `slim` | carries `ReShade.fxh`, which every other pack includes. Not optional despite a tiny effect list. |
+| `crosire/reshade-shaders` @ `legacy` | `AmbientLight`, `Bloom`, `MagicBloom` — the lighting side. |
+| `CeeJayDK/SweetFX` | **SMAA**, plus CAS, LumaSharpen, Tonemap, Vibrance, Curves. |
+| `AlucardDH/dh-reshade-shaders` | `dh_uber_rt` (GI, AO, reflections) and `dh_ambient_remove`. |
+
+66 effects in total. SMAA is the one to notice: disabling MSAA for the depth
+buffer leaves the game with no anti-aliasing at all, and SMAA is what puts it
+back. It lives in SweetFX, not in either crosire branch — which is not
+obvious, and is why the package list came from upstream's own INI.
+
+`dh_ambient_remove` belongs with `dh_uber_rt`: it takes the game's baked
+ambient light out, so the computed bounce is not laid on top of the old one.
+The game's own `SSAOLevel` is left at 6 in `GamerProfile.xml` — if the result
+is too dark once `dh_uber_rt` runs, that is the first dial to turn down.
 
 **vkBasalt is not a substitute.** It is in the pin, and `pkgs.vkbasalt` does
 ship the 32-bit layer manifest a 32-bit game needs — verified: it carries both
@@ -175,14 +209,36 @@ colour and sharpening.
 
 ## Where this stands
 
-Done: the Mod Installer is packaged, runs, and has Rakyat staged.
+The goal settled on is **visuals only, gameplay untouched**. That rules out
+every overhaul in the table above, REBORN included: its headline features are
+a crafting overhaul, rebalanced enemy damage, changed carry capacities and
+all skills unlocked from the start. It is a gameplay mod that happens to ship
+textures, not the reverse.
 
-Not done, and both need a person:
+So the split is: textures from a texture-only pack, lighting from ReShade.
+Neither touches gameplay.
 
-1. **The downgrade** — `download_depot` is a GUI action in the Steam client.
-2. **A lighting/texture mod** — REBORN and the rest are Nexus downloads, and
-   Nexus requires an account. fcmodding.com does not, which is why Rakyat
-   could be fetched automatically and REBORN could not.
+Done:
+
+- Game downgraded to 1.05, with `~/fc3-backup-1.06` holding what was replaced.
+- `GamerProfile.xml` set to `UseD3D11="0"` and `MSAALevel="0"`; the previous
+  file is kept beside it as `GamerProfile.xml.before-reshade`.
+- ReShade 6.6.0 plus 66 effects installed via `fc3-reshade`.
+- `fc-mod-installer` packaged and working, though the visuals-only decision
+  means it is not needed for now.
+
+Open:
+
+1. **Steam launch options** — `WINEDLLOVERRIDES="d3d9=n,b" %command%`, set in
+   the client. Cannot be written to `localconfig.vdf` from outside while
+   Steam is running, because it rewrites that file on exit.
+2. **The texture pack** — [Mud's Mod Ultra HD
+   v5.3](https://www.nexusmods.com/farcry3/mods/200), a Nexus download and so
+   an account is needed.
+3. **Untested**: Mud's Mod advertises itself as DX11, and the depth buffer
+   forces DX9. Whether its textures still load in DX9 has to be tried; the
+   textures live in the Dunia archives rather than the renderer, so there is
+   reason to expect they do.
 
 [^downgrade]: [Downgrade to 1.05 to enable mods](https://steamcommunity.com/sharedfiles/filedetails/?id=3360740938), and [Far Cry 3 Downgrade v1.06 to v1.05](https://www.nexusmods.com/farcry3/mods/196).
 [^conflict]: [Ziggy's Mod comments](https://www.nexusmods.com/farcry3/mods/63?tab=posts) and [Far Cry 3 Redux discussion](https://steamcommunity.com/app/220240/discussions/0/1642043732655502658/).

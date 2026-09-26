@@ -29,6 +29,8 @@ let
 
   fc-mod-installer = pkgs.callPackage ./fc-mod-installer { };
 
+  fc3-reshade = pkgs.callPackage ./fc3-reshade { };
+
   # Makes a switch visible to the session that is already running, instead of
   # at the next login.
   #
@@ -140,6 +142,11 @@ in
     # Patches mods into the Dunia archives of Far Cry 3. See
     # docs/farcry3-mods.md — the game has to be downgraded to 1.05 first.
     fc-mod-installer
+
+    # Drops ReShade and the free GI/AO shaders next to farcry3.exe. A command
+    # rather than an activation, because Steam owns that directory and
+    # "verify integrity" clears it; re-run to put it back.
+    fc3-reshade
 
     # Nix tooling
     npins-ui    # Adwaita front end for npins
