@@ -5,6 +5,7 @@ Answers three questions, cheapest first: has anything moved, how far, and
 which of the packages I actually installed does it change.
 """
 
+import collections
 import contextlib
 import fcntl
 import hashlib
@@ -28,7 +29,7 @@ import gi
 gi.require_version("Adw", "1")
 gi.require_version("Gtk", "4.0")
 
-from gi.repository import Adw, Gio, GLib, Gtk  # noqa: E402
+from gi.repository import Adw, Gio, GLib, Gtk, Pango  # noqa: E402
 
 APP_ID = "de.lucsoft.NpinsUi"
 LOCKFILE = "npins/sources.json"
@@ -42,6 +43,12 @@ def eval_expression():
     """Where versions.nix landed. The wrapper sets this; fall back to the
     source tree so the script also runs straight from a checkout."""
     return Path(os.environ.get("NPINS_UI_EVAL", Path(__file__).parent / "versions.nix"))
+
+
+def sizes_expression():
+    """sizes.nix is installed beside versions.nix, so one variable places
+    both and the two cannot drift into different trees."""
+    return eval_expression().parent / "sizes.nix"
 
 
 # -----------------------------------------------------------------------------
@@ -242,24 +249,37 @@ def changelog_for(package, subjects):
 # -----------------------------------------------------------------------------
 # evaluation — which of my packages change
 # -----------------------------------------------------------------------------
-def package_versions(nixpkgs, home_manager, repo):
-    """Top-level package versions for one pin set, cached.
+def eval_cache(prefix, nixpkgs, home_manager, repo, expression):
+    """Where the answer for one pins-plus-configs-plus-expression triple goes.
 
-    A pin is an immutable store path and the two config files decide which
-    packages are in play, so the answer only changes when one of those
-    changes — which makes it safe to cache on all four.
+    A pin is an immutable store path and the two config files decide what is
+    in play, so an answer only goes stale when one of those changes. The
+    expression counts as one of them: leaving it out means a changed .nix
+    file keeps being answered from a cache the old one built — which fails
+    silently, as an empty diff rather than an error.
     """
     key = hashlib.sha256()
     for part in (nixpkgs, home_manager):
         key.update(str(part).encode())
     for name in ("configuration.nix", "home.nix"):
         key.update(Path(repo, name).read_bytes())
-    # The expression is an input too. Leaving it out means a changed
-    # versions.nix keeps being answered from a cache built by the old one —
-    # which fails silently, as an empty diff rather than an error.
-    key.update(eval_expression().read_bytes())
-    cached = CACHE / f"versions-{key.hexdigest()[:16]}.json"
+    key.update(Path(expression).read_bytes())
+    return CACHE / f"{prefix}-{key.hexdigest()[:16]}.json"
 
+
+def trim_cache(prefix):
+    """One entry per pin pair per config revision, and pins move every week.
+    Nothing here is precious — it is all re-derivable — so keep a handful."""
+    entries = sorted(CACHE.glob(f"{prefix}-*.json"),
+                     key=lambda p: p.stat().st_mtime, reverse=True)
+    for stale in entries[20:]:
+        stale.unlink(missing_ok=True)
+
+
+def package_versions(nixpkgs, home_manager, repo):
+    """Top-level package versions for one pin set, cached."""
+    cached = eval_cache("versions", nixpkgs, home_manager, repo,
+                        eval_expression())
     if cached.is_file():
         return json.loads(cached.read_text())
 
@@ -275,16 +295,65 @@ def package_versions(nixpkgs, home_manager, repo):
     ).stdout
     CACHE.mkdir(parents=True, exist_ok=True)
     cached.write_text(out)
-
-    # One entry per pin pair per config revision, and pins move every week.
-    # Nothing here is precious — it is all re-derivable in a few seconds —
-    # so keep a handful and drop the rest.
-    entries = sorted(CACHE.glob("versions-*.json"),
-                     key=lambda p: p.stat().st_mtime, reverse=True)
-    for stale in entries[20:]:
-        stale.unlink(missing_ok=True)
-
+    trim_cache("versions")
     return json.loads(out)
+
+
+# nix prints this for a derivation it would have to fetch, and prints nothing
+# at all when there is nothing to fetch.
+FETCH_SIZES = re.compile(
+    r"will be fetched \(([\d.]+ [KMGTP]?i?B) download, ([\d.]+ [KMGTP]?i?B) unpacked\)")
+
+# Long enough for the substituters to be asked about a few thousand paths,
+# short enough that a cache which has stopped answering cannot hold up the
+# check. Losing the estimate costs one row; waiting on it costs the answer.
+DRY_RUN_TIMEOUT = 120
+
+
+def download_estimate(nixpkgs, home_manager, repo):
+    """What a rebuild would pull in, without pulling any of it.
+
+    nix answers this for a derivation it has never built: --dry-run asks the
+    substituters what they hold and prints both sizes. Two calls, because
+    they are two different costs — instantiating the pair is about fourteen
+    seconds of pure evaluation, and querying the caches is network.
+
+    Returns {"download", "unpacked"} as nix formatted them, or None when
+    there is nothing to fetch.
+    """
+    cached = eval_cache("download", nixpkgs, home_manager, repo,
+                        sizes_expression())
+    if cached.is_file():
+        return json.loads(cached.read_text()) or None
+
+    drvs = subprocess.run(
+        [
+            "nix-instantiate", "-A", "system", "-A", "home",
+            "--argstr", "nixpkgs", str(nixpkgs),
+            "--argstr", "homeManager", str(home_manager),
+            "--argstr", "repo", str(repo),
+            str(sizes_expression()),
+        ],
+        check=True, capture_output=True, text=True,
+    ).stdout.split()
+
+    # The sizes land on stderr, as the running commentary they are for a
+    # human. --dry-run means nothing is built or fetched either way.
+    done = subprocess.run(
+        ["nix-store", "--realise", "--dry-run", *drvs],
+        capture_output=True, text=True, timeout=DRY_RUN_TIMEOUT,
+    )
+    # Silence from a run that failed is not the same news as silence from a
+    # run that found nothing, and writing the first one down as the second
+    # would keep saying it until the pins move again.
+    done.check_returncode()
+
+    found = FETCH_SIZES.search(done.stderr)
+    answer = {"download": found.group(1), "unpacked": found.group(2)} if found else {}
+    CACHE.mkdir(parents=True, exist_ok=True)
+    cached.write_text(json.dumps(answer))
+    trim_cache("download")
+    return answer or None
 
 
 def store_paths(lockfile):
@@ -348,18 +417,23 @@ OUTPUT_SUFFIXES = ("bin", "dev", "doc", "man", "info", "lib", "out",
                    "static", "debug", "devdoc")
 
 
+def profiles():
+    """The two roots this machine's closure hangs off."""
+    return [p for p in ("/run/current-system",
+                        str(Path.home() / ".local/state/nix/profiles/home-manager"))
+            if Path(p).exists()]
+
+
 def closure_contents():
     """Every package anywhere in the running closure — the dependencies, not
     just the things named in the config. Costs under a tenth of a second.
 
     Returns (prefix set, {package: installed version}).
     """
-    profiles = [p for p in ("/run/current-system",
-                            str(Path.home() / ".local/state/nix/profiles/home-manager"))
-                if Path(p).exists()]
-    if not profiles:
+    roots = profiles()
+    if not roots:
         return set(), {}
-    out = subprocess.run(["nix-store", "-q", "--requisites", *profiles],
+    out = subprocess.run(["nix-store", "-q", "--requisites", *roots],
                          capture_output=True, text=True, check=True).stdout
 
     names = [line.rsplit("/", 1)[-1] for line in out.splitlines()]
@@ -376,6 +450,56 @@ def closure_contents():
                 versions.setdefault(pname.lower(), "-".join(rest))
                 break
     return prefix_set(names), versions
+
+
+def closure_stats(roots):
+    """How many paths a closure has and what they weigh.
+
+    The two numbers nvd and nh print after a rebuild, read where they read
+    them: the nar sizes nix recorded when it took each path in, not the disk.
+    A whole system is a fifth of a second, because it is two queries against
+    a database and no file is opened.
+    """
+    live = [str(r) for r in roots if Path(r).exists()]
+    if not live:
+        return None
+    try:
+        paths = sorted(set(subprocess.run(
+            ["nix-store", "-q", "--requisites", *live],
+            check=True, capture_output=True, text=True).stdout.split()))
+        if not paths:
+            return None
+        sizes = subprocess.run(
+            ["nix-store", "-q", "--size", *paths],
+            check=True, capture_output=True, text=True).stdout.split()
+    except (OSError, subprocess.CalledProcessError, ValueError):
+        # A number the page would have been nicer for is not worth an error
+        # on the page that says the rebuild worked.
+        return None
+    return len(paths), sum(int(size) for size in sizes)
+
+
+def human_size(count, sign=False):
+    """Binary units, the way nix and nvd report store sizes."""
+    value, unit = float(count), "B"
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if abs(value) < 1024 or unit == "TiB":
+            break
+        value /= 1024
+    mark = "+" if sign and count > 0 else ""
+    return f"{mark}{value:.0f} {unit}" if unit == "B" else f"{mark}{value:.2f} {unit}"
+
+
+def closure_delta(before, after):
+    """What the switch did to the store, in one line, or None if unknowable."""
+    if not before or not after:
+        return None
+    (old_paths, old_bytes), (new_paths, new_bytes) = before, after
+    if (old_paths, old_bytes) == (new_paths, new_bytes):
+        return "The store is unchanged."
+    return (f"{old_paths} → {new_paths} paths · "
+            f"{human_size(old_bytes)} → {human_size(new_bytes)} "
+            f"({human_size(new_bytes - old_bytes, sign=True)})")
 
 
 VERSION_BUMP = re.compile(r"(\S+)\s*->\s*(\S+)\s*(?:\(#\d+\))?$")
@@ -509,32 +633,34 @@ def package_changes(repo, old_lockfile, new_lockfile, subjects=()):
 # live the moment the rebuild finishes: a new binary is picked up the next
 # time it starts, and switch-to-configuration has already restarted the
 # services it had to. Two things outlast the switch — what the session loaded
-# at login, and what the kernel came up with. BUILD is the odd one out: not a
-# rebuild that has yet to take effect, but one that never ran.
-NOTHING, SESSION, REBOOT, BUILD = 0, 1, 2, 3
+# at login, and what the kernel came up with. REBUILD is the odd one out: not
+# a rebuild that has yet to take effect, but one that never ran. It is spelled
+# out rather than BUILD because the rebuild page below calls one derivation's
+# worth of work a build.
+NOTHING, SESSION, REBOOT, REBUILD = 0, 1, 2, 3
 
 TIER_ACTION = {
     NOTHING: "",
     SESSION: "Log out and back in to finish",
     REBOOT: "Reboot to finish",
-    BUILD: "Rebuild to install",
+    REBUILD: "Rebuild to install",
 }
 TIER_ICON = {
     NOTHING: "object-select-symbolic",
     SESSION: "system-log-out-symbolic",
     REBOOT: "system-reboot-symbolic",
-    BUILD: "software-update-available-symbolic",
+    REBUILD: "software-update-available-symbolic",
 }
 
 # Why the status page is asking. The session tiers are about a rebuild that
-# happened; BUILD is about one that did not.
-EARLIER_REBUILD = ("An earlier rebuild is waiting on it. Whether the pins "
-                   "have moved is a separate question.")
+# happened; REBUILD is about one that did not.
+AFTER_SWITCH = ("An earlier rebuild is waiting on it. Whether the pins "
+                "have moved is a separate question.")
 TIER_PENDING = {
-    SESSION: EARLIER_REBUILD,
-    REBOOT: EARLIER_REBUILD,
-    BUILD: ("The pins on disk have never been built — applying was "
-            "interrupted, or npins moved them from a terminal."),
+    SESSION: AFTER_SWITCH,
+    REBOOT: AFTER_SWITCH,
+    REBUILD: ("The pins on disk have never been built — applying was "
+              "interrupted, or npins moved them from a terminal."),
 }
 
 STORE_ROOT = re.compile(r"^(/nix/store/[a-z0-9]{32}-[^/]+)")
@@ -691,7 +817,7 @@ def pending_tier(lockfile=None):
     system that was never built finishes nothing.
     """
     if lockfile and rebuild_owed(lockfile):
-        return BUILD
+        return REBUILD
     if reboot_needed(boot_paths("/run/current-system")):
         return REBOOT
     return SESSION if session_stale() else NOTHING
@@ -758,13 +884,23 @@ def survey(repo, lockfile, workdir):
     # list the dependency match does.
     detail["subjects"] = closure_subjects(by_pin)
 
+    probed = Path(workdir) / "sources.json"
     try:
         detail["changes"] = package_changes(
-            repo, lockfile, Path(workdir) / "sources.json", detail["subjects"])
+            repo, lockfile, probed, detail["subjects"])
     except (OSError, subprocess.CalledProcessError, ValueError) as error:
         # A lock file without the configs next to it still has a usable pin
         # diff; only the "affects you" part is lost.
         detail["changes_error"] = describe_error(error)
+
+    # Last, and allowed to fail quietly: it is the most expensive question
+    # asked here and the least load-bearing answer. Everything above still
+    # stands without it — the window simply does not say how big this is.
+    try:
+        detail["download"] = download_estimate(*store_paths(probed), repo)
+    except (OSError, subprocess.CalledProcessError,
+            subprocess.TimeoutExpired, ValueError):
+        pass
     return updates, text, detail
 
 
@@ -895,12 +1031,53 @@ def ago(seconds):
 # -----------------------------------------------------------------------------
 # rebuild — actually installing what the pins point at
 # -----------------------------------------------------------------------------
-# nix --log-format internal-json emits "@nix {...}" on stderr. The numbers
-# that make a real progress bar are in it: a top-level activity is opened per
-# category, and Progress results carry [done, expected, running, failed]
-# against that activity's id.
-ACT_COPY_PATHS, ACT_BUILDS, ACT_BUILD, ACT_COPY_PATH = 103, 104, 105, 100
-RESULT_PROGRESS = 105
+# nix --log-format internal-json emits "@nix {...}" on stderr, and everything
+# this page shows comes out of it. Activities open, carry results, and stop;
+# the id is the thread that ties the three together, and `parent` nests them.
+# The types that carry something worth showing:
+#
+#   104 builds        opened once, holds the [done, expected] build counter
+#   103 copy-paths    the same for downloads
+#   105 build         one per derivation, fields[0] is the .drv being built
+#   108 substitute    one per path fetched, with 100 and 101 nested under it
+#   100 copy-path     fields[0] the path, fields[1] where from, unpacked bytes
+#   101 file-transfer fields[0] the URL, and the bytes actually off the wire
+#
+# and the results that hang off an activity's id:
+#
+#   101 build-log-line  what the builder printed — the only place a compile
+#                       error exists before nix summarises it
+#   104 set-phase       unpackPhase, configurePhase, buildPhase, …
+#   105 progress        [done, expected, running, failed]
+ACT_COPY_PATH, ACT_FILE_TRANSFER = 100, 101
+ACT_COPY_PATHS, ACT_BUILDS, ACT_BUILD, ACT_SUBSTITUTE = 103, 104, 105, 108
+
+RES_BUILD_LOG_LINE, RES_SET_PHASE, RES_PROGRESS = 101, 104, 105
+
+# nix's own verbosity levels. Only the top two are worth interrupting for.
+LEVEL_ERROR, LEVEL_WARN = 0, 1
+
+# nix colours its messages even when asked for json, so the escapes arrive
+# inside the text. A GTK label renders them as stray digits and a blank.
+ANSI = re.compile(r"\x1b\[[0-9;]*m")
+
+# The derivation a failure message names, so its output can be found again.
+DRV_NAMED = re.compile(r"/nix/store/[a-z0-9]{32}-\S+?\.drv")
+
+BUILD, DOWNLOAD = "build", "download"
+
+# Per build, how much of its output to hold. A compile that fails says why in
+# its last few lines; the thousands before that are the ones that worked.
+TAIL = 60
+
+# Builds that have already stopped, kept in case nix is about to say one of
+# them failed — which it does *after* the activity is gone.
+RECENT = 24
+
+# How much of nix's own commentary the fallback view keeps. Build output is
+# not in here: interleaved from a dozen jobs it is unreadable, which is the
+# whole reason the rows above exist.
+RAW_LINES = 2000
 
 # pkexec is how a GNOME app asks for root: polkit puts up the password dialog
 # and gnome-shell is already the agent. Absolute paths are required — pkexec
@@ -923,43 +1100,156 @@ def rebuild_steps(repo):
     ]
 
 
-class NixProgress:
-    """Turns the internal-json stream into a fraction and a status line."""
+def package_name(store_path):
+    """The readable half of a store path. The hash is not for reading and
+    the .drv suffix says nothing the row does not already say."""
+    name = str(store_path).rsplit("/", 1)[-1].removesuffix(".drv")
+    return name.split("-", 1)[-1] if "-" in name else name
 
-    def __init__(self):
-        self.kinds = {}
-        self.totals = {}
-        self.last = ""
 
+class Activity:
+    """One thing nix is doing right now: a build, or a download."""
+
+    __slots__ = ("kind", "name", "detail", "log", "done", "expected", "started")
+
+    def __init__(self, kind, name, detail=""):
+        self.kind = kind
+        self.name = name
+        self.detail = detail
+        self.log = collections.deque(maxlen=TAIL)
+        self.done = self.expected = 0
+        self.started = time.monotonic()
+
+
+class RebuildStream:
+    """The internal-json stream, as something a window can draw.
+
+    Fed line by line off the reader thread and read on a timer by the main
+    loop — nix emits thousands of events a second, and one idle callback per
+    event is not something GTK survives. The lock covers the model rather
+    than any single field, because a redraw wants one consistent set of rows
+    and not a freshly torn one per row.
+    """
+
+    def __init__(self, problems=()):
+        self.lock = threading.Lock()
+        self.kinds = {}       # activity id -> type
+        self.parents = {}     # activity id -> parent id
+        self.live = {}        # activity id -> Activity
+        self.totals = {}      # ACT_BUILDS / ACT_COPY_PATHS -> (done, expected)
+        self.recent = collections.OrderedDict()   # stopped build -> its output
+        self.problems = list(problems)  # what nix called an error or a warning
+        self.raw = collections.deque(maxlen=RAW_LINES)
+        self.pending = []     # raw lines the view has not been handed yet
+        self.dirty = True
+
+    # -- fed from the reader thread -------------------------------------------
     def feed(self, line):
-        """Returns (text_to_log, fraction_or_None). text may be None."""
-        if not line.startswith("@nix "):
-            return line, None
-        try:
-            event = json.loads(line[5:])
-        except ValueError:
-            return None, None
+        with self.lock:
+            self.dirty = True
+            if not line.startswith("@nix "):
+                self.remember(line)
+                return
+            try:
+                event = json.loads(line[5:])
+            except ValueError:
+                return
+            action = event.get("action")
+            if action == "start":
+                self.started(event)
+            elif action == "stop":
+                self.stopped(event.get("id"))
+            elif action == "result":
+                self.result(event)
+            elif action == "msg" and event.get("msg"):
+                self.message(event)
 
-        action = event.get("action")
-        if action == "start":
-            kind = event.get("type")
-            self.kinds[event["id"]] = kind
-            if kind == ACT_BUILD and event.get("text"):
-                self.last = event["text"]
-                return self.last, self.fraction()
-            if kind == ACT_COPY_PATH and event.get("fields"):
-                path = str(event["fields"][0]).split("-", 1)[-1]
-                self.last = f"downloading {path}"
-                return self.last, self.fraction()
-        elif action == "result" and event.get("type") == RESULT_PROGRESS:
-            kind = self.kinds.get(event["id"])
-            if kind in (ACT_COPY_PATHS, ACT_BUILDS):
-                done, expected = event["fields"][0], event["fields"][1]
-                self.totals[kind] = (done, expected)
-                return None, self.fraction()
-        elif action == "msg" and event.get("msg"):
-            return event["msg"], None
-        return None, None
+    def remember(self, text):
+        self.raw.append(text)
+        self.pending.append(text)
+
+    def started(self, event):
+        ident, kind = event.get("id"), event.get("type")
+        fields = event.get("fields") or []
+        self.kinds[ident] = kind
+        self.parents[ident] = event.get("parent", 0)
+
+        if kind == ACT_BUILD and fields:
+            self.live[ident] = Activity(BUILD, package_name(fields[0]))
+            self.remember(event.get("text") or f"building {fields[0]}")
+        elif kind == ACT_COPY_PATH and len(fields) > 1:
+            # Where from, not the full URL: one row has no space for a nar
+            # hash, and which cache answered is the part worth seeing.
+            host = urlparse(str(fields[1])).netloc or str(fields[1])
+            self.live[ident] = Activity(DOWNLOAD, package_name(fields[0]), host)
+
+    def stopped(self, ident):
+        activity = self.live.pop(ident, None)
+        self.kinds.pop(ident, None)
+        self.parents.pop(ident, None)
+        # nix reports a failure a moment *after* closing the activity, and by
+        # then the builder's output is the only thing that says why. Hold the
+        # last few so the message can be given back its evidence.
+        if activity and activity.kind == BUILD and activity.log:
+            self.recent[activity.name] = list(activity.log)
+            while len(self.recent) > RECENT:
+                self.recent.popitem(last=False)
+
+    def result(self, event):
+        ident, kind = event.get("id"), event.get("type")
+        fields = event.get("fields") or []
+        if kind == RES_PROGRESS and len(fields) > 1:
+            owner = self.kinds.get(ident)
+            if owner in (ACT_COPY_PATHS, ACT_BUILDS):
+                self.totals[owner] = (fields[0], fields[1])
+            elif owner == ACT_FILE_TRANSFER:
+                # Bytes off the wire, which is what the cache quoted. The
+                # copy-path above it counts unpacked bytes instead, and the
+                # two differ by whatever the compression won.
+                activity = self.live.get(self.parents.get(ident))
+                if activity:
+                    activity.done, activity.expected = fields[0], fields[1]
+        elif kind == RES_BUILD_LOG_LINE and fields:
+            activity = self.live.get(ident)
+            if activity:
+                activity.log.append(ANSI.sub("", str(fields[0])))
+        elif kind == RES_SET_PHASE and fields:
+            activity = self.live.get(ident)
+            if activity:
+                activity.detail = str(fields[0]).removesuffix("Phase")
+
+    def message(self, event):
+        text = ANSI.sub("", event["msg"]).rstrip()
+        self.remember(text)
+        if event.get("level", LEVEL_WARN + 1) > LEVEL_WARN:
+            return
+        named = DRV_NAMED.search(text)
+        name = package_name(named.group(0)) if named else None
+        self.problems.append({
+            "text": text,
+            "error": event.get("level") == LEVEL_ERROR,
+            "name": name,
+            "log": self.recent.get(name, []),
+        })
+
+    # -- read from the main loop ----------------------------------------------
+    def snapshot(self):
+        """Everything the page draws, taken at one instant, or None when
+        nothing has happened since the last one."""
+        with self.lock:
+            if not self.dirty:
+                return None
+            self.dirty = False
+            rows = sorted(
+                ({"key": (a.kind, a.name), "kind": a.kind, "name": a.name,
+                  "detail": a.detail, "done": a.done, "expected": a.expected,
+                  "started": a.started, "log": list(a.log)}
+                 for a in self.live.values()),
+                key=lambda row: row["started"])
+            pending, self.pending = self.pending, []
+            return {"rows": rows, "problems": list(self.problems),
+                    "fraction": self.fraction(), "summary": self.summary(),
+                    "raw": pending}
 
     def fraction(self):
         done = sum(v[0] for v in self.totals.values())
@@ -1181,6 +1471,83 @@ def section(title):
     return label
 
 
+def output_label(text):
+    """Builder output, wherever it is shown. Monospace because it was
+    written for a terminal and its columns still mean something."""
+    return Gtk.Label(
+        label=text, xalign=0, wrap=True, selectable=True,
+        wrap_mode=Pango.WrapMode.WORD_CHAR,
+        margin_top=8, margin_bottom=8, margin_start=12, margin_end=12,
+        css_classes=["caption", "monospace", "dim-label"],
+    )
+
+
+def clock(seconds):
+    return f"{int(seconds) // 60}:{int(seconds) % 60:02d}"
+
+
+class ActivityRow(Adw.ExpanderRow):
+    """One build or download, updated in place.
+
+    In place, because the page redraws four times a second and an expander
+    the user opened to watch a compile has to survive the next redraw.
+    """
+
+    def __init__(self, kind, name):
+        super().__init__(title=name)
+        self.add_prefix(Gtk.Image(
+            icon_name="system-run-symbolic" if kind == BUILD
+            else "folder-download-symbolic"))
+        self.output = output_label("")
+        self.add_row(self.output)
+
+    def update(self, row):
+        parts = [row["detail"]] if row["detail"] else []
+        if row["expected"]:
+            parts.append(f"{human_size(row['done'])} / {human_size(row['expected'])}")
+        elapsed = time.monotonic() - row["started"]
+        if elapsed >= 2:
+            parts.append(clock(elapsed))
+        self.set_subtitle(" · ".join(parts))
+        # A download has no output and a build has none until it starts
+        # talking; either way an empty expander should say so rather than
+        # open onto nothing.
+        self.output.set_label("\n".join(row["log"]) or "No output yet")
+
+
+def problem_row(problem):
+    """What nix called an error or a warning, with the output that explains
+    it where there is any.
+
+    nix writes these for a terminal: a headline naming a store path, then
+    indented lines of reason under it. A row wants the other order — what
+    broke in the title, why underneath — and the hash in neither.
+    """
+    lines = [line.strip() for line in problem["text"].splitlines() if line.strip()]
+    headline = (lines[0].removeprefix("error:").removeprefix("warning:").strip()
+                if lines else "")
+    # "Reason: builder failed with exit code 3" is the sentence worth having;
+    # the output paths beside it are not.
+    reason = next((line.removeprefix("Reason:").strip()
+                   for line in lines[1:] if line.startswith("Reason:")),
+                  " ".join(lines[1:]))
+
+    title = problem["name"] or headline
+    subtitle = reason
+
+    if problem["log"]:
+        row = Adw.ExpanderRow(title=title, subtitle=subtitle)
+        row.add_row(output_label("\n".join(problem["log"])))
+    else:
+        row = Adw.ActionRow(title=title, subtitle=subtitle, title_lines=0,
+                            subtitle_lines=0)
+    row.add_prefix(Gtk.Image(
+        icon_name="dialog-error-symbolic" if problem["error"]
+        else "dialog-warning-symbolic",
+        css_classes=["error"] if problem["error"] else ["warning"]))
+    return row
+
+
 class Window(Adw.ApplicationWindow):
     def __init__(self, app, repo):
         super().__init__(application=app, title="npins",
@@ -1200,6 +1567,12 @@ class Window(Adw.ApplicationWindow):
         self.cancelled = False
         self.steps = []
         self.step_index = 0
+        self.stream = None
+        self.ticker = 0
+        # Problems outlive the process that reported them: both rebuild steps
+        # report into one list, and a failed step leaves it on screen.
+        self.carried = []
+        self.closure_before = None
         # Whether the update being applied touches the session. Recorded at
         # apply time because after the rebuild there is nothing left to read
         # it off; see session_marker.
@@ -1242,20 +1615,49 @@ class Window(Adw.ApplicationWindow):
                                         css_classes=["suggested-action", "pill"])
         self.finish_button.connect("clicked", lambda _b: self.finish())
         self.status.set_child(self.finish_button)
-        # The rebuild page: a real progress bar fed by nix's own counters,
-        # over the log it is counting.
+        # The rebuild page: a progress bar fed by nix's own counters, over a
+        # list of what it is counting. The list is the point — the log this
+        # replaced could show the same events, but only as one stream of
+        # them, with a dozen parallel builds shredded into each other.
         self.progress = Gtk.ProgressBar(show_text=True, margin_top=12,
                                         margin_start=12, margin_end=12)
+        self.activity = boxed_list()
+        self.problems = boxed_list()
+        self.problems_heading = section("Problems")
+        self.rows = {}
+        self.problem_count = 0
+
+        # nix says things no row was written for — obsolete channels, a
+        # substituter that went away mid-fetch. Keeping its own output one
+        # click away costs a collapsed row and means nothing is lost.
         self.logview = Gtk.TextView(
             editable=False, cursor_visible=False, monospace=True,
             left_margin=12, right_margin=12, top_margin=8, bottom_margin=8,
             wrap_mode=Gtk.WrapMode.WORD_CHAR,
         )
         self.logbuf = self.logview.get_buffer()
-        self.logscroll = Gtk.ScrolledWindow(child=self.logview, vexpand=True)
+        self.logscroll = Gtk.ScrolledWindow(child=self.logview, vexpand=True,
+                                            min_content_height=260)
+        self.logrow = Adw.ExpanderRow(title="Full nix output")
+        self.logrow.add_prefix(Gtk.Image(icon_name="utilities-terminal-symbolic"))
+        self.logrow.add_row(self.logscroll)
+        log_group = boxed_list()
+        log_group.append(self.logrow)
+
+        self.rebuild_body = Gtk.Box(orientation=Gtk.Orientation.VERTICAL,
+                                    spacing=12, margin_top=12, margin_bottom=12,
+                                    margin_start=12, margin_end=12)
+        self.rebuild_body.append(self.activity)
+        self.rebuild_body.append(self.problems_heading)
+        self.rebuild_body.append(self.problems)
+        self.rebuild_body.append(section("Details"))
+        self.rebuild_body.append(log_group)
         rebuild_page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
         rebuild_page.append(self.progress)
-        rebuild_page.append(self.logscroll)
+        rebuild_page.append(Gtk.ScrolledWindow(
+            child=Adw.Clamp(child=self.rebuild_body, maximum_size=700),
+            hscrollbar_policy=Gtk.PolicyType.NEVER, vexpand=True,
+        ))
 
         self.stack = Gtk.Stack()
         self.stack.add_named(self.status, "status")
@@ -1277,6 +1679,12 @@ class Window(Adw.ApplicationWindow):
         self.cancel_button = Gtk.Button(label="Cancel", visible=False)
         self.cancel_button.connect("clicked", lambda _b: self.cancel_rebuild())
 
+        # The way off a failed rebuild's page. It has no Cancel left to press
+        # and nothing has moved on, so leaving is a decision the user makes
+        # once they have read what is on it.
+        self.back_button = Gtk.Button(label="Back", visible=False)
+        self.back_button.connect("clicked", lambda _b: self.leave_rebuild())
+
         # A persistent one-line verdict belongs in a banner, not in a toast
         # that vanishes.
         self.banner = Adw.Banner(revealed=False)
@@ -1289,6 +1697,7 @@ class Window(Adw.ApplicationWindow):
         header.pack_end(menu_button)
         header.pack_end(self.apply_button)
         header.pack_end(self.cancel_button)
+        header.pack_end(self.back_button)
         header.pack_end(self.spinner)
 
         view = Adw.ToolbarView(content=self.stack)
@@ -1341,11 +1750,11 @@ class Window(Adw.ApplicationWindow):
             self.finish_button.set_label("Restart")
         elif tier == SESSION:
             self.finish_button.set_label("Log Out")
-        elif tier == BUILD:
+        elif tier == REBUILD:
             self.finish_button.set_label("Rebuild")
 
     def finish(self):
-        if self.finish_tier == BUILD:
+        if self.finish_tier == REBUILD:
             # The pins are written already, so this is the rebuild half of
             # apply on its own. What the interrupted run knew about the
             # session it could not keep is gone if the window was reopened.
@@ -1382,10 +1791,6 @@ class Window(Adw.ApplicationWindow):
     def _hide_banner(self):
         self.banner.set_revealed(False)
         self._banner_timer = 0
-        self.proc = None
-        self.cancelled = False
-        self.steps = []
-        self.step_index = 0
         return GLib.SOURCE_REMOVE
 
     def busy(self, active, message=None):
@@ -1427,6 +1832,10 @@ class Window(Adw.ApplicationWindow):
         """
         while child := self.content.get_first_child():
             self.content.remove(child)
+        # Whatever brought the window back to the pins — Back, or a check
+        # started from the header — the failed rebuild's page is behind it
+        # now, and its one button does not belong on this one.
+        self.back_button.set_visible(False)
 
         try:
             read_pins(self.lockfile)
@@ -1484,6 +1893,19 @@ class Window(Adw.ApplicationWindow):
                 description += f"\n\n{TIER_ACTION[pending]} an earlier rebuild."
             self.status.set_description(description)
             return
+
+        # What this costs to install, before agreeing to install it. nix
+        # gets this from the substituters without fetching anything, so it
+        # is a real number rather than an extrapolation from the diff below.
+        download = self.detail.get("download")
+        if download:
+            group = boxed_list()
+            row = Adw.ActionRow(
+                title=f"{download['download']} to download",
+                subtitle=f"{download['unpacked']} once unpacked")
+            row.add_prefix(Gtk.Image(icon_name="folder-download-symbolic"))
+            group.append(row)
+            self.content.append(group)
 
         # One row at the top for the only part that is not automatic. It
         # names the components as well, because a kernel rebuilt at an
@@ -1773,7 +2195,7 @@ class Window(Adw.ApplicationWindow):
         # "Nothing new to write" and "what is written is installed" are two
         # claims, and this page used to make the second on the strength of
         # the first.
-        if pending == BUILD:
+        if pending == REBUILD:
             description = ("No pin has moved since these were written, and "
                            "what is written has not been built.")
         else:
@@ -1854,13 +2276,24 @@ class Window(Adw.ApplicationWindow):
         )
 
     # -- rebuild --------------------------------------------------------------
+    # Four times a second, because the page is redrawn on a timer rather than
+    # on the stream: nix emits thousands of events a second during a large
+    # rebuild, and a redraw per event leaves the main loop no time to draw.
+    TICK = 250
+
     def start_rebuild(self):
         self.steps = rebuild_steps(self.repo)
         self.logbuf.set_text("")
         self.progress.set_fraction(0)
+        self.carried = []
+        # Measured before the switch, because afterwards there is nothing
+        # left that remembers what the store weighed.
+        self.closure_before = closure_stats(profiles())
         self.stack.set_visible_child_name("rebuild")
         self.check_button.set_sensitive(False)
         self.cancel_button.set_visible(True)
+        self.back_button.set_visible(False)
+        self.ticker = GLib.timeout_add(self.TICK, self.tick)
         self.run_step(0)
 
     def run_step(self, index):
@@ -1873,7 +2306,12 @@ class Window(Adw.ApplicationWindow):
         self.say(f"{label}…", seconds=0)
         self.progress.set_fraction(0)
         self.progress.set_text(label)
-        self.log(f"$ {' '.join(command)}")
+        self.clear_activity()
+        # Two processes, two sets of counters — but one list of problems, so
+        # that a warning from the system step is still on screen when the
+        # home step is the one running.
+        self.stream = RebuildStream(self.carried)
+        self.stream.feed(f"$ {' '.join(command)}")
 
         try:
             self.proc = subprocess.Popen(
@@ -1884,27 +2322,67 @@ class Window(Adw.ApplicationWindow):
             self.rebuild_done(error)
             return
 
-        parser = NixProgress()
-        threading.Thread(target=self.pump, args=(self.proc, parser, index),
+        threading.Thread(target=self.pump, args=(self.proc, self.stream, index),
                          daemon=True).start()
 
-    def pump(self, proc, parser, index):
-        """Read the child line by line off the main loop and hand each line
-        back to it. nix writes its json to stderr, which is merged in."""
+    def pump(self, proc, stream, index):
+        """Read the child line by line off the main loop and into the model.
+        nix writes its json to stderr, which is merged in."""
         for line in proc.stdout:
-            text, fraction = parser.feed(line.rstrip("\n"))
-            GLib.idle_add(self.on_line, text, fraction, parser.summary())
+            stream.feed(line.rstrip("\n"))
         code = proc.wait()
         GLib.idle_add(self.step_finished, index, code)
 
-    def on_line(self, text, fraction, summary):
-        if text:
-            self.log(text)
-        if fraction is not None:
-            self.progress.set_fraction(min(fraction, 1.0))
-            label = self.steps[self.step_index][0]
-            self.progress.set_text(f"{label} — {summary}" if summary else label)
-        return GLib.SOURCE_REMOVE
+    def tick(self):
+        if not self.ticker:
+            return GLib.SOURCE_REMOVE
+        snapshot = self.stream.snapshot() if self.stream else None
+        if snapshot:
+            self.draw_rebuild(snapshot)
+        return GLib.SOURCE_CONTINUE
+
+    def clear_activity(self):
+        for widget in self.rows.values():
+            self.activity.remove(widget)
+        self.rows = {}
+        self.activity.set_visible(False)
+
+    def draw_rebuild(self, snapshot):
+        """Bring the page up to date with one instant of the stream."""
+        if snapshot["fraction"] is not None:
+            self.progress.set_fraction(min(snapshot["fraction"], 1.0))
+        label = self.steps[self.step_index][0] if self.steps else ""
+        summary = snapshot["summary"]
+        self.progress.set_text(f"{label} — {summary}" if summary else label)
+
+        # Rows are kept and updated rather than rebuilt, so that an expander
+        # opened to watch a compile is not closed again a quarter-second later.
+        wanted = {row["key"]: row for row in snapshot["rows"]}
+        for key in [k for k in self.rows if k not in wanted]:
+            self.activity.remove(self.rows.pop(key))
+        for key, row in wanted.items():
+            widget = self.rows.get(key)
+            if widget is None:
+                widget = ActivityRow(row["kind"], row["name"])
+                self.rows[key] = widget
+                self.activity.append(widget)
+            widget.update(row)
+        self.activity.set_visible(bool(self.rows))
+
+        # Problems only ever grow, so the count is enough to tell whether
+        # this redraw has anything new to say about them.
+        problems = snapshot["problems"]
+        if len(problems) != self.problem_count:
+            while child := self.problems.get_first_child():
+                self.problems.remove(child)
+            for problem in problems:
+                self.problems.append(problem_row(problem))
+            self.problem_count = len(problems)
+        self.problems.set_visible(bool(problems))
+        self.problems_heading.set_visible(bool(problems))
+
+        if snapshot["raw"]:
+            self.log("\n".join(snapshot["raw"]))
 
     def log(self, text):
         end = self.logbuf.get_end_iter()
@@ -1917,6 +2395,14 @@ class Window(Adw.ApplicationWindow):
                 adjustment.get_upper() - adjustment.get_page_size()))
 
     def step_finished(self, index, code):
+        # Whatever the stream still holds is drawn once more before the page
+        # is handed over: the last events of a failed build arrive after the
+        # final tick, and they are the ones worth reading.
+        self.carried = self.stream.problems if self.stream else []
+        snapshot = self.stream.snapshot() if self.stream else None
+        if snapshot:
+            self.draw_rebuild(snapshot)
+
         if self.cancelled:
             self.rebuild_done(None, cancelled=True)
             return GLib.SOURCE_REMOVE
@@ -1926,8 +2412,7 @@ class Window(Adw.ApplicationWindow):
             return GLib.SOURCE_REMOVE
         if code != 0:
             label = self.steps[index][0]
-            self.rebuild_done(RuntimeError(f"{label} failed (exit {code}). "
-                                           "The log above has the details."))
+            self.rebuild_done(RuntimeError(f"{label} failed (exit {code})."))
             return GLib.SOURCE_REMOVE
         self.progress.set_fraction(1.0)
         self.run_step(index + 1)
@@ -1938,34 +2423,63 @@ class Window(Adw.ApplicationWindow):
         if self.proc and self.proc.poll() is None:
             self.proc.terminate()
 
+    def leave_rebuild(self):
+        """Off the failed rebuild's page and back to the pins."""
+        self.say("")
+        self.render()
+        self.sync_apply()
+
+    def rebuild_failed(self, error):
+        """A failed rebuild keeps its page.
+
+        The status page can hold one sentence, and the reason a build failed
+        is never one sentence — it is the compiler output now sitting in the
+        rows behind this banner. Sending the window back to a status page
+        would throw away the only copy.
+        """
+        self.clear_activity()
+        self.progress.set_fraction(0)
+        self.progress.set_text(str(error))
+        self.say(f"{error} What went wrong is below.", seconds=0)
+        self.back_button.set_visible(True)
+        if not self.problem_count:
+            # nix said nothing a row was made of — a step that died before
+            # it started, or was killed. The full output is all there is.
+            self.logrow.set_expanded(True)
+
     def rebuild_done(self, error, cancelled=False):
         self.proc = None
         self.cancelled = False
         self.cancel_button.set_visible(False)
+        if self.ticker:
+            GLib.source_remove(self.ticker)
+            self.ticker = 0
         self.sync_check()
+
+        if error and not cancelled:
+            self.rebuild_failed(error)
+            self.offer(NOTHING)
+            return
+
         self.stack.set_visible_child_name("status")
 
-        # Both of these leave the pins written and the rebuild part way
-        # through, which is what BUILD is for. Offered without asking
-        # rebuild_owed() first: a run that stopped in its home half leaves a
-        # system already matching the pin, and is still unfinished.
+        # A cancelled rebuild leaves the pins written and nothing installed,
+        # which is what REBUILD is for. Offered without asking rebuild_owed()
+        # first: a run stopped in its home half leaves a system that already
+        # matches the pin, and is still unfinished.
+        #
+        # A failed one is not handled here at all — it keeps its own page,
+        # above, because the build output is the answer and a status page
+        # cannot hold it. It leaves the same thing behind, and render() reads
+        # that back off the lock file when Back sends the window home.
         if cancelled:
             self.say("Rebuild cancelled")
-            self.offer(BUILD)
-            self.status.set_icon_name(TIER_ICON[BUILD])
+            self.offer(REBUILD)
+            self.status.set_icon_name(TIER_ICON[REBUILD])
             self.status.set_title("Rebuild cancelled")
             self.status.set_description("The pins are written and the rebuild "
                                         "stopped part way. Rebuild picks it up "
                                         "from the top.")
-            return
-        if error:
-            self.say("Rebuild failed")
-            self.offer(BUILD)
-            self.status.set_icon_name(TIER_ICON[BUILD])
-            self.status.set_title("Rebuild failed")
-            self.status.set_description("The pins are written and the rebuild "
-                                        "stopped part way.")
-            self.fail(error)
             return
 
         # The switch is what moved /run/current-system, so from here the
@@ -1982,6 +2496,12 @@ class Window(Adw.ApplicationWindow):
         self.status.set_icon_name(TIER_ICON[tier])
         self.status.set_title(headline)
         description = "The new system and home generations are live."
+        # What the switch cost, now that both ends of it exist. Same two
+        # numbers nvd and nh print, and the only summary of a rebuild that
+        # does not depend on having predicted it correctly beforehand.
+        delta = closure_delta(self.closure_before, closure_stats(profiles()))
+        if delta:
+            description += f"\n\n{delta}"
         if tier == REBOOT:
             description += ("\n\nThe running kernel is still the one this "
                             "machine booted with.")
