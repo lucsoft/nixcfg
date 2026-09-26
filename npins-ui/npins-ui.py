@@ -184,17 +184,22 @@ def github(path):
         return json.load(response)
 
 
-def compare(repo, old_rev, new_rev):
+def compare(repo, old_rev, new_rev, report=lambda text: None):
     """Commit subjects between two revisions, and how many there are.
 
     The compare endpoint caps its commits array at 250, so a range wider
     than that has to be paged or the changelog silently loses its tail.
+
+    The first page says how many there are in total, which makes this the
+    one step of a check that can say how far along it is rather than only
+    what it is doing.
     """
     first = github(f"/repos/{repo}/compare/{old_rev}...{new_rev}?per_page=250")
     total = first.get("total_commits", 0)
     commits = list(first.get("commits", []))
     page = 2
     while len(commits) < total and page <= 8:
+        report(f"Reading {len(commits)} of {total} commits…")
         more = github(
             f"/repos/{repo}/compare/{old_rev}...{new_rev}?per_page=250&page={page}"
         )
@@ -849,14 +854,21 @@ def end_session(tier):
 # -----------------------------------------------------------------------------
 # a check, and what the last one found
 # -----------------------------------------------------------------------------
-def survey(repo, lockfile, workdir):
+def survey(repo, lockfile, workdir, report=lambda text: None):
     """Everything a check finds: which pins moved, how far, and what the two
     together change for this machine.
 
     One function for both callers, the window and the timer, because they
     now share the result — and two copies of this loop would quietly grow
     apart into two shapes of it.
+
+    `report` is handed a line per step. A check that finds something runs
+    for the better part of a minute — the forge, two evaluations and a
+    question to the cache — and a window that says only "checking" for all
+    of it is a window that looks stuck. The timer passes nothing and the
+    lines go nowhere.
     """
+    report("Looking for moved pins…")
     updates, text = probe_updates(lockfile, workdir)
     detail = {"subjects": []}
     if not updates:
@@ -869,8 +881,10 @@ def survey(repo, lockfile, workdir):
     for update in updates:
         if not (update["repo"] and update["old_rev"] and update["new_rev"]):
             continue
+        report(f"Reading what moved in {update['name']}…")
         try:
-            result = compare(update["repo"], update["old_rev"], update["new_rev"])
+            result = compare(update["repo"], update["old_rev"], update["new_rev"],
+                             report=report)
             detail[update["name"]] = {
                 "behind": result["total"],
                 "age": commit_age(update["repo"], update["new_rev"]),
@@ -885,6 +899,7 @@ def survey(repo, lockfile, workdir):
     detail["subjects"] = closure_subjects(by_pin)
 
     probed = Path(workdir) / "sources.json"
+    report("Working out what changes for you…")
     try:
         detail["changes"] = package_changes(
             repo, lockfile, probed, detail["subjects"])
@@ -896,6 +911,7 @@ def survey(repo, lockfile, workdir):
     # Last, and allowed to fail quietly: it is the most expensive question
     # asked here and the least load-bearing answer. Everything above still
     # stands without it — the window simply does not say how big this is.
+    report("Asking the cache how big this is…")
     try:
         detail["download"] = download_estimate(*store_paths(probed), repo)
     except (OSError, subprocess.CalledProcessError,
@@ -2417,12 +2433,28 @@ class Window(Adw.ApplicationWindow):
 
         self.busy(True, "Checking pins…")
 
+        def report(text):
+            # Off the worker thread, so the banner is touched from the main
+            # loop like everything else that draws.
+            GLib.idle_add(self.progress_line, text)
+
         def work():
-            found = survey(self.repo, self.lockfile, self.workdir)
+            found = survey(self.repo, self.lockfile, self.workdir, report)
             save_check(self.repo, self.lockfile, *found)
             return found
 
         self.run_async(work, self.checked)
+
+    def progress_line(self, text):
+        """What the check is doing, while it is doing it.
+
+        A spinner and a line rather than a bar: nix reports no progress at
+        all for an evaluation or for a question to a substituter, so a bar
+        here could only pulse or lie, and the guidelines ask for neither.
+        """
+        if self.working:
+            self.say(text, seconds=0)
+        return GLib.SOURCE_REMOVE
 
     def checked(self, result):
         self.busy(False)
