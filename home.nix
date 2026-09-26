@@ -27,6 +27,8 @@ let
 
   npins-ui = pkgs.callPackage ./npins-ui { };
 
+  fc-mod-installer = pkgs.callPackage ./fc-mod-installer { };
+
   # Makes a switch visible to the session that is already running, instead of
   # at the next login.
   #
@@ -134,6 +136,10 @@ in
       # on the sandbox's lib paths, not just the binary on PATH.
       extraLibraries = pkgs: with pkgs; [ gamemode ];
     })
+
+    # Patches mods into the Dunia archives of Far Cry 3. See
+    # docs/farcry3-mods.md — the game has to be downgraded to 1.05 first.
+    fc-mod-installer
 
     # Nix tooling
     npins-ui    # Adwaita front end for npins
