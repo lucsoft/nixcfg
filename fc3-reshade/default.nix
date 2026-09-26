@@ -158,66 +158,85 @@ writeShellApplication {
       exit 1
     fi
 
-    case "''${1:-install}" in
-      install)
-        install -Dm644 ${reshade}/ReShade32.dll "$bin/d3d9.dll"
+    profile="''${FC3_PROFILE:-$HOME/.steam/steam/steamapps/compatdata/220240/pfx/drive_c/users/steamuser/Documents/My Games/Far Cry 3/GamerProfile.xml}"
 
-        # Seed the settings once, then never again: ReShade writes the depth
-        # buffer choice and every tweak back into this file, and re-running
-        # the installer after a Steam verify must not throw that away.
-        if [ ! -f "$bin/ReShade.ini" ]; then
-          install -Dm644 ${iniFile} "$bin/ReShade.ini"
-          echo "fc3-reshade: wrote a fresh ReShade.ini"
-        else
-          echo "fc3-reshade: kept the existing ReShade.ini"
-        fi
-
-        # Next to the executable, so Wine finds it ahead of its own stub in
-        # system32 — and so a Proton prefix rebuild cannot take it away.
-        install -Dm644 ${d3dcompiler47}/d3dcompiler_47.dll "$bin/d3dcompiler_47.dll"
-
-        rm -rf "$bin/reshade-shaders"
-        mkdir -p "$bin/reshade-shaders/Shaders" "$bin/reshade-shaders/Textures"
-
-        # Packs disagree about nesting — SweetFX keeps its effects in a
-        # subdirectory, the crosire ones do not. Copying each pack's tree as
-        # it comes keeps both working, because EffectSearchPaths recurses.
-        for pack in ${lib.concatStringsSep " " shaderPacks}; do
-          if [ -d "$pack/Shaders" ]; then
-            cp -r --no-preserve=mode,ownership \
-              "$pack/Shaders/." "$bin/reshade-shaders/Shaders/"
-          fi
-          if [ -d "$pack/Textures" ]; then
-            cp -r --no-preserve=mode,ownership \
-              "$pack/Textures/." "$bin/reshade-shaders/Textures/"
-          fi
-        done
-
-        echo "fc3-reshade: installed into $bin"
-        echo "fc3-reshade: $(find "$bin/reshade-shaders/Shaders" -name '*.fx' | wc -l) effects available"
-        echo
-        echo "Two things the game itself still needs:"
-        echo "  1. GamerProfile.xml: UseD3D11=\"0\" and MSAALevel=\"0\""
-        echo "     (DX11 has no readable depth buffer; MSAA depth cannot be read at all)"
-        echo "  2. Steam launch options:"
-        echo "     WINEDLLOVERRIDES=\"d3d9=n,b;d3dcompiler_47=n\" %command%"
-        echo "     Both halves matter — without the second, every effect fails to"
-        echo "     compile against Wine's stub compiler."
-        echo
-        echo "The overlay opens with Home."
-        ;;
+    # Which renderer ReShade attaches to decides the DLL name, and the game
+    # has to be pointed at the same one. Keeping the two in one place is the
+    # only way they cannot drift apart.
+    case "''${1:-dx9}" in
+      dx9|install) hook="d3d9.dll" ; stale="dxgi.dll"  ; want11="0" ;;
+      dx11)        hook="dxgi.dll" ; stale="d3d9.dll"  ; want11="1" ;;
 
       uninstall)
-        rm -fv "$bin/d3d9.dll" "$bin/ReShade.ini" "$bin/d3dcompiler_47.dll"
+        rm -fv "$bin/d3d9.dll" "$bin/dxgi.dll" "$bin/ReShade.ini" \
+               "$bin/d3dcompiler_47.dll"
         rm -rf "$bin/reshade-shaders"
         echo "fc3-reshade: removed"
+        exit 0
         ;;
 
       *)
-        echo "usage: fc3-reshade [install|uninstall]" >&2
+        echo "usage: fc3-reshade [dx9|dx11|uninstall]" >&2
         exit 1
         ;;
     esac
+
+    install -Dm644 ${reshade}/ReShade32.dll "$bin/$hook"
+
+    # Leaving the other one behind would load ReShade a second time through
+    # the renderer we are not using.
+    rm -f "$bin/$stale"
+
+    # Seed the settings once, then never again: ReShade writes the depth
+    # buffer choice and every tweak back into this file, and re-running the
+    # installer after a Steam verify must not throw that away.
+    if [ ! -f "$bin/ReShade.ini" ]; then
+      install -Dm644 ${iniFile} "$bin/ReShade.ini"
+      echo "fc3-reshade: wrote a fresh ReShade.ini"
+    else
+      echo "fc3-reshade: kept the existing ReShade.ini"
+    fi
+
+    # Next to the executable, so Wine finds it ahead of its own stub in
+    # system32 — and so a Proton prefix rebuild cannot take it away.
+    install -Dm644 ${d3dcompiler47}/d3dcompiler_47.dll "$bin/d3dcompiler_47.dll"
+
+    rm -rf "$bin/reshade-shaders"
+    mkdir -p "$bin/reshade-shaders/Shaders" "$bin/reshade-shaders/Textures"
+
+    # Packs disagree about nesting — SweetFX keeps its effects in a
+    # subdirectory, the crosire ones do not. Copying each pack's tree as it
+    # comes keeps both working, because EffectSearchPaths recurses.
+    for pack in ${lib.concatStringsSep " " shaderPacks}; do
+      if [ -d "$pack/Shaders" ]; then
+        cp -r --no-preserve=mode,ownership \
+          "$pack/Shaders/." "$bin/reshade-shaders/Shaders/"
+      fi
+      if [ -d "$pack/Textures" ]; then
+        cp -r --no-preserve=mode,ownership \
+          "$pack/Textures/." "$bin/reshade-shaders/Textures/"
+      fi
+    done
+
+    # Point the game at the renderer ReShade just hooked. Getting these two
+    # out of step is silent: the game runs, ReShade simply never attaches.
+    if [ -f "$profile" ]; then
+      sed -i "s/UseD3D11=\"[^\"]*\"/UseD3D11=\"$want11\"/" "$profile"
+      echo "fc3-reshade: set UseD3D11=\"$want11\" in GamerProfile.xml"
+    else
+      echo "fc3-reshade: no GamerProfile.xml at $profile — set UseD3D11=\"$want11\" yourself" >&2
+    fi
+
+    echo "fc3-reshade: installed into $bin as $hook"
+    echo "fc3-reshade: $(find "$bin/reshade-shaders/Shaders" -name '*.fx' | wc -l) effects available"
+    echo
+    echo "Steam launch options for this mode:"
+    echo "  WINEDLLOVERRIDES=\"''${hook%.dll}=n,b;d3dcompiler_47=n\" %command%"
+    echo "  The second half is not optional — without it every effect fails to"
+    echo "  compile against Wine's stub of d3dcompiler_47."
+    echo
+    echo "MSAA still has to stay off: a multisampled depth buffer cannot be read."
+    echo "The overlay opens with Home."
   '';
 
   meta = {
