@@ -22,22 +22,4 @@
   services.udev.extraRules = ''
     ACTION=="add", SUBSYSTEM=="usb", ATTR{idVendor}=="1ea7", ATTR{idProduct}=="0066", ATTR{power/wakeup}="disabled"
   '';
-
-  # A resume hang reaches no journal, but pm_trace stashes a hash of the last
-  # device resume callback in the RTC, where it survives a power-cycle and is
-  # printed on the next boot:
-  #
-  #     sudo dmesg | grep -iE 'hash matches|Magic number'
-  #
-  # The cost is a scrambled RTC clock after a hang; NTP fixes it shortly after
-  # the next boot. Drop this unit once suspend is reliable again.
-  systemd.services.arm-pm-trace = {
-    description = "Arm PM trace to debug resume hangs";
-    wantedBy = [ "multi-user.target" ];
-    serviceConfig = {
-      Type = "oneshot";
-      RemainAfterExit = true;
-    };
-    script = "echo 1 > /sys/power/pm_trace";
-  };
 }
