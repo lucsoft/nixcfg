@@ -218,6 +218,16 @@ in
     };
   };
 
+  # Claude Code writes ~/.claude/settings.json itself — /config keeps the theme
+  # and its like in there — so Home Manager cannot own that file. A store
+  # symlink is read-only, and an atomic write over one replaces the link and
+  # breaks the next switch. Managed settings are the single layer the program
+  # never writes back to. Everything here also outranks the other sources and
+  # /config cannot undo it, so this is for decisions, not for preferences.
+  environment.etc."claude-code/managed-settings.json".text = builtins.toJSON {
+    disableArtifact = true;   # no publishing pages to claude.ai
+  };
+
   nixpkgs.config.allowUnfree = true;
 
   # Point <nixpkgs> at the pinned tree. NixOS defaults it to root's channel
