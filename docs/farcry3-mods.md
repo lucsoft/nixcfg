@@ -258,6 +258,40 @@ After that: 65 of 66 effects compile. The one holdout is `dh_ahoh.fx`, on
 shader model, not something to fix. Anything reaching for bitwise operations
 will fail the same way, which is the standing cost of the DX9 route.
 
+### DX11 was tried, and it crashes
+
+The DX9 choice rested on a 2013 forum post. It was tested properly on
+2026-09-26, and the post turns out to be wrong about the part it is quoted
+for — but DX11 is unusable here anyway.
+
+What DX11 does deliver, from the ReShade log:
+
+- The device comes up: `D3D11CreateDevice` succeeds, `Using feature level
+  b000` — feature level 11_0 under DXVK. ProtonDB's "DirectX 11 is broken
+  under Proton" does not hold for startup.
+- **66 of 66 effects compile, zero failures.** `dh_ahoh.fx`, which fails on
+  DX9 with `X3535: Bitwise operations not supported on target ps_3_0`, goes
+  through. Shader model 5 removes that ceiling entirely.
+
+And then the game dies while loading a savegame. Ruled out, in order:
+
+| suspected | test | result |
+|---|---|---|
+| ReShade | renamed `dxgi.dll` away, launched clean | crashes anyway |
+| 2 GB address space | set `IMAGE_FILE_LARGE_ADDRESS_AWARE` on both executables — neither ships it, so they are capped at 2 GB while a 970 MB texture pack is loaded | crashes anyway |
+
+No Wine crash dump and no game log is written, so there is nothing to read
+without `PROTON_LOG=1`. The untried lever is `Quality="ultrahigh"`, which the
+texture pack's author ships as `High` — the reading that his profile is memory
+tuning is still open.
+
+DX9 is where this stays, because DX9 runs. The cost is the shader model 3
+ceiling and one dead effect out of 66.
+
+The LAA patch was left in place; it is harmless and may help DX9 too. It lives
+in the executable, so a Steam file verification reverts it — along with the
+mods.
+
 ### How it is packaged
 
 No `reshade` attribute exists in the pin, so `fc3-reshade` in `home.nix` does
