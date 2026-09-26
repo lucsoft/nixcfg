@@ -129,6 +129,31 @@ from 202 MB to 970 MB. The 1.05 originals are kept in
 The German localisation lives in its own `patch_german.*` pair and is not
 touched.
 
+### The version it wants, and the downgrade that should not have happened
+
+**The 1.05 downgrade was a requirement of REBORN, and REBORN was then not
+installed.** When the goal settled on visuals-only, the overhaul was dropped
+but the version change stayed — a leftover from an abandoned decision.
+
+It surfaced as cars wearing leaf textures. That is the signature of an asset
+*mismatch* rather than a broken file: the Dunia archives resolve assets by ID,
+and a texture pack built against a different base version puts the right
+texture behind the wrong ID. Mud's Mod ships no version requirement in its
+README, but the archive is dated January 2024, long after 1.06 became the
+retail build — so 1.06 is what it was made against.
+
+Restored to 1.06 on 2026-09-26 from `~/fc3-backup-1.06`, with the texture pack
+re-applied afterwards; restoring first and re-applying second matters, or the
+backup's vanilla `patch.dat` wins.
+
+A second benefit: Steam's `appmanifest` always said 1.06, so files and
+bookkeeping now agree again, and there is no pending update to fear.
+
+The lesson worth keeping: **the version the game needs follows from the mod
+that is actually installed**, and that has to be re-checked whenever the mod
+choice changes. Downgrade because a mod demands it, not by default — 1.06 is
+the version everything else expects.
+
 ### Why its GamerProfile.xml was not used
 
 The archive ships one, and the README calls replacing it "VERY IMPORTANT ...
