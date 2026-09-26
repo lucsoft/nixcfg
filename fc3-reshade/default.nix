@@ -161,7 +161,16 @@ writeShellApplication {
     case "''${1:-install}" in
       install)
         install -Dm644 ${reshade}/ReShade32.dll "$bin/d3d9.dll"
-        install -Dm644 ${iniFile} "$bin/ReShade.ini"
+
+        # Seed the settings once, then never again: ReShade writes the depth
+        # buffer choice and every tweak back into this file, and re-running
+        # the installer after a Steam verify must not throw that away.
+        if [ ! -f "$bin/ReShade.ini" ]; then
+          install -Dm644 ${iniFile} "$bin/ReShade.ini"
+          echo "fc3-reshade: wrote a fresh ReShade.ini"
+        else
+          echo "fc3-reshade: kept the existing ReShade.ini"
+        fi
 
         # Next to the executable, so Wine finds it ahead of its own stub in
         # system32 — and so a Proton prefix rebuild cannot take it away.
