@@ -1079,6 +1079,26 @@ RECENT = 24
 # whole reason the rows above exist.
 RAW_LINES = 2000
 
+# Before it builds anything, nix says what it is about to build, as a heading
+# and one indented store path per line. That listing is the build plan, and
+# it is the only place the plan exists — the activity stream announces each
+# build as it starts and never says what is still to come.
+PLAN_HEADING = re.compile(r"^(?:this|these \d+) derivations? will be built:")
+PLAN_ENTRY = re.compile(r"^\s+(/nix/store/\S+\.drv)$")
+
+# What a node in the build tree can be. Planned is what the listing above
+# hands over; the rest the activity stream moves it through.
+PLANNED, RUNNING, DONE, FAILED = "planned", "running", "done", "failed"
+
+# The tree is drawn with the same box characters nom uses, in a column of
+# their own so the titles still line up as Adwaita titles.
+TREE_LAST, TREE_MORE, TREE_PIPE, TREE_GAP = "└─", "├─", "│ ", "  "
+
+# A tree taller than this is not a tree anyone reads. nom cuts to the height
+# of the terminal; this is a window that scrolls, so the cut is only a guard
+# against a rebuild that plans hundreds of derivations.
+TREE_ROWS = 80
+
 # pkexec is how a GNOME app asks for root: polkit puts up the password dialog
 # and gnome-shell is already the agent. Absolute paths are required — pkexec
 # scrubs the environment, so PATH lookups do not survive it.
@@ -1107,15 +1127,54 @@ def package_name(store_path):
     return name.split("-", 1)[-1] if "-" in name else name
 
 
+def input_derivations(drv):
+    """The derivations a derivation is built from.
+
+    This is the one thing the activity stream does not carry. nom gets it by
+    reading the .drv file and taking its inputDrvs; the store's own
+    reference graph holds the same edges — a .drv references the .drv of
+    each of its inputs — so asking nix costs a database query instead of an
+    ATerm parser.
+    """
+    try:
+        out = subprocess.run(["nix-store", "-q", "--references", drv],
+                             check=True, capture_output=True, text=True).stdout
+    except (OSError, subprocess.CalledProcessError):
+        return []
+    return [line for line in out.split() if line.endswith(".drv")]
+
+
+def build_forest(planned):
+    """Edges and roots among the derivations a rebuild plans to build.
+
+    Edges *within* the plan only. An input already in the store is not going
+    to be built and so is not a node here, which is what keeps this small: a
+    rebuild that moves the configuration rather than the pins plans on the
+    order of a dozen derivations, because everything else is a download.
+
+    Returns (edges, roots), a root being a derivation nothing else in the
+    plan is waiting for — for a system rebuild, the toplevel.
+    """
+    inside = set(planned)
+    edges, parented = {}, set()
+    for drv in planned:
+        deps = [d for d in input_derivations(drv) if d in inside and d != drv]
+        edges[drv] = deps
+        parented.update(deps)
+    return edges, [drv for drv in planned if drv not in parented]
+
+
 class Activity:
     """One thing nix is doing right now: a build, or a download."""
 
-    __slots__ = ("kind", "name", "detail", "log", "done", "expected", "started")
+    __slots__ = ("kind", "name", "detail", "log", "done", "expected",
+                 "started", "drv")
 
     def __init__(self, kind, name, detail=""):
         self.kind = kind
         self.name = name
         self.detail = detail
+        self.drv = ""
         self.log = collections.deque(maxlen=TAIL)
         self.done = self.expected = 0
         self.started = time.monotonic()
@@ -1142,6 +1201,17 @@ class RebuildStream:
         self.raw = collections.deque(maxlen=RAW_LINES)
         self.pending = []     # raw lines the view has not been handed yet
         self.dirty = True
+
+        # The build plan, and the graph over it. `planned` is ordered because
+        # nix lists the plan bottom up, which puts the toplevel last and its
+        # inputs before it — a reasonable order to fall back to while the
+        # edges are still being worked out.
+        self.planned = collections.OrderedDict()   # drv -> PLANNED/RUNNING/…
+        self.by_drv = {}      # drv -> the Activity now building it
+        self.edges = {}       # drv -> the drvs in the plan it waits for
+        self.roots = []
+        self.reading_plan = False
+        self.grapher = None
 
     # -- fed from the reader thread -------------------------------------------
     def feed(self, line):
@@ -1175,8 +1245,21 @@ class RebuildStream:
         self.parents[ident] = event.get("parent", 0)
 
         if kind == ACT_BUILD and fields:
-            self.live[ident] = Activity(BUILD, package_name(fields[0]))
-            self.remember(event.get("text") or f"building {fields[0]}")
+            drv = str(fields[0])
+            activity = Activity(BUILD, package_name(drv))
+            self.live[ident] = activity
+            # A build nix never listed — the plan is printed per invocation,
+            # and the home step prints one of its own. Take it as a node
+            # anyway; with no inputs in the plan it stands as its own root.
+            self.planned.setdefault(drv, PLANNED)
+            self.planned[drv] = RUNNING
+            self.by_drv[drv] = activity
+            activity.drv = drv
+            # The listing is normally closed by the next message, but the
+            # first build starting is just as good a sign that it is over.
+            self.reading_plan = False
+            self.resolve_graph()
+            self.remember(event.get("text") or f"building {drv}")
         elif kind == ACT_COPY_PATH and len(fields) > 1:
             # Where from, not the full URL: one row has no space for a nar
             # hash, and which cache answered is the part worth seeing.
@@ -1187,6 +1270,13 @@ class RebuildStream:
         activity = self.live.pop(ident, None)
         self.kinds.pop(ident, None)
         self.parents.pop(ident, None)
+        if activity and activity.drv:
+            self.by_drv.pop(activity.drv, None)
+            # A build that stops has succeeded as far as this stream is
+            # concerned. The failure message, when there is one, arrives
+            # afterwards and says so itself.
+            if self.planned.get(activity.drv) == RUNNING:
+                self.planned[activity.drv] = DONE
         # nix reports a failure a moment *after* closing the activity, and by
         # then the builder's output is the only thing that says why. Hold the
         # last few so the message can be given back its evidence.
@@ -1218,12 +1308,54 @@ class RebuildStream:
             if activity:
                 activity.detail = str(fields[0]).removesuffix("Phase")
 
+    def take_plan(self, text):
+        """Collect the listing nix prints before it builds anything.
+
+        One message per line, so this is a small state machine: a heading
+        opens the listing, indented store paths fill it, and anything else
+        closes it.
+        """
+        if PLAN_HEADING.match(text):
+            self.reading_plan = True
+            return
+        if not self.reading_plan:
+            return
+        entry = PLAN_ENTRY.match(text)
+        if entry:
+            self.planned.setdefault(entry.group(1), PLANNED)
+            return
+        self.reading_plan = False
+        self.resolve_graph()
+
+    def resolve_graph(self):
+        """Work out the edges, off the thread that is reading the stream.
+
+        One store query per planned derivation. That is nothing for the
+        dozen a configuration change plans, but nix is writing into a pipe
+        while this runs, and a reader that stops reading stops the build.
+        """
+        if self.grapher or not self.planned:
+            return
+        planned = list(self.planned)
+
+        def work():
+            edges, roots = build_forest(planned)
+            with self.lock:
+                self.edges, self.roots = edges, roots
+                self.dirty = True
+
+        self.grapher = threading.Thread(target=work, daemon=True)
+        self.grapher.start()
+
     def message(self, event):
         text = ANSI.sub("", event["msg"]).rstrip()
         self.remember(text)
+        self.take_plan(text)
         if event.get("level", LEVEL_WARN + 1) > LEVEL_WARN:
             return
         named = DRV_NAMED.search(text)
+        if named and named.group(0) in self.planned:
+            self.planned[named.group(0)] = FAILED
         name = package_name(named.group(0)) if named else None
         self.problems.append({
             "text": text,
@@ -1231,6 +1363,85 @@ class RebuildStream:
             "name": name,
             "log": self.recent.get(name, []),
         })
+
+    # -- the plan, as a forest ------------------------------------------------
+    def waiting_on(self, drv):
+        """How much of a derivation's subtree is still outstanding.
+
+        Distinct derivations, not a walk count: an input feeding two others
+        is one thing to wait for, not two.
+        """
+        found, stack = set(), list(self.edges.get(drv, []))
+        while stack:
+            dep = stack.pop()
+            if dep in found:
+                continue
+            found.add(dep)
+            stack.extend(self.edges.get(dep, []))
+        return sum(1 for dep in found if self.planned.get(dep) != DONE)
+
+    def forest(self):
+        """The plan as nested nodes, each derivation appearing once.
+
+        A build graph is not a tree — an input can feed several derivations —
+        so it has to be cut somewhere. nom cuts it at the second sighting and
+        drops that node rather than drawing it again, which keeps one row per
+        derivation; what the dropped edge was carrying still shows up in the
+        parent's count of what it is waiting for.
+
+        Nesting happens before the drawing because which sightings are second
+        depends on the order of the walk, and the box characters have to know
+        which child really is the last one.
+        """
+        seen = set()
+
+        def nest(drv):
+            if drv in seen:
+                return None
+            seen.add(drv)
+            kids = [node for node in map(nest, self.edges.get(drv, []))
+                    if node is not None]
+            return (drv, kids)
+
+        forest = [node for node in map(nest, self.roots) if node is not None]
+        # Anything the graph did not reach still gets a row. nix lists what
+        # it will build before it builds it, but a derivation that turns up
+        # after the edges were worked out would otherwise be built in
+        # silence — and silence is the one thing this page must not do.
+        forest += [node for node in map(nest, self.planned) if node is not None]
+        return forest
+
+    def tree(self):
+        """The forest flattened into rows, each carrying its own indent."""
+        rows = []
+
+        def draw(node, prefix, last, depth):
+            if len(rows) >= TREE_ROWS:
+                return
+            drv, kids = node
+            activity = self.by_drv.get(drv)
+            lead = "" if not depth else prefix + (TREE_LAST if last
+                                                  else TREE_MORE)
+            rows.append({
+                "key": ("node", drv),
+                "kind": BUILD,
+                "lead": lead,
+                "name": package_name(drv),
+                "state": self.planned.get(drv, PLANNED),
+                "waiting": self.waiting_on(drv),
+                "detail": activity.detail if activity else "",
+                "started": activity.started if activity else 0,
+                "log": list(activity.log) if activity else [],
+            })
+            below = prefix + ("" if not depth else
+                              TREE_GAP if last else TREE_PIPE)
+            for index, kid in enumerate(kids):
+                draw(kid, below, index == len(kids) - 1, depth + 1)
+
+        forest = self.forest()
+        for index, node in enumerate(forest):
+            draw(node, "", index == len(forest) - 1, 0)
+        return rows
 
     # -- read from the main loop ----------------------------------------------
     def snapshot(self):
@@ -1240,14 +1451,21 @@ class RebuildStream:
             if not self.dirty:
                 return None
             self.dirty = False
+            tree = self.tree()
+            # Downloads have no graph — nothing is waiting for one, they are
+            # just arriving — so they stay a list under the tree, the way nom
+            # keeps them to their own column. When there is no tree at all,
+            # builds join them: a step that plans nothing still has something
+            # to show while it runs.
+            wanted = (DOWNLOAD,) if tree else (BUILD, DOWNLOAD)
             rows = sorted(
                 ({"key": (a.kind, a.name), "kind": a.kind, "name": a.name,
                   "detail": a.detail, "done": a.done, "expected": a.expected,
                   "started": a.started, "log": list(a.log)}
-                 for a in self.live.values()),
+                 for a in self.live.values() if a.kind in wanted),
                 key=lambda row: row["started"])
             pending, self.pending = self.pending, []
-            return {"rows": rows, "problems": list(self.problems),
+            return {"tree": tree, "rows": rows, "problems": list(self.problems),
                     "fraction": self.fraction(), "summary": self.summary(),
                     "raw": pending}
 
@@ -1486,33 +1704,73 @@ def clock(seconds):
     return f"{int(seconds) // 60}:{int(seconds) % 60:02d}"
 
 
+STATE_ICON = {
+    PLANNED: "content-loading-symbolic",
+    RUNNING: "system-run-symbolic",
+    DONE: "object-select-symbolic",
+    FAILED: "dialog-error-symbolic",
+}
+
+
 class ActivityRow(Adw.ExpanderRow):
-    """One build or download, updated in place.
+    """One node of the build tree, or one download, updated in place.
 
     In place, because the page redraws four times a second and an expander
     the user opened to watch a compile has to survive the next redraw.
     """
 
-    def __init__(self, kind, name):
-        super().__init__(title=name)
-        self.add_prefix(Gtk.Image(
-            icon_name="system-run-symbolic" if kind == BUILD
-            else "folder-download-symbolic"))
+    def __init__(self, row):
+        super().__init__(title=row["name"])
+        # The tree lines get a column of their own instead of going into the
+        # title, so the titles still line up the way Adwaita titles do while
+        # the box characters line up the way box characters have to.
+        self.lead = Gtk.Label(label="", valign=Gtk.Align.CENTER,
+                              css_classes=["monospace", "dim-label"])
+        self.add_prefix(self.lead)
+        self.icon = Gtk.Image()
+        self.add_prefix(self.icon)
         self.output = output_label("")
         self.add_row(self.output)
 
     def update(self, row):
-        parts = [row["detail"]] if row["detail"] else []
-        if row["expected"]:
-            parts.append(f"{human_size(row['done'])} / {human_size(row['expected'])}")
-        elapsed = time.monotonic() - row["started"]
-        if elapsed >= 2:
-            parts.append(clock(elapsed))
-        self.set_subtitle(" · ".join(parts))
-        # A download has no output and a build has none until it starts
+        lead = row.get("lead", "")
+        self.lead.set_label(lead)
+        self.lead.set_visible(bool(lead))
+
+        state = row.get("state")
+        self.icon.set_from_icon_name(
+            STATE_ICON[state] if state else "folder-download-symbolic")
+        if state == FAILED:
+            self.icon.add_css_class("error")
+        else:
+            self.icon.remove_css_class("error")
+
+        self.set_subtitle(self.describe(row))
+        # A download has no output, and a build has none until it starts
         # talking; either way an empty expander should say so rather than
         # open onto nothing.
         self.output.set_label("\n".join(row["log"]) or "No output yet")
+
+    @staticmethod
+    def describe(row):
+        """The line under the name — what this node is doing, or waiting for."""
+        state = row.get("state")
+        if state == PLANNED:
+            waiting = row.get("waiting", 0)
+            return f"waiting for {waiting}" if waiting else "queued"
+        if state == DONE:
+            return "built"
+        if state == FAILED:
+            return "failed"
+
+        parts = [row["detail"]] if row.get("detail") else []
+        if row.get("expected"):
+            parts.append(f"{human_size(row['done'])} / {human_size(row['expected'])}")
+        if row.get("started"):
+            elapsed = time.monotonic() - row["started"]
+            if elapsed >= 2:
+                parts.append(clock(elapsed))
+        return " · ".join(parts)
 
 
 def problem_row(problem):
@@ -1625,6 +1883,7 @@ class Window(Adw.ApplicationWindow):
         self.problems = boxed_list()
         self.problems_heading = section("Problems")
         self.rows = {}
+        self.tree_shape = ()
         self.problem_count = 0
 
         # nix says things no row was written for — obsolete channels, a
@@ -2232,7 +2491,11 @@ class Window(Adw.ApplicationWindow):
             return
 
         changes = self.detail.get("changes")
-        self.applied_session = bool(changes and changes.get("graphics"))
+        # The names, not just the fact. What a reboot is owed for can be
+        # measured again afterwards; what a log out is owed for cannot, and
+        # by then the change set is gone.
+        self.applied_session = ([entry["name"] for entry in changes["graphics"]]
+                                if changes else [])
 
         def work():
             write_lockfile(self.lockfile, text)
@@ -2345,6 +2608,7 @@ class Window(Adw.ApplicationWindow):
         for widget in self.rows.values():
             self.activity.remove(widget)
         self.rows = {}
+        self.tree_shape = ()
         self.activity.set_visible(False)
 
     def draw_rebuild(self, snapshot):
@@ -2355,15 +2619,24 @@ class Window(Adw.ApplicationWindow):
         summary = snapshot["summary"]
         self.progress.set_text(f"{label} — {summary}" if summary else label)
 
+        # The tree arrives whole, a second or so into the step, when the
+        # edges have been worked out. A list box cannot be reordered without
+        # taking it apart, so when the shape changes it is taken apart once,
+        # here, rather than drifting out of order for the rest of the build.
+        shape = tuple(row["key"] for row in snapshot["tree"])
+        if shape != self.tree_shape:
+            self.clear_activity()
+            self.tree_shape = shape
+
         # Rows are kept and updated rather than rebuilt, so that an expander
         # opened to watch a compile is not closed again a quarter-second later.
-        wanted = {row["key"]: row for row in snapshot["rows"]}
+        wanted = {row["key"]: row for row in snapshot["tree"] + snapshot["rows"]}
         for key in [k for k in self.rows if k not in wanted]:
             self.activity.remove(self.rows.pop(key))
         for key, row in wanted.items():
             widget = self.rows.get(key)
             if widget is None:
-                widget = ActivityRow(row["kind"], row["name"])
+                widget = ActivityRow(row)
                 self.rows[key] = widget
                 self.activity.append(widget)
             widget.update(row)
@@ -2502,12 +2775,15 @@ class Window(Adw.ApplicationWindow):
         delta = closure_delta(self.closure_before, closure_stats(profiles()))
         if delta:
             description += f"\n\n{delta}"
+        # What is owed, named. The title already says that something is —
+        # repeating it in a longer sentence is the one thing a description
+        # here must not spend its words on.
         if tier == REBOOT:
-            description += ("\n\nThe running kernel is still the one this "
-                            "machine booted with.")
-        elif tier == SESSION:
-            description += ("\n\nThe session is still running the graphics "
-                            "stack and fonts it started with.")
+            owed = reboot_needed(boot_paths("/run/current-system"))
+        else:
+            owed = self.applied_session if tier == SESSION else []
+        if owed:
+            description += f"\n\nWaiting on {', '.join(owed)}."
         self.status.set_description(description)
 
     def about(self):
