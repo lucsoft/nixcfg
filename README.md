@@ -31,6 +31,7 @@ repo configures graphics — there is no proprietary driver to pull in.
 | `plymouth/` | the boot splash theme — logo, progress bar, unit names |
 | `home.nix` | Home Manager — my packages, dotfiles and user settings |
 | `npins/sources.json` | the pins: nixpkgs, nixpkgs-unstable, home-manager |
+| `docs/` | notes on things this repo does not configure, but this machine does |
 
 `npins/default.nix` is generated — never edit it by hand.
 
