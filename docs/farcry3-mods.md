@@ -154,38 +154,62 @@ that is actually installed**, and that has to be re-checked whenever the mod
 choice changes. Downgrade because a mod demands it, not by default — 1.06 is
 the version everything else expects.
 
-### Why its GamerProfile.xml was not used
+### Its GamerProfile.xml is not optional — the README is right
 
 The archive ships one, and the README calls replacing it "VERY IMPORTANT ...
-THIS PREVENTS THE MOD FROM CRASHING". It was deliberately not installed,
-because it sets `UseD3D11="1"` and `MSAALevel="4"` — exactly what the depth
-buffer cannot work with. Taking it would trade ReShade's ambient occlusion
-and GI away.
+THIS PREVENTS THE MOD FROM CRASHING". That was initially dismissed, because
+its `UseD3D11="1"` and `MSAALevel="4"` are exactly what ReShade's depth buffer
+cannot use. Dismissing it was wrong: with his file installed verbatim, DX11
+loads a savegame; with ours, it dies every time.
 
-Comparing it against the existing profile shows most of it is simply the
-author's own setup: English, gamepad on, his FOV, his contrast and gamma,
-VSync off, HUD hints disabled. The parts that plausibly relate to the mod:
+Two readings of that file were wrong along the way and are worth recording so
+they are not repeated:
 
-| setting | his | kept here |
-|---|---|---|
-| `GeometryQuality` | ultrahigh | high |
-| `ShadowQuality` | veryhigh | high |
-| `WaterQuality` | veryhigh | high |
-| `PostFxQuality` | ultrahigh | high |
-| `DeferredAmbientQuality` | high | medium |
-| `SSAOLevel` | 1 | 6 |
-| `Quality` | High | ultrahigh |
+- **"It is mostly his personal settings."** Partly true — English, his FOV,
+  his 2560×1440 — but not the whole story, since it demonstrably fixes the
+  crash.
+- **"The rest is memory tuning."** Flatly wrong. This came from a comparison
+  script that matched the wrong attribute: `Quality` appears 17 times in the
+  file, and sorting picked a sub-element rather than the one on
+  `RenderProfile`. His `RenderProfile` `Quality` is `ultrahigh`, the same as
+  ours, and every sub-quality he sets is *higher*, not lower:
 
-Note the shape of it: sub-qualities raised, overall `Quality` and `SSAO`
-lowered. A plausible reading is memory pressure — **the game is 32-bit, so it
-has roughly 4 GB of address space**, and a 970 MB texture set eats into that.
-That is a hypothesis, not something established here, which is why none of
-these were applied to a working configuration on spec.
+  | | his | ours was |
+  |---|---|---|
+  | `GeometryQuality` | ultrahigh | high |
+  | `ShadowQuality` | veryhigh | high |
+  | `WaterQuality` | veryhigh | high |
+  | `PostFxQuality` | ultrahigh | high |
+  | `DeferredAmbientQuality` | high | medium |
 
-If the game crashes or stutters, they are the dials, in this order: `Quality`
-to `High`, then `SSAOLevel` to `1` — the latter is worth doing anyway once
-`dh_uber_rt` runs, since two ambient-occlusion passes stacked on each other
-look wrong.
+The settings he has that we did not, and which are the actual candidates:
+`Borderless="1"` (exclusive fullscreen is a known irritant under DXVK),
+`GPUMaxBufferedFrames="0"`, `VSync="0"`.
+
+Lesson: when a mod author ships a config and says it is required, test it
+verbatim before reasoning about which parts matter. Reasoning first cost
+several launches here, and one of the arguments was based on a bad grep.
+
+### The ReShade conflict that remains
+
+His profile carries `MSAALevel="4"`, and a multisampled depth buffer cannot be
+read at all — so as it stands, the configuration that keeps the game alive is
+also the one that denies ReShade the depth buffer, and with it ambient
+occlusion and GI.
+
+That is the open question, and it is decided by testing rather than argument:
+start from his file, which works, and walk settings back toward ours one at a
+time until either the crash returns or nothing of his is left that we need.
+
+Order of the walk, each verified by loading the same savegame:
+
+1. Resolution back to 3440×1440 and the language back to German. Everything
+   else stays his.
+2. `MSAALevel` to `0`, and ReShade re-installed as `dxgi.dll`.
+
+If step 2 brings the crash back, MSAA is load-bearing and the choice is real:
+HD textures under DX11 without depth effects, or DX9 with them. If it does
+not, all of it fits together.
 
 ## For lighting and textures
 
