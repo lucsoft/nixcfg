@@ -122,11 +122,45 @@ let
     sha256 = "09i6r2rrqvjc6wl8q4z3884sg1vaw64fmsk5a5wi3n7j6bbsan8f";
   };
 
+  # MXAO, and LAUNCHPAD for motion vectors — dh_uber_rt has a dedicated
+  # USE_MARTY_LAUNCHPAD_MOTION switch for the latter, so this is the path its
+  # author had in mind rather than a substitute. Only RTGI is paid; these are
+  # not.
+  immerse = fetchFromGitHub {
+    owner = "martymcmodding";
+    repo = "iMMERSE";
+    rev = "f57d3afa1ebe5d1fd6152d4f6fb9a2e75bd1d1cb";
+    sha256 = "0nwd1z6kq72ny8gi57wd1xxzp6xp1y13szqzv93ishsmhqf7c3y7";
+  };
+
+  # ReVeil and Dehaze pull the haze veil out of the image. Worth more here
+  # than it sounds: screen-space GI has nothing to bounce off surfaces that
+  # volumetric fog has swallowed, so this helps twice. CMAA_2 is a cheaper
+  # alternative to SMAA.
+  insaneShaders = fetchFromGitHub {
+    owner = "LordOfLunacy";
+    repo = "Insane-Shaders";
+    rev = "19397d503e2fbf1ad2cbedb35fbf2ee84a32e3ec";
+    sha256 = "0zrsm90hi51qis7rfsjj57i72mxybrlj7b3byig31y7kw23g9lys";
+  };
+
+  # Colour grading, against Far Cry 3's yellow cast: colour temperature,
+  # selective colour, filmic adaptation.
+  prod80 = fetchFromGitHub {
+    owner = "prod80";
+    repo = "prod80-ReShade-Repository";
+    rev = "1c2ed5b093b03c558bfa6aea45c2087052e99554";
+    sha256 = "0pwqk9fi59z7v71cgg73dsx7qnb3ml2ign98yw0xblndjv35dkqh";
+  };
+
   shaderPacks = [
     stockShaders
     legacyShaders
     sweetFX
     dhShaders
+    immerse
+    insaneShaders
+    prod80
   ];
 
   # ReShade reads this from next to the DLL. Without the search paths it
