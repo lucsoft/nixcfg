@@ -171,6 +171,20 @@ in
     remotePlay.openFirewall = true;
     localNetworkGameTransfers.openFirewall = true;
     extest.enable = true;   # Steam Input on Wayland
+
+    # Native Wayland games draw their own decorations through libdecor, which
+    # loads a rendering plugin at runtime. The steamrt4 runtime ships only
+    # libdecor-cairo, whose frame matches nothing on this desktop; nixpkgs also
+    # builds libdecor-gtk, which follows the GTK theme. Point libdecor at ours:
+    # /nix is visible inside pressure-vessel, and it already overrides the
+    # container glibc with the host's, so the Nix-built plugin resolves there.
+    #
+    # 64-bit only — a 32-bit game cannot load this and falls back to cairo.
+    # Only reached when a game actually runs on Wayland; the SDL2 X11 default
+    # gets mutter's decorations and never calls libdecor at all.
+    package = pkgs.steam.override {
+      extraEnv.LIBDECOR_PLUGIN_DIR = "${pkgs.libdecor}/lib/libdecor/plugins-1";
+    };
   };
 
   programs.gamemode.enable = true;
