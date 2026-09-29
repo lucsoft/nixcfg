@@ -932,7 +932,9 @@ STATE = CACHE / "last-check.json"
 # thrown away. The marker is renamed into place already locked, so it never
 # shows up unheld; and the lock is what a killed check cannot leave behind,
 # because the kernel drops it. A file nobody holds therefore reads as free.
-RUNNING = CACHE / "check.lock"
+# Named for the file rather than the state: RUNNING is also what a
+# derivation is doing while it builds, and the rebuild page owns that word.
+CHECK_LOCK = CACHE / "check.lock"
 
 
 @contextlib.contextmanager
@@ -943,7 +945,7 @@ def marker():
         CACHE.mkdir(parents=True, exist_ok=True)
         fd = os.open(tmp, os.O_CREAT | os.O_WRONLY, 0o644)
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        os.replace(tmp, RUNNING)
+        os.replace(tmp, CHECK_LOCK)
     except OSError:
         # A marker that will not be written is a hint the window does not
         # get, not a reason to skip the check.
@@ -957,14 +959,14 @@ def marker():
     finally:
         if fd is not None:
             with contextlib.suppress(OSError):
-                RUNNING.unlink()
+                CHECK_LOCK.unlink()
             os.close(fd)
 
 
 def check_running():
     """Whether a check is in flight somewhere other than this process."""
     try:
-        fd = os.open(RUNNING, os.O_RDONLY)
+        fd = os.open(CHECK_LOCK, os.O_RDONLY)
     except OSError:
         return False
     try:
