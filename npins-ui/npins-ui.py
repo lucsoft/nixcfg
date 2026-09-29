@@ -5,11 +5,13 @@ Answers three questions, cheapest first: has anything moved, how far, and
 which of the packages I actually installed does it change.
 """
 
+import cairo
 import collections
 import contextlib
 import fcntl
 import hashlib
 import json
+import math
 import os
 import re
 import shutil
@@ -29,7 +31,8 @@ import gi
 gi.require_version("Adw", "1")
 gi.require_version("Gtk", "4.0")
 
-from gi.repository import Adw, Gio, GLib, Gtk, Pango  # noqa: E402
+from gi.repository import (Adw, Gdk, Gio, GLib, GObject, Graphene,  # noqa: E402
+                           Gtk, Pango)
 
 APP_ID = "de.lucsoft.NpinsUi"
 LOCKFILE = "npins/sources.json"
@@ -1037,6 +1040,62 @@ def load_check(repo, lockfile):
             state.get("text"), detail)
 
 
+APPLIED = CACHE / "last-apply.json"
+
+
+def save_apply(record):
+    """Keep the rebuild that just ran, so it can be opened again.
+
+    One record, replaced each time: this is the page from the last apply,
+    not a history. It lives in the cache because it is a copy of something
+    that already happened — losing it costs a page nobody can reprint, but
+    nothing that was true stops being true.
+    """
+    try:
+        CACHE.mkdir(parents=True, exist_ok=True)
+        tmp = APPLIED.with_suffix(".json.new")
+        tmp.write_text(json.dumps(record))
+        os.replace(tmp, APPLIED)
+    except OSError:
+        pass          # a cache that will not be written is not worth an error
+
+
+def applied_ago(when):
+    """How long ago a record was written, in the words the window uses for
+    the last check."""
+    try:
+        moment = datetime.fromisoformat(when)
+    except (TypeError, ValueError):
+        return "at some point"
+    return ago((datetime.now(timezone.utc) - moment).total_seconds())
+
+
+def load_apply():
+    """The last rebuild, or None.
+
+    json has no tuples: the keys the views index rows by and the columns the
+    connector lines read come back as lists, and a list cannot be a dict
+    key. They are put back on the way in, once, rather than guarded against
+    everywhere they are used.
+    """
+    try:
+        record = json.loads(APPLIED.read_text())
+    except (OSError, ValueError):
+        return None
+
+    def revive(row):
+        row["key"] = tuple(row["key"])
+        if "pipes" in row:
+            row["pipes"] = tuple(row["pipes"])
+        for kid in row.get("kids", ()):
+            revive(kid)
+
+    for step in record.get("steps", []):
+        for row in step.get("plan", []) + step.get("downloads", []):
+            revive(row)
+    return record
+
+
 def ago(seconds):
     """A rough age, for a line that only has to say recent or not."""
     for size, unit in ((86400, "day"), (3600, "hour"), (60, "minute")):
@@ -1097,6 +1156,10 @@ RECENT = 24
 # whole reason the rows above exist.
 RAW_LINES = 2000
 
+# How much of that a step node carries. The whole run is still one click
+# away under Details; this is the part worth re-setting four times a second.
+STEP_LINES = 200
+
 # Before it builds anything, nix says what it is about to build, as a heading
 # and one indented store path per line. That listing is the build plan, and
 # it is the only place the plan exists — the activity stream announces each
@@ -1108,14 +1171,14 @@ PLAN_ENTRY = re.compile(r"^\s+(/nix/store/\S+\.drv)$")
 # hands over; the rest the activity stream moves it through.
 PLANNED, RUNNING, DONE, FAILED = "planned", "running", "done", "failed"
 
-# The tree is drawn with the same box characters nom uses, in a column of
-# their own so the titles still line up as Adwaita titles.
-TREE_LAST, TREE_MORE, TREE_PIPE, TREE_GAP = "└─", "├─", "│ ", "  "
+# A plan bigger than this is not a plan anyone reads. It is only a guard
+# against a rebuild that plans hundreds of derivations: the graph would draw
+# them a few pixels wide and the list would scroll for a minute.
+PLAN_NODES = 80
 
-# A tree taller than this is not a tree anyone reads. nom cuts to the height
-# of the terminal; this is a window that scrolls, so the cut is only a guard
-# against a rebuild that plans hundreds of derivations.
-TREE_ROWS = 80
+# Which view a rebuild opens in when nothing has said otherwise. The schema
+# carries the same default; this is what a run from a checkout falls back to.
+DEFAULT_PLAN_VIEW = "graph"
 
 # pkexec is how a GNOME app asks for root: polkit puts up the password dialog
 # and gnome-shell is already the agent. Absolute paths are required — pkexec
@@ -1215,6 +1278,14 @@ class RebuildStream:
         self.live = {}        # activity id -> Activity
         self.totals = {}      # ACT_BUILDS / ACT_COPY_PATHS -> (done, expected)
         self.recent = collections.OrderedDict()   # stopped build -> its output
+        # Same thing keyed by derivation rather than name, and kept for the
+        # whole run: a build that has finished still has output worth
+        # reading, and after the page is archived it is the only copy.
+        self.tails = collections.OrderedDict()    # drv -> its last output
+        # Downloads that have arrived. A rebuild that only moves a pin
+        # builds nothing and downloads everything, and without this the
+        # page would have nothing to show for it once they finish.
+        self.fetched = collections.OrderedDict()  # name -> the finished row
         self.problems = list(problems)  # what nix called an error or a warning
         self.raw = collections.deque(maxlen=RAW_LINES)
         self.pending = []     # raw lines the view has not been handed yet
@@ -1298,10 +1369,25 @@ class RebuildStream:
         # nix reports a failure a moment *after* closing the activity, and by
         # then the builder's output is the only thing that says why. Hold the
         # last few so the message can be given back its evidence.
+        if activity and activity.kind == DOWNLOAD:
+            self.fetched[activity.name] = {
+                "key": (DOWNLOAD, activity.name), "kind": DOWNLOAD,
+                "name": activity.name, "state": DONE,
+                "detail": activity.detail,
+                "done": activity.expected or activity.done,
+                "expected": activity.expected, "started": activity.started,
+                "waiting": 0, "log": [], "kids": [],
+            }
+            while len(self.fetched) > PLAN_NODES:
+                self.fetched.popitem(last=False)
         if activity and activity.kind == BUILD and activity.log:
             self.recent[activity.name] = list(activity.log)
             while len(self.recent) > RECENT:
                 self.recent.popitem(last=False)
+            if activity.drv:
+                self.tails[activity.drv] = list(activity.log)
+                while len(self.tails) > PLAN_NODES:
+                    self.tails.popitem(last=False)
 
     def result(self, event):
         ident, kind = event.get("id"), event.get("type")
@@ -1429,37 +1515,68 @@ class RebuildStream:
         forest += [node for node in map(nest, self.planned) if node is not None]
         return forest
 
-    def tree(self):
-        """The forest flattened into rows, each carrying its own indent."""
-        rows = []
+    def plan(self):
+        """The forest as nested nodes, each carrying what a view needs.
 
-        def draw(node, prefix, last, depth):
-            if len(rows) >= TREE_ROWS:
-                return
-            drv, kids = node
+        Both views read this one shape: the graph nests by "kids", and the
+        list draws its connector lines off depth/last/pipes. Which child is
+        the last one depends on the order of the walk, so it is decided here,
+        once, rather than in each view.
+        """
+        nodes = []
+
+        def carry(drv, kids, depth, last, pipes):
+            if len(nodes) >= PLAN_NODES:
+                return None
             activity = self.by_drv.get(drv)
-            lead = "" if not depth else prefix + (TREE_LAST if last
-                                                  else TREE_MORE)
-            rows.append({
+            node = {
                 "key": ("node", drv),
                 "kind": BUILD,
-                "lead": lead,
                 "name": package_name(drv),
                 "state": self.planned.get(drv, PLANNED),
                 "waiting": self.waiting_on(drv),
                 "detail": activity.detail if activity else "",
                 "started": activity.started if activity else 0,
-                "log": list(activity.log) if activity else [],
-            })
-            below = prefix + ("" if not depth else
-                              TREE_GAP if last else TREE_PIPE)
-            for index, kid in enumerate(kids):
-                draw(kid, below, index == len(kids) - 1, depth + 1)
+                "log": (list(activity.log) if activity
+                        else self.tails.get(drv, [])),
+                "depth": depth,
+                "last": last,
+                "pipes": pipes,
+                "kids": [],
+            }
+            nodes.append(node)
+            below = pipes + ((not last,) if depth else ())
+            for index, (kid, sub) in enumerate(kids):
+                child = carry(kid, sub, depth + 1, index == len(kids) - 1,
+                              below)
+                if child is not None:
+                    node["kids"].append(child)
+            return node
 
         forest = self.forest()
-        for index, node in enumerate(forest):
-            draw(node, "", index == len(forest) - 1, 0)
-        return rows
+        roots = []
+        for index, (drv, kids) in enumerate(forest):
+            root = carry(drv, kids, 0, index == len(forest) - 1, ())
+            if root is not None:
+                roots.append(root)
+        return roots
+
+    def downloads(self):
+        """What this step fetched, as nodes — the ones still arriving and
+        the ones already here.
+
+        A download that finishes used to disappear: the activity was closed
+        and the row went with it. For a rebuild that only moves a pin that
+        is the whole story, so it is kept instead, and it hangs under the
+        step that fetched it rather than in a list of its own.
+        """
+        live = [{"key": (DOWNLOAD, a.name), "kind": DOWNLOAD, "name": a.name,
+                 "state": RUNNING, "detail": a.detail, "done": a.done,
+                 "expected": a.expected, "started": a.started, "waiting": 0,
+                 "log": [], "kids": []}
+                for a in self.live.values() if a.kind == DOWNLOAD]
+        done = [dict(row) for row in self.fetched.values()]
+        return sorted(live + done, key=lambda row: row["started"])
 
     # -- read from the main loop ----------------------------------------------
     def snapshot(self):
@@ -1469,23 +1586,31 @@ class RebuildStream:
             if not self.dirty:
                 return None
             self.dirty = False
-            tree = self.tree()
-            # Downloads have no graph — nothing is waiting for one, they are
-            # just arriving — so they stay a list under the tree, the way nom
-            # keeps them to their own column. When there is no tree at all,
-            # builds join them: a step that plans nothing still has something
-            # to show while it runs.
-            wanted = (DOWNLOAD,) if tree else (BUILD, DOWNLOAD)
-            rows = sorted(
-                ({"key": (a.kind, a.name), "kind": a.kind, "name": a.name,
-                  "detail": a.detail, "done": a.done, "expected": a.expected,
-                  "started": a.started, "log": list(a.log)}
-                 for a in self.live.values() if a.kind in wanted),
-                key=lambda row: row["started"])
             pending, self.pending = self.pending, []
-            return {"tree": tree, "rows": rows, "problems": list(self.problems),
+            return {"plan": self.plan(), "downloads": self.downloads(),
+                    "tail": list(self.raw)[-STEP_LINES:],
+                    "problems": list(self.problems),
                     "fraction": self.fraction(), "summary": self.summary(),
                     "raw": pending}
+
+    def archive(self, label):
+        """This step as something that can be read back later.
+
+        The same shape the page draws from, taken once the step is over: the
+        plan with its states, what every derivation said, the problems, and
+        nix's own output. A rebuild is worth re-reading — most of all the
+        one that failed — and none of this survives the process otherwise.
+        """
+        with self.lock:
+            return {
+                "label": label,
+                "plan": self.plan(),
+                "downloads": self.downloads(),
+                "problems": list(self.problems),
+                "tail": list(self.raw)[-STEP_LINES:],
+                "summary": self.summary(),
+                "raw": list(self.raw),
+            }
 
     def fraction(self):
         done = sum(v[0] for v in self.totals.values())
@@ -1730,65 +1855,824 @@ STATE_ICON = {
 }
 
 
-class ActivityRow(Adw.ExpanderRow):
-    """One node of the build tree, or one download, updated in place.
+# -----------------------------------------------------------------------------
+# the plan, drawn
+# -----------------------------------------------------------------------------
+def describe(row):
+    """The line under a name: what this node is doing, or waiting for."""
+    state = row.get("state")
+    if state == PLANNED:
+        waiting = row.get("waiting", 0)
+        return f"waiting for {waiting}" if waiting else "queued"
+    if state == DONE:
+        if row.get("kind") != DOWNLOAD:
+            return "built"
+        size = human_size(row["expected"]) if row.get("expected") else ""
+        return f"{size} downloaded".strip()
+    if state == FAILED:
+        return "failed"
 
-    In place, because the page redraws four times a second and an expander
-    the user opened to watch a compile has to survive the next redraw.
+    parts = [row["detail"]] if row.get("detail") else []
+    if row.get("expected"):
+        parts.append(f"{human_size(row['done'])} / {human_size(row['expected'])}")
+    if row.get("started"):
+        elapsed = time.monotonic() - row["started"]
+        if elapsed >= 2:
+            parts.append(clock(elapsed))
+    return " · ".join(parts)
+
+
+def walk_plan(nodes):
+    for node in nodes:
+        yield node
+        yield from walk_plan(node["kids"])
+
+
+def load_settings():
+    """The app's own settings, or None when the schema is not installed.
+
+    The schema ships with the package; running this script straight from a
+    checkout has no schema at all, and Gio.Settings aborts the process
+    rather than returning an error when it cannot find one — so the lookup
+    happens here, and the window falls back to the default view.
+    """
+    source = Gio.SettingsSchemaSource.get_default()
+    if source and source.lookup(APP_ID, True):
+        return Gio.Settings.new(APP_ID)
+    return None
+
+
+def relayout(roots):
+    """Re-stamp depth, last and pipes over a tree that has been rearranged.
+
+    The stream works these out for the plan it knows about. The page hangs
+    that plan under nodes of its own — the run, and a node per step — and
+    the connector lines have to be told about the new shape.
+    """
+    def stamp(node, depth, last, pipes):
+        node["depth"], node["last"], node["pipes"] = depth, last, pipes
+        below = pipes + ((not last,) if depth else ())
+        kids = node["kids"]
+        for index, kid in enumerate(kids):
+            stamp(kid, depth + 1, index == len(kids) - 1, below)
+
+    for index, root in enumerate(roots):
+        stamp(root, 0, index == len(roots) - 1, ())
+    return roots
+
+
+def download_group(index, rows):
+    """Every download of one step, under one node.
+
+    Downloads have no graph of their own — nothing waits for one, it just
+    arrives — so they hang off the step that fetched them as a single
+    branch rather than being scattered through a plan they are not part of.
+    """
+    arriving = [row for row in rows if row["state"] == RUNNING]
+    return {
+        "key": ("downloads", index),
+        "kind": DOWNLOAD,
+        "name": f"{len(rows)} download{'' if len(rows) == 1 else 's'}",
+        "state": RUNNING if arriving else DONE,
+        "waiting": len(arriving),
+        "detail": "",
+        "done": sum(row["done"] for row in rows),
+        "expected": sum(row["expected"] for row in rows),
+        "fraction": None,
+        "started": min(row["started"] for row in rows),
+        "log": [],
+        "kids": rows,
+    }
+
+
+def compose(steps, started=0):
+    """The whole rebuild as one tree.
+
+    The run is the root, each step is a node under it, and each step's plan
+    hangs under that. It is the same thing the progress bar used to say from
+    outside the page — how far along, out of how much — except that now it
+    is a node like everything else it is counting, and the two halves of a
+    rebuild are on screen together instead of one replacing the other.
+    """
+    nodes = []
+    for index, step in enumerate(steps):
+        kids = list(step["plan"])
+        if step.get("downloads"):
+            kids.append(download_group(index, step["downloads"]))
+        outstanding = [row for row in walk_plan(kids) if row["state"] != DONE]
+        if any(row["state"] == FAILED for row in walk_plan(kids)):
+            state = FAILED
+        elif step["fraction"] is None:
+            state = PLANNED
+        elif step.get("running"):
+            state = RUNNING
+        else:
+            state = DONE
+        nodes.append({
+            "key": ("step", index),
+            "kind": BUILD,
+            "name": step["label"],
+            "state": state,
+            "waiting": len(outstanding),
+            "detail": step["summary"],
+            "fraction": step["fraction"],
+            "started": step.get("started", 0),
+            "log": step.get("tail", []),
+            "kids": kids,
+        })
+
+    done = sum(1 for node in nodes if node["state"] == DONE)
+    live = next((node for node in nodes if node["state"] == RUNNING), None)
+    if any(node["state"] == FAILED for node in nodes):
+        state = FAILED
+    elif nodes and done == len(nodes):
+        state = DONE
+    else:
+        state = RUNNING
+    root = {
+        "key": ("rebuild",),
+        "kind": BUILD,
+        "name": "Rebuild",
+        "state": state,
+        "waiting": sum(1 for node in nodes if node["state"] != DONE),
+        "detail": (live or nodes[-1] if nodes else {}).get("detail", ""),
+        # Steps are the only thing the run itself can count: what is inside
+        # them nix counts per invocation, and those counters start over.
+        "fraction": ((done + (live["fraction"] or 0 if live else 0))
+                     / len(nodes)) if nodes else None,
+        "started": started,
+        "log": [],
+        "kids": nodes,
+    }
+    return relayout([root])
+
+
+class Palette:
+    """The two colours the drawn parts of the plan use, from the theme."""
+
+    def __init__(self, widget):
+        colour = widget.get_color()
+        self.fg = (colour.red, colour.green, colour.blue)
+        accent = Adw.StyleManager.get_default().get_accent_color_rgba()
+        self.accent = (accent.red, accent.green, accent.blue)
+
+
+class Ring(Gtk.DrawingArea):
+    """A spinner that knows how far along it is.
+
+    Neither GTK nor libadwaita has one: Adw.Spinner only ever says "still
+    going" and both progress widgets are bars. Only downloads get it —
+    those are the ones nix reports a size for. A build reports the phase it
+    is in and nothing else, so a percentage on a build would be a number
+    the build never gave.
     """
 
-    def __init__(self, row):
-        super().__init__(title=row["name"])
-        # The tree lines get a column of their own instead of going into the
-        # title, so the titles still line up the way Adwaita titles do while
-        # the box characters line up the way box characters have to.
-        self.lead = Gtk.Label(label="", valign=Gtk.Align.CENTER,
-                              css_classes=["monospace", "dim-label"])
-        self.add_prefix(self.lead)
+    SIZE = 16
+
+    def __init__(self):
+        super().__init__(content_width=self.SIZE, content_height=self.SIZE,
+                         valign=Gtk.Align.CENTER)
+        self.fraction = 0.0
+        self.set_draw_func(self.draw)
+
+    def set_fraction(self, fraction):
+        if abs(fraction - self.fraction) < 0.01:
+            return
+        self.fraction = fraction
+        self.queue_draw()
+
+    def draw(self, _area, cr, width, height):
+        paint = Palette(self)
+        radius = min(width, height) / 2 - 1.5
+        cr.set_line_width(2.5)
+        cr.set_line_cap(cairo.LINE_CAP_ROUND)
+        cr.arc(width / 2, height / 2, radius, 0, 2 * math.pi)
+        cr.set_source_rgba(*paint.fg, .18)
+        cr.stroke()
+        start = -math.pi / 2
+        cr.arc(width / 2, height / 2, radius, start,
+               start + 2 * math.pi * self.fraction)
+        cr.set_source_rgba(*paint.accent, 1)
+        cr.stroke()
+
+
+class StateSlot(Gtk.Stack):
+    """What a node is doing, in sixteen pixels: a spinner while it runs, a
+    ring when there is a size to fill, the state's icon otherwise.
+
+    A stack rather than a swap, because a build that finishes replaces one
+    with the other and an instant replacement reads as a flicker. All three
+    are built once and kept: rebuilding a spinner four times a second
+    restarts its animation four times a second.
+    """
+
+    def __init__(self):
+        super().__init__(valign=Gtk.Align.CENTER, hhomogeneous=True,
+                         vhomogeneous=True, transition_duration=250,
+                         transition_type=Gtk.StackTransitionType.CROSSFADE)
+        self.spinner = Adw.Spinner(width_request=16, height_request=16)
+        self.ring = Ring()
         self.icon = Gtk.Image()
-        self.add_prefix(self.icon)
-        self.output = output_label("")
-        self.add_row(self.output)
+        self.add_named(self.spinner, "spinner")
+        self.add_named(self.ring, "ring")
+        self.add_named(self.icon, "icon")
 
-    def update(self, row):
-        lead = row.get("lead", "")
-        self.lead.set_label(lead)
-        self.lead.set_visible(bool(lead))
-
+    def show(self, row):
         state = row.get("state")
-        self.icon.set_from_icon_name(
-            STATE_ICON[state] if state else "folder-download-symbolic")
-        if state == FAILED:
-            self.icon.add_css_class("error")
-        else:
-            self.icon.remove_css_class("error")
+        if state in (None, RUNNING):
+            # A download says how far along it is; a build only says that it
+            # is going, so that is all the spinner claims.
+            if row.get("expected"):
+                self.ring.set_fraction(row["done"] / row["expected"])
+                self.set_visible_child_name("ring")
+            else:
+                self.set_visible_child_name("spinner")
+            return
+        self.set_visible_child_name("icon")
+        self.icon.set_from_icon_name(STATE_ICON[state])
+        for name in ("dim-label", "success", "error"):
+            self.icon.remove_css_class(name)
+        self.icon.add_css_class({PLANNED: "dim-label", DONE: "success",
+                                 FAILED: "error"}[state])
 
-        self.set_subtitle(self.describe(row))
-        # A download has no output, and a build has none until it starts
-        # talking; either way an empty expander should say so rather than
-        # open onto nothing.
-        self.output.set_label("\n".join(row["log"]) or "No output yet")
+
+class PlanNode(GObject.Object):
+    """One derivation, as the list model holds it. The dict behind it is
+    replaced on every redraw; the object stays, so the rows do too."""
+
+    def __init__(self, row):
+        super().__init__()
+        self.row = row
+        self.kids = []
+
+
+# -----------------------------------------------------------------------------
+# the plan as an indented list
+# -----------------------------------------------------------------------------
+class Gutter(Gtk.DrawingArea):
+    """The connector lines, drawn over the row the expander indented.
+
+    Same information the box characters carried — which columns continue,
+    where this row hangs off its parent — at the row's real height instead
+    of a glyph's. Nothing here is a guess: the expander's own arrow is
+    measured, so the elbow lands on it whatever the theme makes it.
+    """
+
+    indent = 20
+
+    def __init__(self, expander):
+        super().__init__(can_target=False)
+        self.expander = expander
+        self.node = None
+        self.set_draw_func(self.draw)
+
+    def show(self, node):
+        self.node = node
+        self.queue_draw()
+
+    def metrics(self):
+        """Indent per level and arrow centre, as the theme laid them out."""
+        arrow = self.expander.get_first_child()
+        if arrow is None:
+            return self.indent, self.indent / 2
+        # Measured against the gutter, which the overlay lays over the whole
+        # row: inside the expander the arrow sits at zero whatever the depth.
+        found, box = arrow.compute_bounds(self)
+        if found and self.node.row["depth"] and box.origin.x > 0:
+            Gutter.indent = box.origin.x / self.node.row["depth"]
+        return Gutter.indent, box.size.width / 2
+
+    def draw(self, _area, cr, _width, height):
+        row = self.node.row if self.node else None
+        if not row or not row["depth"]:
+            return
+        indent, centre = self.metrics()
+        colour = self.get_color()
+        cr.set_source_rgba(colour.red, colour.green, colour.blue, 0.3)
+        cr.set_line_width(1.0)
+        mid = round(height / 2) + 0.5
+
+        def column(level):
+            return round(level * indent + centre) + 0.5
+
+        for level, pipe in enumerate(row["pipes"]):
+            if pipe:
+                cr.move_to(column(level), 0)
+                cr.line_to(column(level), height)
+
+        # The elbow: down the parent's column, then out. It stops at the
+        # arrow when there is one and runs on to the icon when there is not,
+        # so either way the line ends on something rather than in air.
+        x = column(row["depth"] - 1)
+        cr.move_to(x, 0)
+        cr.line_to(x, mid if row["last"] else height)
+        cr.move_to(x, mid)
+        cr.line_to(row["depth"] * indent + (0 if row["kids"] else indent - 4),
+                   mid)
+        cr.stroke()
+
+
+class PlanList(Gtk.Box):
+    """The plan as the indented list it used to be, with the indent and the
+    lines drawn rather than spelled out in box characters."""
+
+    def __init__(self):
+        super().__init__(orientation=Gtk.Orientation.VERTICAL)
+        self.on_select = None
+        self.bound = {}
+        self.nodes = {}
+        self.shape = ()
+
+        factory = Gtk.SignalListItemFactory()
+        factory.connect("setup", self.setup)
+        factory.connect("bind", self.bind)
+        factory.connect("unbind", self.unbind)
+        self.view = Gtk.ListView(factory=factory, vexpand=True,
+                                 css_classes=["plan-list"])
+        frame = Gtk.Frame(child=Gtk.ScrolledWindow(child=self.view,
+                                                   vexpand=True))
+        frame.add_css_class("view")
+        self.append(frame)
+
+    # -- the model ------------------------------------------------------------
+    def update(self, plan):
+        shape = tuple(row["key"] for row in walk_plan(plan))
+        if shape != self.shape:
+            self.shape = shape
+            self.load(plan)
+        else:
+            for row in walk_plan(plan):
+                self.nodes[row["key"]].row = row
+        for item, node in self.bound.items():
+            self.paint(item, node)
+
+    def load(self, plan):
+        self.nodes = {}
+        store = Gio.ListStore.new(PlanNode)
+        for row in plan:
+            store.append(self.wrap(row))
+        self.view.set_model(Gtk.NoSelection.new(
+            Gtk.TreeListModel.new(store, False, True, self.children_of)))
+
+    def wrap(self, row):
+        node = PlanNode(row)
+        node.kids = [self.wrap(kid) for kid in row["kids"]]
+        self.nodes[row["key"]] = node
+        return node
 
     @staticmethod
-    def describe(row):
-        """The line under the name — what this node is doing, or waiting for."""
-        state = row.get("state")
-        if state == PLANNED:
-            waiting = row.get("waiting", 0)
-            return f"waiting for {waiting}" if waiting else "queued"
-        if state == DONE:
-            return "built"
-        if state == FAILED:
-            return "failed"
+    def children_of(node):
+        if not node.kids:
+            return None
+        store = Gio.ListStore.new(PlanNode)
+        for kid in node.kids:
+            store.append(kid)
+        return store
 
-        parts = [row["detail"]] if row.get("detail") else []
-        if row.get("expected"):
-            parts.append(f"{human_size(row['done'])} / {human_size(row['expected'])}")
-        if row.get("started"):
-            elapsed = time.monotonic() - row["started"]
-            if elapsed >= 2:
-                parts.append(clock(elapsed))
-        return " · ".join(parts)
+    # -- the rows -------------------------------------------------------------
+    def setup(self, _factory, item):
+        slot = StateSlot()
+        title = Gtk.Label(xalign=0, ellipsize=Pango.EllipsizeMode.MIDDLE)
+        detail = Gtk.Label(xalign=0, ellipsize=Pango.EllipsizeMode.END,
+                           css_classes=["caption", "dim-label"])
+        labels = Gtk.Box(orientation=Gtk.Orientation.VERTICAL,
+                         valign=Gtk.Align.CENTER, hexpand=True)
+        labels.append(title)
+        labels.append(detail)
+        bar = Gtk.ProgressBar(valign=Gtk.Align.CENTER, width_request=120)
+
+        inner = Gtk.Box(spacing=10, css_classes=["plan-row"])
+        inner.append(slot)
+        inner.append(labels)
+        inner.append(bar)
+        expander = Gtk.TreeExpander(child=inner)
+
+        # The lines go over the row, not beside it: the expander indents by
+        # depth on its own, and drawing on top is what lets the elbow reach
+        # into that indent instead of stopping at the edge of a column.
+        gutter = Gutter(expander)
+        overlay = Gtk.Overlay(child=expander)
+        overlay.add_overlay(gutter)
+        click = Gtk.GestureClick()
+        click.connect("pressed", lambda *_a, it=item: self.choose(it))
+        overlay.add_controller(click)
+
+        item.set_child(overlay)
+        item.widgets = (gutter, expander, slot, title, detail, bar)
+
+    def bind(self, _factory, item):
+        listrow = item.get_item()
+        node = listrow.get_item()
+        self.bound[item] = node
+        gutter, expander, *_ = item.widgets
+        expander.set_list_row(listrow)
+        gutter.show(node)
+        self.paint(item, node)
+
+    def unbind(self, _factory, item):
+        self.bound.pop(item, None)
+
+    def choose(self, item):
+        node = self.bound.get(item)
+        if node is not None and self.on_select:
+            self.on_select(node.row["key"])
+
+    @staticmethod
+    def paint(item, node):
+        gutter, _expander, slot, title, detail, bar = item.widgets
+        title.set_label(node.row["name"])
+        detail.set_label(describe(node.row))
+        slot.show(node.row)
+        fraction = node.row.get("fraction")
+        bar.set_visible(fraction is not None
+                        and node.row["state"] not in (DONE, FAILED))
+        bar.set_fraction(min(fraction or 0, 1.0))
+        gutter.queue_draw()
+
+
+# -----------------------------------------------------------------------------
+# the plan as a graph
+# -----------------------------------------------------------------------------
+class PlanGraph(Gtk.Widget):
+    """Cards laid out by depth, edges drawn behind them.
+
+    The list says what is waiting for what; this says it in one look, which
+    is the thing a dependency tree is for. Cells are whatever the window
+    leaves room for, down to a floor, so a plan fits instead of scrolling.
+    """
+
+    CARD_W, MIN_W, PAD, GAP_MIN, GAP_MAX = 210, 160, 12, 22, 72
+    COLLAPSE = 320
+
+    def __init__(self):
+        super().__init__()
+        self.on_select = None
+        self.shape = ()
+        self.cards = {}
+        self.nodes = {}
+        self.roots = []
+        self.places = {}
+        self.geometry_cache = ()
+        self.fades = {}
+        self.states = ()
+        self.recentre = False
+        self.columns = self.levels = 1
+
+    # -- the model ------------------------------------------------------------
+    def update(self, plan):
+        shape = tuple(row["key"] for row in walk_plan(plan))
+        if shape != self.shape:
+            self.shape = shape
+            self.load(plan)
+        else:
+            for row in walk_plan(plan):
+                self.nodes[row["key"]].row = row
+        self.refresh()
+
+    def load(self, plan):
+        for card in self.cards.values():
+            card.unparent()
+        self.cards, self.nodes, self.places, self.fades = {}, {}, {}, {}
+        self.geometry_cache = ()
+        self.roots = [self.wrap(row) for row in plan]
+        self.recentre = True
+        for node in self.nodes.values():
+            card = self.card(node)
+            card.set_parent(self)
+            self.cards[node] = card
+        self.layout()
+
+    def wrap(self, row):
+        node = PlanNode(row)
+        self.nodes[row["key"]] = node
+        node.kids = [self.wrap(kid) for kid in row["kids"]]
+        return node
+
+    def walk(self, node):
+        yield node
+        for kid in node.kids:
+            yield from self.walk(kid)
+
+    def card(self, node):
+        """Name over three lines, state beside it, and a foot line for what
+        the state cannot say on its own.
+
+        Store paths are long and all the difference is in the middle, so a
+        card that ellipsizes to one line says nothing; three fit most of
+        them whole. The foot carries the phase while it builds and the
+        count while it waits — and nothing at all once it is built.
+        """
+        slot = StateSlot()
+        title = Gtk.Label(xalign=0, wrap=True, lines=3, hexpand=True,
+                          wrap_mode=Pango.WrapMode.WORD_CHAR, max_width_chars=1,
+                          ellipsize=Pango.EllipsizeMode.END,
+                          valign=Gtk.Align.START)
+        head = Gtk.Box(spacing=8, valign=Gtk.Align.START)
+        head.append(slot)
+        head.append(title)
+
+        detail = Gtk.Label(xalign=0, ellipsize=Pango.EllipsizeMode.END,
+                           css_classes=["caption", "dim-label"])
+        # Only the run and its steps have a fraction — nix counts
+        # derivations, not the inside of one — so only they get a bar. It
+        # takes a fixed slice rather than expanding: the words beside it say
+        # what it is counting, and they are the half worth reading.
+        bar = Gtk.ProgressBar(valign=Gtk.Align.CENTER, width_request=64)
+        foot = Gtk.Box(spacing=8, valign=Gtk.Align.END)
+        foot.append(detail)
+        foot.append(bar)
+        # The revealer slides the foot out when there is nothing to put in
+        # it, and the card measures shorter while it does, which is what
+        # makes the row close up smoothly instead of snapping. The gap above
+        # it is the foot's own margin rather than the box's spacing, because
+        # spacing stays behind when the revealer folds.
+        foot.set_margin_top(6)
+        reveal = Gtk.Revealer(
+            child=foot, reveal_child=True, transition_duration=self.COLLAPSE,
+            transition_type=Gtk.RevealerTransitionType.SLIDE_UP)
+
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL,
+                      css_classes=["card", "plan-card"])
+        box.append(head)
+        box.append(reveal)
+        click = Gtk.GestureClick()
+        click.connect("pressed", lambda *_a, n=node: self.choose(n))
+        box.add_controller(click)
+        box.parts = (slot, title, detail, bar, reveal)
+        return box
+
+    def choose(self, node):
+        if self.on_select:
+            self.on_select(node.row["key"])
+
+    # -- layout ---------------------------------------------------------------
+    def layout(self):
+        """Leaves take the next free column, parents centre over their kids."""
+        self.column = 0
+
+        def place(node):
+            if node.kids:
+                xs = [place(kid) for kid in node.kids]
+                x = (min(xs) + max(xs)) / 2
+            else:
+                x = self.column
+                self.column += 1
+            self.places[node] = x
+            return x
+
+        for root in self.roots:
+            place(root)
+        self.columns = max(self.column, 1)
+        self.levels = max((node.row["depth"] for node in self.nodes.values()),
+                          default=0) + 1
+
+    def geometry(self):
+        """Column step, card width, and where each level sits.
+
+        Every level is as tall as the tallest card in it and no taller: a
+        row of one-line names has no reason to take the room a row of
+        wrapped store paths needs. What is left over becomes the gap between
+        the levels, which is where the edges are drawn.
+        """
+        width = max(self.get_width(), 1) - 2 * self.PAD
+        height = max(self.get_height(), 1) - 2 * self.PAD
+        step_x = width / self.columns
+
+        # No card is ever allocated less than it asked for: a card squeezed
+        # below its minimum re-measures for the rest of the frame and the
+        # widget never settles enough to draw.
+        floor = max([self.MIN_W] + [card.measure(Gtk.Orientation.HORIZONTAL,
+                                                 -1)[0]
+                                    for card in self.cards.values()])
+        card_w = max(floor, min(self.CARD_W, step_x - 8))
+
+        tall, heights = {}, {}
+        for node, card in self.cards.items():
+            _min, natural, _b1, _b2 = card.measure(Gtk.Orientation.VERTICAL,
+                                                   int(card_w))
+            heights[node] = natural
+            depth = node.row["depth"]
+            tall[depth] = max(tall.get(depth, 0), natural)
+
+        needed = sum(tall.values())
+        gaps = max(self.levels - 1, 1)
+        gap = min(self.GAP_MAX, max(self.GAP_MIN, (height - needed) / gaps))
+        top = self.PAD + max(0, (height - needed - gap * gaps) / 2)
+
+        rows, y = {}, top
+        for depth in range(self.levels):
+            rows[depth] = y
+            y += tall.get(depth, 0) + gap
+        return step_x, card_w, rows, heights
+
+    def box_of(self, node):
+        """Where a card sits, from the last allocation. Measuring children
+        from inside a snapshot never settles, so before the first one there
+        is nothing to draw and the next frame has it all."""
+        if not self.geometry_cache:
+            return None
+        step_x, card_w, rows, heights = self.geometry_cache
+        x = self.PAD + (self.places[node] + 0.5) * step_x - card_w / 2
+        return x, rows[node.row["depth"]], card_w, heights[node]
+
+    def do_measure(self, orientation, _for_size):
+        if orientation == Gtk.Orientation.HORIZONTAL:
+            floor = self.PAD * 2 + self.columns * (self.MIN_W + 8)
+            want = self.PAD * 2 + self.columns * (self.CARD_W + 16)
+            return (floor, want, -1, -1)
+        else:
+            floor = self.PAD * 2 + self.levels * (46 + self.GAP_MIN)
+            want = self.PAD * 2 + self.levels * (96 + 36)
+        return (floor, want, -1, -1)
+
+    def centre(self):
+        """Put the root in the middle of what can be seen.
+
+        A plan wider than the window opens on its top left corner, which is
+        a corner of a tree and reads as nothing. Done once per plan, so
+        scrolling somewhere and staying there still works."""
+        scroller = self.get_ancestor(Gtk.ScrolledWindow)
+        box = self.box_of(self.roots[0]) if self.roots else None
+        if scroller is None or box is None:
+            return
+        adjustment = scroller.get_hadjustment()
+        page = adjustment.get_page_size()
+        if not page:
+            return
+        self.recentre = False
+        adjustment.set_value(max(0, min(box[0] + box[2] / 2 - page / 2,
+                                        adjustment.get_upper() - page)))
+
+    def do_size_allocate(self, _width, _height, _baseline):
+        if not self.cards:
+            return
+        self.geometry_cache = self.geometry()
+        for node, card in self.cards.items():
+            x, y, w, h = self.box_of(node)
+            rect = Gdk.Rectangle()
+            rect.x, rect.y = int(x), int(y)
+            rect.width, rect.height = int(w), int(h)
+            card.size_allocate(rect, -1)
+        if self.recentre:
+            GLib.idle_add(self.centre)
+
+    def do_dispose(self):
+        # A plain GtkWidget subclass owns its children by hand; leaving them
+        # parented at teardown takes the process with it.
+        while child := self.get_first_child():
+            child.unparent()
+        Gtk.Widget.do_dispose(self)
+
+    # -- the edges ------------------------------------------------------------
+    def do_snapshot(self, snapshot):
+        cr = snapshot.append_cairo(Graphene.Rect().init(
+            0, 0, self.get_width(), self.get_height()))
+        paint = Palette(self)
+        cr.set_line_width(1.5)
+        for node in self.cards:
+            box = self.box_of(node)
+            if box is None:
+                break
+            px, py, pw, ph = box
+            for kid in node.kids:
+                kx, ky, kw, _kh = self.box_of(kid)
+                # An edge into something already built is spent; one feeding
+                # what is building now is the path the build is on.
+                state = kid.row["state"]
+                if state == RUNNING:
+                    cr.set_source_rgba(*paint.accent, .9)
+                else:
+                    cr.set_source_rgba(*paint.fg,
+                                       .18 if state == DONE else .35)
+                x0, y0 = px + pw / 2, py + ph
+                x1, y1 = kx + kw / 2, ky
+                slack = max((y1 - y0) / 2, 8)
+                cr.move_to(x0, y0)
+                cr.curve_to(x0, y0 + slack, x1, y1 - slack, x1, y1)
+                cr.stroke()
+        Gtk.Widget.do_snapshot(self, snapshot)
+
+    # -- the cards ------------------------------------------------------------
+    def refresh(self):
+        for node, card in self.cards.items():
+            slot, title, detail, bar, reveal = card.parts
+            title.set_label(node.row["name"])
+            detail.set_label(describe(node.row))
+            slot.show(node.row)
+            fraction = node.row.get("fraction")
+            bar.set_visible(fraction is not None
+                            and node.row["state"] not in (DONE, FAILED))
+            bar.set_fraction(min(fraction or 0, 1.0))
+            self.settle(node, detail, reveal)
+            for state in (RUNNING, FAILED):
+                card.remove_css_class(state)
+            if node.row["state"] in (RUNNING, FAILED):
+                card.add_css_class(node.row["state"])
+
+        # Only a state change can move the layout, and the page redraws four
+        # times a second: asking for a new one on every redraw leaves the
+        # widget permanently mid-resize.
+        shape = tuple(node.row["state"] for node in self.cards)
+        if shape != self.states:
+            self.states = shape
+            self.queue_resize()
+        self.queue_draw()
+
+    def settle(self, node, detail, reveal):
+        """Built is the end of the line: there is nothing left to say about
+        a derivation that is done, so the status fades out and the foot
+        slides shut under it, and the card gives back the height it was
+        holding open for a word that will not change again."""
+        wanted = node.row["state"] != DONE
+        if wanted == reveal.get_reveal_child():
+            return
+        reveal.set_reveal_child(wanted)
+        if wanted:
+            self.fades.pop(node, None)
+            detail.set_opacity(1)
+            return
+        target = Adw.CallbackAnimationTarget.new(detail.set_opacity)
+        fade = Adw.TimedAnimation.new(detail, 1, 0, self.COLLAPSE - 60, target)
+        fade.set_easing(Adw.Easing.EASE_OUT_CUBIC)
+        self.fades[node] = fade
+        fade.play()
+
+
+# -----------------------------------------------------------------------------
+# the output of whatever is being watched
+# -----------------------------------------------------------------------------
+class LogPane(Gtk.Box):
+    """What one derivation is saying, as it says it.
+
+    The plan has room for a name and a state; a build talks the whole way
+    through. Everything it says lands here instead, for whichever node is
+    building — or whichever one was clicked.
+    """
+
+    def __init__(self):
+        super().__init__(orientation=Gtk.Orientation.VERTICAL)
+        self.key = None
+        self.lines = []
+
+        self.title = Gtk.Label(xalign=0, css_classes=["heading"],
+                               ellipsize=Pango.EllipsizeMode.MIDDLE)
+        self.detail = Gtk.Label(xalign=0, css_classes=["caption", "dim-label"],
+                                ellipsize=Pango.EllipsizeMode.END)
+        self.follow = Gtk.CheckButton(label="Follow the build", active=True)
+
+        head = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2,
+                       margin_top=12, margin_bottom=12, margin_start=12,
+                       margin_end=12)
+        head.append(self.title)
+        head.append(self.detail)
+        head.append(self.follow)
+
+        self.view = Gtk.TextView(
+            editable=False, cursor_visible=False, monospace=True,
+            wrap_mode=Gtk.WrapMode.WORD_CHAR, left_margin=12, right_margin=12,
+            top_margin=8, bottom_margin=8, css_classes=["plan-log"])
+        self.buffer = self.view.get_buffer()
+        self.scroll = Gtk.ScrolledWindow(child=self.view, vexpand=True,
+                                         hscrollbar_policy=Gtk.PolicyType.NEVER)
+
+        self.append(head)
+        self.append(Gtk.Separator())
+        self.append(self.scroll)
+        self.show(None)
+
+    def show(self, row):
+        """Point the pane at a row — a node, a download, or nothing."""
+        if row is None:
+            self.key = None
+            self.lines = []
+            self.title.set_label("Nothing to read yet")
+            self.detail.set_label("Pick a derivation to follow its output.")
+            self.buffer.set_text("")
+            return
+
+        if row["key"] != self.key:
+            self.key, self.lines = row["key"], []
+            self.buffer.set_text("")
+        self.title.set_label(row["name"])
+        self.detail.set_label(describe(row) or "building")
+
+        # The log is a tail: lines fall off the front as new ones arrive, so
+        # what is on screen is replaced rather than appended to. Sixty lines
+        # four times a second is nothing, and it keeps the two in step.
+        if row["log"] == self.lines:
+            return
+        self.lines = list(row["log"])
+        # A build that has not said anything yet, or a download, which never
+        # will: an empty pane looks like something failed to arrive.
+        self.buffer.set_text("\n".join(self.lines) or "No output yet")
+
+        # Stay at the newest line, unless whoever is reading scrolled up.
+        adjustment = self.scroll.get_vadjustment()
+        if adjustment.get_value() + adjustment.get_page_size() >= \
+                adjustment.get_upper() - 48:
+            GLib.idle_add(lambda: adjustment.set_value(
+                adjustment.get_upper() - adjustment.get_page_size()))
+
 
 
 def problem_row(problem):
@@ -1858,7 +2742,13 @@ class Window(Adw.ApplicationWindow):
                                        tooltip_text="Check for Updates")
         self.check_button.connect("clicked", lambda _b: self.check())
 
+        view_menu = Gio.Menu()
+        view_menu.append("Graph", "win.plan-view::graph")
+        view_menu.append("List", "win.plan-view::list")
+
         menu = Gio.Menu()
+        menu.append_section("Rebuild View", view_menu)
+        menu.append("Last Apply", "win.last-apply")
         menu.append("Sources", "win.sources")
         menu.append("About npins", "win.about")
         menu_button = Gtk.MenuButton(icon_name="open-menu-symbolic",
@@ -1891,17 +2781,33 @@ class Window(Adw.ApplicationWindow):
                                         css_classes=["suggested-action", "pill"])
         self.finish_button.connect("clicked", lambda _b: self.finish())
         self.status.set_child(self.finish_button)
-        # The rebuild page: a progress bar fed by nix's own counters, over a
-        # list of what it is counting. The list is the point — the log this
-        # replaced could show the same events, but only as one stream of
-        # them, with a dozen parallel builds shredded into each other.
-        self.progress = Gtk.ProgressBar(show_text=True, margin_top=12,
-                                        margin_start=12, margin_end=12)
-        self.activity = boxed_list()
+        # The rebuild page is the plan and nothing else. How far along the
+        # run is used to be a bar above it; it is the root node now, with a
+        # node per step under it, because a rebuild counting its own steps
+        # is part of the tree rather than chrome around it.
+        self.graph = PlanGraph()
+        self.list = PlanList()
+        self.graph.on_select = self.watch
+        self.list.on_select = self.watch
+        # The graph asks for the width its cards want; a rebuild with fifty
+        # downloads in it would otherwise drag the window that wide. Inside
+        # a scroller it fits when it can and scrolls when it cannot, and the
+        # window keeps a size a window can have.
+        self.plan_views = Gtk.Stack(vexpand=True)
+        self.plan_views.add_named(
+            Gtk.ScrolledWindow(child=self.graph, vexpand=True), "graph")
+        self.plan_views.add_named(self.list, "list")
+        self.pane = LogPane()
+        self.watching = None
+        self.seen = {}
+        # What the page is showing when it is not showing a live rebuild:
+        # the record of the last one, and which of its steps is on screen.
+        self.replay = None
+        self.record = []
+        self.rebuild_started = self.step_started = 0
+
         self.problems = boxed_list()
         self.problems_heading = section("Problems")
-        self.rows = {}
-        self.tree_shape = ()
         self.problem_count = 0
 
         # nix says things no row was written for — obsolete channels, a
@@ -1924,17 +2830,32 @@ class Window(Adw.ApplicationWindow):
         self.rebuild_body = Gtk.Box(orientation=Gtk.Orientation.VERTICAL,
                                     spacing=12, margin_top=12, margin_bottom=12,
                                     margin_start=12, margin_end=12)
-        self.rebuild_body.append(self.activity)
         self.rebuild_body.append(self.problems_heading)
         self.rebuild_body.append(self.problems)
         self.rebuild_body.append(section("Details"))
         self.rebuild_body.append(log_group)
-        rebuild_page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
-        rebuild_page.append(self.progress)
-        rebuild_page.append(Gtk.ScrolledWindow(
-            child=Adw.Clamp(child=self.rebuild_body, maximum_size=700),
-            hscrollbar_policy=Gtk.PolicyType.NEVER, vexpand=True,
-        ))
+        # The plan takes the room and the rest takes what it needs: a
+        # scroller that stops growing at a third of the window, so a long
+        # list of downloads cannot push the plan off the page.
+        extras = Gtk.ScrolledWindow(
+            child=self.rebuild_body, hscrollbar_policy=Gtk.PolicyType.NEVER,
+            propagate_natural_height=True, max_content_height=260,
+        )
+        plan_side = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        plan_side.append(self.plan_views)
+        plan_side.append(extras)
+
+        # Collapsed: the output is a drawer over the plan rather than a
+        # third of the window standing empty until something is clicked.
+        # Clicking a node opens it; the button in the header keeps it open.
+        self.split = Adw.OverlaySplitView(
+            content=plan_side, sidebar=self.pane, collapsed=True,
+            show_sidebar=False, sidebar_position=Gtk.PackType.END,
+            sidebar_width_fraction=0.34, min_sidebar_width=280,
+            max_sidebar_width=400,
+        )
+        rebuild_page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        rebuild_page.append(self.split)
 
         self.stack = Gtk.Stack()
         self.stack.add_named(self.status, "status")
@@ -1962,6 +2883,15 @@ class Window(Adw.ApplicationWindow):
         self.back_button = Gtk.Button(label="Back", visible=False)
         self.back_button.connect("clicked", lambda _b: self.leave_rebuild())
 
+        # The output drawer, pinned open. Clicking a derivation opens it
+        # anyway; this is for keeping it there while the build moves on.
+        self.output_button = Gtk.ToggleButton(
+            icon_name="sidebar-show-right-symbolic", visible=False,
+            tooltip_text="Build Output")
+        self.output_button.bind_property(
+            "active", self.split, "show-sidebar",
+            GObject.BindingFlags.BIDIRECTIONAL)
+
         # A persistent one-line verdict belongs in a banner, not in a toast
         # that vanishes.
         self.banner = Adw.Banner(revealed=False)
@@ -1975,6 +2905,7 @@ class Window(Adw.ApplicationWindow):
         header.pack_end(self.apply_button)
         header.pack_end(self.cancel_button)
         header.pack_end(self.back_button)
+        header.pack_end(self.output_button)
         header.pack_end(self.spinner)
 
         view = Adw.ToolbarView(content=self.stack)
@@ -1987,12 +2918,31 @@ class Window(Adw.ApplicationWindow):
         for name, handler in (
             ("apply-only", lambda *_: self.apply(commit=False, rebuild=True)),
             ("write-only", lambda *_: self.apply(commit=True, rebuild=False)),
+            ("last-apply", lambda *_: self.open_apply()),
             ("sources", lambda *_: self.sources()),
             ("about", lambda *_: self.about()),
         ):
             action = Gio.SimpleAction.new(name, None)
             action.connect("activate", handler)
             self.add_action(action)
+
+        # Which view the rebuild draws its plan in. GSettings owns the
+        # choice when its schema is installed and hands out an action bound
+        # to it; from a checkout there is no schema, so the action carries
+        # the state itself and the choice lasts as long as the window.
+        self.settings = load_settings()
+        if self.settings:
+            view_action = self.settings.create_action("plan-view")
+            self.settings.connect("changed::plan-view",
+                                  lambda *_: self.show_plan_view())
+        else:
+            view_action = Gio.SimpleAction.new_stateful(
+                "plan-view", GLib.VariantType.new("s"),
+                GLib.Variant("s", DEFAULT_PLAN_VIEW))
+            view_action.connect("change-state", lambda action, value: (
+                action.set_state(value), self.show_plan_view()))
+        self.add_action(view_action)
+        self.show_plan_view()
 
         # Open on what the timer already found rather than on nothing. It ran
         # the same check this window would, so repeating it on every launch
@@ -2003,6 +2953,7 @@ class Window(Adw.ApplicationWindow):
 
         self.render()
         self.sync_apply()
+        self.sync_apply_history()
 
         if not restored or age > FRESH_FOR:
             # Nothing kept, or kept longer than the timer promises to keep it
@@ -2580,9 +3531,11 @@ class Window(Adw.ApplicationWindow):
 
     def start_rebuild(self):
         self.steps = rebuild_steps(self.repo)
+        self.replay = None
+        self.record = []
         self.logbuf.set_text("")
-        self.progress.set_fraction(0)
         self.carried = []
+        self.rebuild_started = time.monotonic()
         # Measured before the switch, because afterwards there is nothing
         # left that remembers what the store weighed.
         self.closure_before = closure_stats(profiles())
@@ -2590,7 +3543,9 @@ class Window(Adw.ApplicationWindow):
         self.check_button.set_sensitive(False)
         self.cancel_button.set_visible(True)
         self.back_button.set_visible(False)
+        self.output_button.set_visible(True)
         self.ticker = GLib.timeout_add(self.TICK, self.tick)
+        self.sync_apply_history()
         self.run_step(0)
 
     def run_step(self, index):
@@ -2601,8 +3556,7 @@ class Window(Adw.ApplicationWindow):
         label, command = self.steps[index]
         self.step_index = index
         self.say(f"{label}…", seconds=0)
-        self.progress.set_fraction(0)
-        self.progress.set_text(label)
+        self.step_started = time.monotonic()
         self.clear_activity()
         # Two processes, two sets of counters — but one list of problems, so
         # that a warning from the system step is still on screen when the
@@ -2638,43 +3592,82 @@ class Window(Adw.ApplicationWindow):
             self.draw_rebuild(snapshot)
         return GLib.SOURCE_CONTINUE
 
+    def plan_view(self):
+        """Which of the two views the plan is drawn in right now."""
+        if self.settings:
+            return self.settings.get_string("plan-view")
+        action = self.lookup_action("plan-view")
+        return action.get_state().get_string() if action else DEFAULT_PLAN_VIEW
+
+    def show_plan_view(self):
+        self.plan_views.set_visible_child_name(self.plan_view())
+
+    def watch(self, key):
+        """A click on a derivation: read that one, and stop chasing the
+        build. The drawer comes out on its own — that is what the click was
+        asking for."""
+        self.pane.follow.set_active(False)
+        self.watching = key
+        self.pane.show(self.seen.get(key))
+        self.split.set_show_sidebar(True)
+
     def clear_activity(self):
-        for widget in self.rows.values():
-            self.activity.remove(widget)
-        self.rows = {}
-        self.tree_shape = ()
-        self.activity.set_visible(False)
+        self.seen = {}
+        self.watching = None
+        self.graph.update([])
+        self.list.update([])
+        self.pane.show(None)
+
+    def pick_reading(self):
+        """What a record opens on: whatever failed, or else the last thing
+        that said anything at all."""
+        failed = [key for key, row in self.seen.items()
+                  if row.get("state") == FAILED]
+        spoke = [key for key, row in self.seen.items() if row.get("log")]
+        return (failed or spoke or [None])[-1]
+
+    def live_steps(self, snapshot):
+        """Every step of the run at once: the ones already archived, the one
+        that is running, and the ones still to come.
+
+        The page used to show one step at a time, because that is all the
+        stream in front of it knew about. The record knows the rest, so the
+        tree can hold the whole rebuild — including the half that has not
+        started, which is the half people wonder about."""
+        steps = []
+        for index, (label, _command) in enumerate(self.steps):
+            if index < len(self.record):
+                kept = self.record[index]
+                steps.append(dict(kept, fraction=1.0,
+                                  tail=kept["raw"][-STEP_LINES:]))
+            elif index == self.step_index:
+                steps.append({
+                    "label": label, "plan": snapshot["plan"],
+                    "downloads": snapshot["downloads"],
+                    "summary": snapshot["summary"], "running": True,
+                    "fraction": snapshot["fraction"] or 0.0,
+                    "tail": snapshot["tail"], "started": self.step_started,
+                })
+            else:
+                steps.append({"label": label, "plan": [], "summary": "",
+                              "fraction": None})
+        return steps
+
+    def draw_plan(self, plan):
+        """Hand the tree to both views. The one not on screen is kept up to
+        date too, so switching to it shows the build rather than the build
+        as it was when it was last looked at."""
+        self.graph.update(plan)
+        self.list.update(plan)
+        self.plan_views.set_visible(bool(plan))
+        return plan
 
     def draw_rebuild(self, snapshot):
         """Bring the page up to date with one instant of the stream."""
-        if snapshot["fraction"] is not None:
-            self.progress.set_fraction(min(snapshot["fraction"], 1.0))
-        label = self.steps[self.step_index][0] if self.steps else ""
-        summary = snapshot["summary"]
-        self.progress.set_text(f"{label} — {summary}" if summary else label)
-
-        # The tree arrives whole, a second or so into the step, when the
-        # edges have been worked out. A list box cannot be reordered without
-        # taking it apart, so when the shape changes it is taken apart once,
-        # here, rather than drifting out of order for the rest of the build.
-        shape = tuple(row["key"] for row in snapshot["tree"])
-        if shape != self.tree_shape:
-            self.clear_activity()
-            self.tree_shape = shape
-
-        # Rows are kept and updated rather than rebuilt, so that an expander
-        # opened to watch a compile is not closed again a quarter-second later.
-        wanted = {row["key"]: row for row in snapshot["tree"] + snapshot["rows"]}
-        for key in [k for k in self.rows if k not in wanted]:
-            self.activity.remove(self.rows.pop(key))
-        for key, row in wanted.items():
-            widget = self.rows.get(key)
-            if widget is None:
-                widget = ActivityRow(row)
-                self.rows[key] = widget
-                self.activity.append(widget)
-            widget.update(row)
-        self.activity.set_visible(bool(self.rows))
+        plan = self.draw_plan(compose(self.live_steps(snapshot),
+                                      self.rebuild_started))
+        self.seen = {row["key"]: row for row in walk_plan(plan)}
+        self.draw_log()
 
         # Problems only ever grow, so the count is enough to tell whether
         # this redraw has anything new to say about them.
@@ -2690,6 +3683,34 @@ class Window(Adw.ApplicationWindow):
 
         if snapshot["raw"]:
             self.log("\n".join(snapshot["raw"]))
+
+    def draw_log(self):
+        """Keep the pane on something worth reading.
+
+        Following sticks with one derivation until it is finished rather
+        than hopping to whichever started last: with a dozen builds running
+        at once, hopping makes the pane unreadable. In a record there is
+        nothing to follow at all — it opens on whatever failed, and every
+        node is still one click away.
+        """
+        self.pane.follow.set_visible(self.replay is None)
+        if self.replay:
+            if self.watching is None:
+                self.watching = self.pick_reading()
+            self.pane.show(self.seen.get(self.watching))
+            return
+
+        running = [row for row in self.seen.values()
+                   if row.get("state") == RUNNING or row.get("state") is None]
+        if self.pane.follow.get_active():
+            current = self.seen.get(self.watching)
+            if current not in running:
+                # Nothing left running means the step is over: hold whatever
+                # was being read, and if that is nothing, open on the reason
+                # it stopped.
+                self.watching = (running[0]["key"] if running
+                                 else self.watching or self.pick_reading())
+        self.pane.show(self.seen.get(self.watching))
 
     def log(self, text):
         end = self.logbuf.get_end_iter()
@@ -2709,6 +3730,10 @@ class Window(Adw.ApplicationWindow):
         snapshot = self.stream.snapshot() if self.stream else None
         if snapshot:
             self.draw_rebuild(snapshot)
+        # Archived here rather than at the end of the run: the stream that
+        # holds this step is replaced by the next one, and a failed step is
+        # the last thing that happens before the page stops moving.
+        self.keep_step(index)
 
         if self.cancelled:
             self.rebuild_done(None, cancelled=True)
@@ -2721,7 +3746,6 @@ class Window(Adw.ApplicationWindow):
             label = self.steps[index][0]
             self.rebuild_done(RuntimeError(f"{label} failed (exit {code})."))
             return GLib.SOURCE_REMOVE
-        self.progress.set_fraction(1.0)
         self.run_step(index + 1)
         return GLib.SOURCE_REMOVE
 
@@ -2731,7 +3755,11 @@ class Window(Adw.ApplicationWindow):
             self.proc.terminate()
 
     def leave_rebuild(self):
-        """Off the failed rebuild's page and back to the pins."""
+        """Off the rebuild page — failed, or an old one read back — and
+        back to the pins."""
+        self.replay = None
+        self.output_button.set_visible(False)
+        self.split.set_show_sidebar(False)
         self.say("")
         self.render()
         self.sync_apply()
@@ -2744,15 +3772,94 @@ class Window(Adw.ApplicationWindow):
         rows behind this banner. Sending the window back to a status page
         would throw away the only copy.
         """
-        self.clear_activity()
-        self.progress.set_fraction(0)
-        self.progress.set_text(str(error))
+        # The plan stays: the derivation that failed is in it, marked, with
+        # what it said still readable in the pane beside it. Clearing it
+        # would throw away the only copy of the answer.
         self.say(f"{error} What went wrong is below.", seconds=0)
         self.back_button.set_visible(True)
+        self.output_button.set_visible(True)
         if not self.problem_count:
             # nix said nothing a row was made of — a step that died before
             # it started, or was killed. The full output is all there is.
             self.logrow.set_expanded(True)
+
+    # -- the last apply, kept and read back ------------------------------------
+    def keep_step(self, index):
+        """Put this step's page into the record being built."""
+        if self.stream and self.steps:
+            self.record.append(self.stream.archive(self.steps[index][0]))
+
+    def keep_apply(self, outcome, message=""):
+        """Write the record, and let the menu reach it."""
+        if not self.record:
+            return
+        save_apply({
+            "when": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "outcome": outcome,
+            "message": message,
+            "steps": self.record,
+        })
+        self.sync_apply_history()
+
+    def sync_apply_history(self):
+        action = self.lookup_action("last-apply")
+        if action:
+            action.set_enabled(APPLIED.is_file() and self.proc is None)
+
+    def open_apply(self):
+        """The last rebuild's page, as it stood when it finished."""
+        record = load_apply()
+        if not record or not record.get("steps"):
+            self.say("Nothing has been applied yet")
+            return
+        self.replay = record
+        self.stack.set_visible_child_name("rebuild")
+        self.cancel_button.set_visible(False)
+        self.apply_button.set_visible(False)
+        self.back_button.set_visible(True)
+        self.output_button.set_visible(True)
+        self.logrow.set_expanded(False)
+        self.draw_replay()
+
+    def draw_replay(self):
+        """The record, as the same tree the live page draws.
+
+        Every step is in it, so there is nothing to switch between: the run
+        is the root, and what failed is a node under it with its output
+        still attached."""
+        if not self.replay:
+            return
+        self.clear_activity()
+        self.logbuf.set_text("")
+
+        steps = [dict(step, fraction=1.0, tail=step["raw"][-STEP_LINES:])
+                 for step in self.replay["steps"]]
+        plan = self.draw_plan(compose(steps))
+        self.seen = {row["key"]: row for row in walk_plan(plan)}
+
+        problems = [problem for step in self.replay["steps"]
+                    for problem in step["problems"]]
+        while child := self.problems.get_first_child():
+            self.problems.remove(child)
+        for problem in problems:
+            self.problems.append(problem_row(problem))
+        self.problem_count = len(problems)
+        self.problems.set_visible(bool(problems))
+        self.problems_heading.set_visible(bool(problems))
+        self.log("\n".join(line for step in self.replay["steps"]
+                           for line in step["raw"]))
+        self.draw_log()
+        # A record opens on what failed, so the drawer opens with it. There
+        # is no build to watch here — reading is the only reason to be on
+        # this page at all.
+        self.split.set_show_sidebar(self.watching is not None)
+
+        headline = self.replay.get("message") or {
+            "failed": "The rebuild failed",
+            "cancelled": "The rebuild was cancelled",
+        }.get(self.replay["outcome"], "Applied")
+        self.say(f"{headline} · {applied_ago(self.replay.get('when'))}",
+                 seconds=0)
 
     def rebuild_done(self, error, cancelled=False):
         self.proc = None
@@ -2762,6 +3869,11 @@ class Window(Adw.ApplicationWindow):
             GLib.source_remove(self.ticker)
             self.ticker = 0
         self.sync_check()
+        self.output_button.set_visible(False)
+        self.keep_apply("failed" if error and not cancelled else
+                        "cancelled" if cancelled else "ok",
+                        str(error) if error and not cancelled else "")
+        self.sync_apply_history()
 
         if error and not cancelled:
             self.rebuild_failed(error)
@@ -2831,6 +3943,28 @@ class Window(Adw.ApplicationWindow):
         ).present(self)
 
 
+# What Adwaita has no class for. Everything else on these pages is a stock
+# widget with a stock style; this is the little that the drawn plan needs.
+CSS = b"""
+/* The row carries no padding of its own: the gutter has to reach the row
+   above and below it, or the connector lines come out dashed. */
+listview.plan-list > row { padding: 0; }
+.plan-row { padding: 6px 12px 6px 0; }
+
+.plan-card { padding: 8px 10px; border-radius: 12px; }
+.plan-card label { font-size: .9em; }
+/* An outline, not a border: a border takes room, and a card that grows by
+   two pixels when it starts building shoves every card beside it. */
+.plan-card.running, .plan-card.failed {
+    outline-style: solid; outline-width: 2px; outline-offset: -2px;
+}
+.plan-card.running { outline-color: alpha(@accent_color, .6); }
+.plan-card.failed  { outline-color: alpha(@error_color, .6); }
+
+.plan-log { font-family: monospace; font-size: .85em; }
+"""
+
+
 class Application(Adw.Application):
     def __init__(self, repo):
         # NON_UNIQUE because the repo is per-process state: with the default
@@ -2841,6 +3975,11 @@ class Application(Adw.Application):
         self.repo = repo
 
     def do_activate(self):
+        provider = Gtk.CssProvider()
+        provider.load_from_data(CSS)
+        Gtk.StyleContext.add_provider_for_display(
+            Gdk.Display.get_default(), provider,
+            Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
         window = self.props.active_window or Window(self, self.repo)
         window.present()
 

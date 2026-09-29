@@ -2,6 +2,7 @@
 
 { lib
 , stdenvNoCC
+, glib
 , python3
 , wrapGAppsHook4
 , gobject-introspection
@@ -41,7 +42,11 @@ stdenvNoCC.mkDerivation {
 
   # gobject-introspection here (not in buildInputs) is what makes
   # wrapGAppsHook4 collect GI_TYPELIB_PATH for Gtk and Adw.
-  nativeBuildInputs = [ wrapGAppsHook4 gobject-introspection ];
+  # glib is here for glib-compile-schemas. Its own hook only relocates a
+  # schema directory into share/gsettings-schemas and points the wrapper at
+  # it — compiling is the package's job, and nothing else in this build
+  # would do it.
+  nativeBuildInputs = [ wrapGAppsHook4 gobject-introspection glib ];
   buildInputs = [ gtk4 libadwaita pythonEnv ];
 
   installPhase = ''
@@ -50,6 +55,10 @@ stdenvNoCC.mkDerivation {
     install -Dm755 npins-ui.py $out/bin/npins-ui
     substituteInPlace $out/bin/npins-ui \
       --replace-fail '#!/usr/bin/env python3' '#!${pythonEnv}/bin/python3'
+
+    install -Dm644 de.lucsoft.NpinsUi.gschema.xml \
+      $out/share/glib-2.0/schemas/de.lucsoft.NpinsUi.gschema.xml
+    glib-compile-schemas $out/share/glib-2.0/schemas
 
     install -Dm644 versions.nix $out/share/npins-ui/versions.nix
     install -Dm644 sizes.nix $out/share/npins-ui/sizes.nix

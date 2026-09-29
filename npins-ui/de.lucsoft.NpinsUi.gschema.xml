@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<schemalist>
+  <enum id="de.lucsoft.NpinsUi.PlanView">
+    <value nick="graph" value="0"/>
+    <value nick="list" value="1"/>
+  </enum>
+
+  <schema id="de.lucsoft.NpinsUi" path="/de/lucsoft/NpinsUi/">
+    <key name="plan-view" enum="de.lucsoft.NpinsUi.PlanView">
+      <default>'graph'</default>
+      <summary>How a rebuild draws its plan</summary>
+      <description>
+        The rebuild page shows what nix is building as the dependency graph
+        it is. "graph" lays the derivations out by depth with the edges
+        drawn between them; "list" is the same tree as an indented list,
+        which holds more derivations on screen at once.
+      </description>
+    </key>
+  </schema>
+</schemalist>
