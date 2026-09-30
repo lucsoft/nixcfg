@@ -1,5 +1,6 @@
 """The window."""
 
+import shutil
 import subprocess
 import tempfile
 import threading
@@ -18,7 +19,7 @@ from ..effect import (NOTHING, REBOOT, REBUILD, SESSION, TIER_ACTION,
                       end_session, mark_session_stale, pending_tier,
                       reboot_needed)
 from ..evaluate import closure_delta, closure_stats, profiles
-from ..check import (APPLIED, FRESH_FOR, STATE, ago, applied_ago,
+from ..check import (APPLIED, CHECK_LOCK, FRESH_FOR, STATE, ago, applied_ago,
                      check_running, load_apply, load_check, save_apply,
                      save_check, survey)
 from ..stream import (DEFAULT_PLAN_VIEW, FAILED, RUNNING, STEP_LINES,
@@ -47,6 +48,11 @@ class Window(Adw.ApplicationWindow):
         self.working = False
         self._banner_timer = 0
         self.proc = None
+        # Whether a rebuild is in flight, as its own answer rather than as
+        # `proc is not None`. The process only exists once Popen has
+        # returned, and everything that asks — the check button, the state
+        # watch, Apply, Last Apply — asks earlier than that.
+        self.rebuilding = False
         self.cancelled = False
         self.steps = []
         self.step_index = 0
@@ -288,6 +294,24 @@ class Window(Adw.ApplicationWindow):
             self.show_current(age)
 
         self.watch_state()
+        self.connect("close-request", self.closing)
+
+    def closing(self, *_args):
+        """Closing the window ends the process, and the rebuild with it.
+
+        nix is written to with --log-format internal-json the whole way
+        through, so losing the read end of its pipe kills it — possibly
+        inside switch-to-configuration, between one service restart and the
+        next. That is not something a window close should be able to do, so
+        it is refused while a rebuild is in flight; Cancel is the way out,
+        and it stops at the end of the step for the same reason.
+        """
+        if self.rebuilding:
+            self.say("The rebuild is still running. Cancel it first.",
+                     seconds=0)
+            return True     # GDK_EVENT_STOP — the window stays
+        shutil.rmtree(self.workdir, ignore_errors=True)
+        return False
 
     # -- helpers --------------------------------------------------------------
     def toast(self, text):
@@ -297,6 +321,10 @@ class Window(Adw.ApplicationWindow):
         """Put what is owed on the status page as something to press."""
         self.finish_tier = tier
         self.finish_button.set_visible(tier != NOTHING)
+        # A check landing mid-rebuild puts this page back up with Rebuild on
+        # it, and pressing it would start a second nixos-rebuild over the
+        # first. Greyed rather than hidden: it is still what is owed.
+        self.finish_button.set_sensitive(not self.working and not self.rebuilding)
         if tier == REBOOT:
             self.finish_button.set_label("Restart")
         elif tier == SESSION:
@@ -349,6 +377,7 @@ class Window(Adw.ApplicationWindow):
         self.spinner.set_visible(active)
         self.sync_check()
         self.sync_apply(busy=active)
+        self.offer(self.finish_tier)
         if message:
             self.say(message, seconds=0)
 
@@ -357,8 +386,12 @@ class Window(Adw.ApplicationWindow):
 
     def sync_apply(self, busy=False):
         """There is nothing to apply until a check finds something, so the
-        button is absent rather than present-and-greyed."""
-        ready = bool(self.pending_text)
+        button is absent rather than present-and-greyed.
+
+        Not while a rebuild is running either: applying writes the lock file
+        that the running nixos-rebuild is reading.
+        """
+        ready = bool(self.pending_text) and not self.rebuilding
         self.apply_button.set_visible(ready)
         self.apply_button.set_sensitive(ready and not busy)
 
@@ -652,7 +685,7 @@ class Window(Adw.ApplicationWindow):
         self.state_watch = Gio.File.new_for_path(str(STATE)).monitor_file(
             Gio.FileMonitorFlags.WATCH_MOVES, None)
         self.state_watch.connect("changed", self.state_changed)
-        self.check_watch = Gio.File.new_for_path(str(RUNNING)).monitor_file(
+        self.check_watch = Gio.File.new_for_path(str(CHECK_LOCK)).monitor_file(
             Gio.FileMonitorFlags.WATCH_MOVES, None)
         self.check_watch.connect(
             "changed", lambda *_args: self.sync_check())
@@ -665,7 +698,7 @@ class Window(Adw.ApplicationWindow):
         """
         # A rebuild counts too: it is the window busy in its own way, and
         # a marker dropped mid-build would otherwise hand the button back.
-        busy = self.working or self.proc is not None
+        busy = self.working or self.rebuilding
         elsewhere = not busy and check_running()
         self.check_button.set_sensitive(not busy and not elsewhere)
         if elsewhere:
@@ -681,7 +714,7 @@ class Window(Adw.ApplicationWindow):
         finished write: save_check renames the file into place, and a state
         that is half written, for another repo, or for pins that have moved
         since is one load_check turns down anyway."""
-        if self.working or self.proc:
+        if self.working or self.rebuilding:
             # A rebuild owns the window, and a check of the window's own is
             # about to arrive carrying this same answer.
             return
@@ -693,6 +726,11 @@ class Window(Adw.ApplicationWindow):
 
     def present_check(self):
         """Put what the window holds on screen, however it got there."""
+        if self.rebuilding:
+            # A check started before the rebuild finishing during it. What
+            # it found is held; render() would pull the status page up over
+            # the live plan. rebuild_done catches the buttons back up.
+            return
         self.render()
         self.sync_apply()
         if self.updates:
@@ -853,6 +891,13 @@ class Window(Adw.ApplicationWindow):
     TICK = 250
 
     def start_rebuild(self):
+        if self.rebuilding:
+            # Two nixos-rebuild switches against one store, and the second
+            # would orphan the first's process so Cancel could never reach
+            # it. Reachable from finish(), whose button a late check can put
+            # back up over a running rebuild.
+            return
+        self.rebuilding = True
         self.steps = rebuild_steps(self.repo)
         self.replay = None
         self.record = []
@@ -865,6 +910,7 @@ class Window(Adw.ApplicationWindow):
         self.stack.set_visible_child_name("rebuild")
         self.check_button.set_sensitive(False)
         self.cancel_button.set_visible(True)
+        self.cancel_button.set_sensitive(True)   # a cancel left it greyed
         self.back_button.set_visible(False)
         self.output_button.set_visible(True)
         self.ticker = GLib.timeout_add(self.TICK, self.tick)
@@ -1073,9 +1119,24 @@ class Window(Adw.ApplicationWindow):
         return GLib.SOURCE_REMOVE
 
     def cancel_rebuild(self):
+        """Stop the run, as far as it can be stopped.
+
+        The flag is what actually cancels: step_finished reads it and does
+        not start the next step. Signalling the current one is the part that
+        may not be allowed — the system step is pkexec's child and runs as
+        root, which an unprivileged parent cannot signal. Saying so is
+        better than a button that looks ignored for the rest of the build.
+        """
         self.cancelled = True
+        self.cancel_button.set_sensitive(False)
         if self.proc and self.proc.poll() is None:
-            self.proc.terminate()
+            try:
+                self.proc.terminate()
+            except OSError:
+                self.say("Cancelling — the system build runs as root and "
+                         "finishes this step first", seconds=0)
+                return
+        self.say("Cancelling…", seconds=0)
 
     def leave_rebuild(self):
         """Off the rebuild page — failed, or an old one read back — and
@@ -1127,7 +1188,7 @@ class Window(Adw.ApplicationWindow):
     def sync_apply_history(self):
         action = self.lookup_action("last-apply")
         if action:
-            action.set_enabled(APPLIED.is_file() and self.proc is None)
+            action.set_enabled(APPLIED.is_file() and not self.rebuilding)
 
     def open_apply(self):
         """The last rebuild's page, as it stood when it finished."""
@@ -1186,6 +1247,7 @@ class Window(Adw.ApplicationWindow):
 
     def rebuild_done(self, error, cancelled=False):
         self.proc = None
+        self.rebuilding = False
         self.cancelled = False
         self.cancel_button.set_visible(False)
         if self.ticker:
@@ -1197,6 +1259,9 @@ class Window(Adw.ApplicationWindow):
                         "cancelled" if cancelled else "ok",
                         str(error) if error and not cancelled else "")
         self.sync_apply_history()
+        # A check that landed mid-rebuild was held back from the page; the
+        # buttons it should have moved are this window's to catch up on.
+        self.sync_apply()
 
         if error and not cancelled:
             self.rebuild_failed(error)
