@@ -1,6 +1,5 @@
 """The window."""
 
-import shutil
 import subprocess
 import tempfile
 import threading
@@ -38,7 +37,13 @@ class Window(Adw.ApplicationWindow):
                          default_width=820, default_height=680)
         self.repo = Path(repo)
         self.lockfile = self.repo / LOCKFILE
-        self.workdir = Path(tempfile.mkdtemp(prefix="npins-ui-"))
+        # Held as the object, not just its path: its finalizer takes the
+        # directory away at interpreter exit too, so quitting by any route
+        # other than closing the window does not leave one behind. Closing
+        # the window is the prompt case and cleans up there; 123 of these
+        # had collected in /tmp before anything did.
+        self._workdir = tempfile.TemporaryDirectory(prefix="npins-ui-")
+        self.workdir = Path(self._workdir.name)
         self.pending_text = None
         self.updates = []
         self.detail = {}
@@ -310,7 +315,7 @@ class Window(Adw.ApplicationWindow):
             self.say("The rebuild is still running. Cancel it first.",
                      seconds=0)
             return True     # GDK_EVENT_STOP — the window stays
-        shutil.rmtree(self.workdir, ignore_errors=True)
+        self._workdir.cleanup()
         return False
 
     # -- helpers --------------------------------------------------------------
