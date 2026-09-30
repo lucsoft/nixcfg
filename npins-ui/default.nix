@@ -52,9 +52,15 @@ stdenvNoCC.mkDerivation {
   installPhase = ''
     runHook preInstall
 
+    # The launcher is the only file that becomes a binary; the package it
+    # imports goes on PYTHONPATH below, beside the two .nix expressions.
     install -Dm755 npins-ui.py $out/bin/npins-ui
     substituteInPlace $out/bin/npins-ui \
       --replace-fail '#!/usr/bin/env python3' '#!${pythonEnv}/bin/python3'
+
+    mkdir -p $out/share/npins-ui
+    cp -r npins_ui $out/share/npins-ui/
+    find $out/share/npins-ui -name __pycache__ -type d -exec rm -rf {} +
 
     install -Dm644 de.lucsoft.NpinsUi.gschema.xml \
       $out/share/glib-2.0/schemas/de.lucsoft.NpinsUi.gschema.xml
@@ -76,6 +82,11 @@ stdenvNoCC.mkDerivation {
       # on the app's PATH rather than only in the profile that installed it.
       --prefix PATH : ${lib.makeBinPath [ npins git nix ]}
       --set NPINS_UI_EVAL $out/share/npins-ui/versions.nix
+
+      # Where npins_ui itself lives. The launcher in bin/ only adds its own
+      # directory to sys.path, which is what makes running from a checkout
+      # work; installed, this is the line that finds the package.
+      --prefix PYTHONPATH : $out/share/npins-ui
 
       # The icon themes have to be named here. Putting them in buildInputs
       # populates XDG_ICON_DIRS but wrapGAppsHook4 no longer folds that into
