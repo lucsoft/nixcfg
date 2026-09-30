@@ -312,10 +312,16 @@ class Window(Adw.ApplicationWindow):
         and it stops at the end of the step for the same reason.
         """
         if self.rebuilding:
-            self.say("The rebuild is still running. Cancel it first.",
-                     seconds=0)
+            # A toast, not the banner: the banner is carrying the step that
+            # is running, and a refusal has no business sitting on top of it
+            # for the twenty minutes a system build takes.
+            self.toast("The rebuild is still running. Cancel it first.")
             return True     # GDK_EVENT_STOP — the window stays
-        self._workdir.cleanup()
+        if not self.working:
+            # A check is probing into that directory from its own thread.
+            # Taking it away underneath survey() is worse than keeping it a
+            # moment longer — the finalizer has it when the process goes.
+            self._workdir.cleanup()
         return False
 
     # -- helpers --------------------------------------------------------------
@@ -1137,10 +1143,15 @@ class Window(Adw.ApplicationWindow):
         if self.proc and self.proc.poll() is None:
             try:
                 self.proc.terminate()
-            except OSError:
+            except PermissionError:
                 self.say("Cancelling — the system build runs as root and "
                          "finishes this step first", seconds=0)
                 return
+            except OSError:
+                # Gone between poll() and here. Nothing to signal, and the
+                # flag above has already done the cancelling — saying it
+                # runs as root would be answering a different question.
+                pass
         self.say("Cancelling…", seconds=0)
 
     def leave_rebuild(self):
@@ -1264,8 +1275,13 @@ class Window(Adw.ApplicationWindow):
                         "cancelled" if cancelled else "ok",
                         str(error) if error and not cancelled else "")
         self.sync_apply_history()
-        # A check that landed mid-rebuild was held back from the page; the
-        # buttons it should have moved are this window's to catch up on.
+        # A check that landed mid-rebuild was held back from the page. Read
+        # it off disk rather than trusting what is still in hand: load_check
+        # turns down an answer whose pins have moved since, which is exactly
+        # what an apply-then-rebuild just did to it. What survives is news.
+        restored = load_check(self.repo, self.lockfile)
+        if restored:
+            self.adopt(restored)
         self.sync_apply()
 
         if error and not cancelled:

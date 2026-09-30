@@ -70,7 +70,18 @@ stdenvNoCC.mkDerivation {
 
     mkdir -p $out/share/npins-ui
     cp -r npins_ui $out/share/npins-ui/
-    find $out/share/npins-ui -name __pycache__ -type d -exec rm -rf {} +
+
+    # Byte-compile into the store, for two reasons. $out is read-only, so
+    # without this every run reparses the package and caches nothing. And
+    # compileall exits non-zero on a syntax error, which is the only thing
+    # standing between a typo in app.py or headless.py and the timer: both
+    # are imported lazily by __main__, so nothing until then would parse
+    # them. It does not import, so it catches syntax and not much else.
+    #
+    # unchecked-hash because the store normalises every mtime to 1970 — the
+    # default timestamp check would then invalidate the cache it just wrote.
+    ${pythonEnv}/bin/python3 -m compileall -q \
+      --invalidation-mode unchecked-hash $out/share/npins-ui/npins_ui
 
     install -Dm644 de.lucsoft.NpinsUi.gschema.xml \
       $out/share/glib-2.0/schemas/de.lucsoft.NpinsUi.gschema.xml
