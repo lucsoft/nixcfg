@@ -38,7 +38,17 @@ stdenvNoCC.mkDerivation {
   pname = "npins-ui";
   version = "0.2.0";
 
-  src = ./.;
+  # Not ./. on its own. Running the app from a checkout now imports a package
+  # rather than one script, so Python leaves __pycache__ beside it — and a
+  # plain path import folds that into the derivation hash, which rebuilds
+  # npins-ui and everything downstream of it for nothing. Nix does not read
+  # .gitignore, so the filter has to say it here too.
+  src = lib.cleanSourceWith {
+    name = "npins-ui-source";
+    src = ./.;
+    filter = path: type:
+      !(type == "directory" && baseNameOf path == "__pycache__");
+  };
 
   # gobject-introspection here (not in buildInputs) is what makes
   # wrapGAppsHook4 collect GI_TYPELIB_PATH for Gtk and Adw.
