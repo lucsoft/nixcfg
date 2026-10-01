@@ -29,6 +29,7 @@ repo configures graphics — there is no proprietary driver to pull in.
 | `hardware-configuration.nix` | generated hardware scan (filesystems, kernel modules) |
 | `power.nix` | suspend/resume workarounds — transitional, see the file |
 | `plymouth/` | the boot splash theme — logo, progress bar, unit names |
+| `shaderbg/` | GNOME Shell extension — a GLSL shader as the desktop background |
 | `home.nix` | Home Manager — my packages, dotfiles and user settings |
 | `npins/sources.json` | the pins: nixpkgs, nixpkgs-unstable, home-manager, helium |
 

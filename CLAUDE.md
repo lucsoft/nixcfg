@@ -87,11 +87,22 @@ Always evaluate first — never commit a change that has not been built:
     nixos-rebuild dry-build --file ~/nixcfg   # system side
     home-manager build && rm -rf result       # user side
 
-Applying is the user's job: `nixos-rebuild switch` needs sudo, which is not
-available in an agent session.
+Then apply. The user side needs no sudo, so an agent session runs it itself —
+build first, switch second, no need to ask. The system side does need sudo,
+which an agent session does not have, so that one stays the user's job.
 
-    home-manager switch                         # user side, no sudo
-    sudo nixos-rebuild switch --file ~/nixcfg   # system side
+    home-manager switch                         # user side, no sudo — go ahead
+    sudo nixos-rebuild switch --file ~/nixcfg   # system side — ask the user
+
+Work happens directly on `main`, and committing and pushing there is part of
+finishing a change rather than something to ask about each time.
+
+A newly added GNOME Shell extension will not show up after a switch. The Shell
+scans its extension directories once, at startup, and the one D-Bus method that
+looks like it would help — `org.gnome.Shell.Extensions.ReloadExtension` —
+answers `NotSupported: deprecated and does not work`. On Wayland there is no
+way to restart the Shell either, so it takes a logout. Say so instead of
+leaving it looking broken.
 
 `--file` matters: without it `nixos-rebuild` falls back to
 `/etc/nixos/configuration.nix`, which is not this repo.

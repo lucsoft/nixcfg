@@ -1,0 +1,54 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<schemalist>
+  <schema id="de.lucsoft.shaderbg" path="/de/lucsoft/shaderbg/">
+
+    <key name="speed" type="d">
+      <default>1.0</default>
+      <range min="0.05" max="2.0"/>
+      <summary>Global speed multiplier</summary>
+      <description>
+        Multiplied on top of the per-shader speed from sources.nix. Scales the
+        time base, not the repaint rate, so slowing a shader down does not make
+        it stutter.
+      </description>
+    </key>
+
+    <key name="fps-cap" type="i">
+      <default>30</default>
+      <range min="5" max="144"/>
+      <summary>Repaint rate</summary>
+      <description>
+        How often the background is redrawn per second. The monitor runs at
+        144 Hz; there is no reason for a wallpaper to.
+      </description>
+    </key>
+
+    <key name="pause-fullscreen" type="b">
+      <default>true</default>
+      <summary>Pause while a window is fullscreen</summary>
+      <description>
+        Drops the repaint timer entirely while something covers the screen,
+        rather than rendering a background nobody can see.
+      </description>
+    </key>
+
+    <key name="override-index" type="i">
+      <default>-1</default>
+      <summary>Hand-picked shader index</summary>
+      <description>
+        Index into sources.nix, or -1 to follow the daily rotation. Paired with
+        override-day so the choice expires on its own.
+      </description>
+    </key>
+
+    <key name="override-day" type="i">
+      <default>-1</default>
+      <summary>Day the override was set</summary>
+      <description>
+        Days since the epoch, local time. When this no longer matches today,
+        override-index is ignored and the rotation resumes.
+      </description>
+    </key>
+
+  </schema>
+</schemalist>

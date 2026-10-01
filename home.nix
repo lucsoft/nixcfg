@@ -197,6 +197,11 @@ in
 
       # Turn the overview dash into a permanent dock.
       { package = pkgs.gnomeExtensions.dash-to-dock; }
+
+      # A fragment shader as the desktop background, one per day out of
+      # shaderbg/sources.nix. Local rather than from e.g.o because the only
+      # GLSL wallpaper extension there stops at Shell 49.
+      { package = pkgs.callPackage ./shaderbg { }; }
     ];
   };
 
