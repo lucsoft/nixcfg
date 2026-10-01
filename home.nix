@@ -271,11 +271,33 @@ in
   # MPRIS player (`mprisence_web`) for the daemon to pick up. The sites it
   # knows ship with the package — SoundCloud is one of them — so neither side
   # needs a config file.
+  # SoundCloud and nothing else. Out of the box mprisence shows every local
+  # player it has a preset for and every bundled website except YouTube, so a
+  # YouTube Music or Bandcamp tab would end up in Discord too.
+  #
+  # allowed_players is the gate in front of all of that: a player that does
+  # not match is dropped before any of the per-player rules are even
+  # consulted. It matches on the MPRIS identity, and the bridge names each tab
+  # after its site — "SoundCloud", "YouTube" — so the one entry covers both
+  # halves, the other sites and the local players alike. `mprisence players
+  # list --detailed` spells out the verdict per player.
+  #
+  # 1.8 adds scoped selectors (`web_player:soundcloud`) and wants them; the
+  # bare name keeps working, with a deprecation warning in the journal.
+  xdg.configFile."mprisence/config.toml".text = ''
+    allowed_players = ["soundcloud"]
+  '';
+
   systemd.user.services.mprisence = {
     Unit = {
       Description = "Discord rich presence for MPRIS players";
       PartOf = [ "graphical-session.target" ];
       After = [ "graphical-session.target" ];
+      # The daemon reloads the config when it changes, but what changes here
+      # is a symlink pointing somewhere else, which its watcher does not see.
+      # Naming the store path in the unit makes the unit itself differ on
+      # every edit, and Home Manager restarts units that differ.
+      X-Restart-Triggers = [ "${config.xdg.configFile."mprisence/config.toml".source}" ];
     };
     Service = {
       ExecStart = "${pkgs.mprisence}/bin/mprisence";
