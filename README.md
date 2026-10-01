@@ -30,7 +30,7 @@ repo configures graphics — there is no proprietary driver to pull in.
 | `power.nix` | suspend/resume workarounds — transitional, see the file |
 | `plymouth/` | the boot splash theme — logo, progress bar, unit names |
 | `home.nix` | Home Manager — my packages, dotfiles and user settings |
-| `npins/sources.json` | the pins: nixpkgs, nixpkgs-unstable, home-manager |
+| `npins/sources.json` | the pins: nixpkgs, nixpkgs-unstable, home-manager, helium |
 
 `npins/default.nix` is generated — never edit it by hand.
 

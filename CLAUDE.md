@@ -47,7 +47,7 @@ Examples:
 
 ## Pins
 
-No channels, no flakes. Three pins live in `npins/sources.json`:
+No channels, no flakes. Multiple pins live in `npins/sources.json`:
 
 - **`nixpkgs`** — `nixos-26.05`, pinned against `releases.nixos.org` rather
   than GitHub, so it is the Hydra-tested channel release and the tarball
@@ -58,6 +58,14 @@ No channels, no flakes. Three pins live in `npins/sources.json`:
   uses it instead of a `nix-channel` copy.
 - **`nixpkgs-unstable`** — Bottles only; the comment in `home.nix` says why
   and when it can go.
+- **`helium`** — `oxcl/nix-flake-helium-browser`, a third party's packaging of
+  the Helium browser, which no channel carries. It is a flake, but nothing
+  here treats it as one: `home.nix` calls its `helium.nix` through
+  `callPackage`, which is all its `flake.nix` does too, so the package builds
+  against the nixpkgs pinned above rather than the unstable its `flake.lock`
+  names. Pinned to `main`, because the repo cuts no releases. The browser
+  version is a literal inside `helium.nix`, so `npins update helium` is also
+  what updates the browser.
 
 `nix.nixPath` in `configuration.nix` aims `<nixpkgs>` at the same pin, because
 that path is what standalone Home Manager builds against.

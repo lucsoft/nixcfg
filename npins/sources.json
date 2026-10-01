@@ -1,5 +1,18 @@
 {
   "pins": {
+    "helium": {
+      "type": "Git",
+      "repository": {
+        "type": "GitHub",
+        "owner": "oxcl",
+        "repo": "nix-flake-helium-browser"
+      },
+      "branch": "main",
+      "submodules": false,
+      "revision": "5334f268b6cec49c58f69093b8f3198d3516e566",
+      "url": "https://github.com/oxcl/nix-flake-helium-browser/archive/5334f268b6cec49c58f69093b8f3198d3516e566.tar.gz",
+      "hash": "sha256-VGsihdN8HxpBeNHB2AK/G5PJP2fFMLBCTy0c1ti0fIg="
+    },
     "home-manager": {
       "type": "Git",
       "repository": {

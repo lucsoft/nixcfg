@@ -27,6 +27,15 @@ let
 
   npins-ui = pkgs.callPackage ./npins-ui { };
 
+  # Helium, a Chromium fork, is in no nixpkgs channel. The pin is a third
+  # party's packaging repo, which is a flake — but its flake.nix only does
+  # `callPackage ./helium.nix {}`, so calling that file directly skips the
+  # flake machinery and builds against the nixpkgs pinned here instead of the
+  # unstable its flake.lock names. It repackages upstream's .deb with
+  # patchelf; nothing is built from source. `npins update helium` moves both
+  # the packaging and the browser version that file names.
+  helium = pkgs.callPackage "${sources.helium}/helium.nix" { };
+
   # Makes a switch visible to the session that is already running, instead of
   # at the next login.
   #
@@ -112,6 +121,7 @@ in
     discord
     signal-desktop
     gnome-secrets   # KeePass-format password manager (libadwaita)
+    helium          # Chromium fork; see the pin above
     resources       # system monitor (GNOME Circle)
 
     # From the unstable pin above, not this channel's broken 63.2.
