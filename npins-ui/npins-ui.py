@@ -1156,8 +1156,8 @@ RECENT = 24
 # whole reason the rows above exist.
 RAW_LINES = 2000
 
-# How much of that a step node carries. The whole run is still one click
-# away under Details; this is the part worth re-setting four times a second.
+# How much of that a step node carries. The whole run is on the run's own
+# node; this is the part worth re-setting four times a second.
 STEP_LINES = 200
 
 # Before it builds anything, nix says what it is about to build, as a heading
@@ -1950,7 +1950,7 @@ def download_group(index, rows):
     }
 
 
-def compose(steps, started=0):
+def compose(steps, started=0, output=()):
     """The whole rebuild as one tree.
 
     The run is the root, each step is a node under it, and each step's plan
@@ -2006,7 +2006,10 @@ def compose(steps, started=0):
         "fraction": ((done + (live["fraction"] or 0 if live else 0))
                      / len(nodes)) if nodes else None,
         "started": started,
-        "log": [],
+        # What nix said that no row was made of is the run's own output, so
+        # the run is what carries it — one more node with a log, read in the
+        # same drawer as every other node.
+        "log": list(output),
         "kids": nodes,
     }
     return relayout([root])
@@ -2918,10 +2921,20 @@ class LogPane(Gtk.Box):
         # four times a second is nothing, and it keeps the two in step.
         if row["log"] == self.lines:
             return
-        self.lines = list(row["log"])
-        # A build that has not said anything yet, or a download, which never
-        # will: an empty pane looks like something failed to arrive.
-        self.buffer.set_text("\n".join(self.lines) or "No output yet")
+        # A per-node log is a tail — lines fall off the front as new ones
+        # arrive — so it is replaced. The run's own output only ever grows,
+        # and that one is thousands of lines: it gets what is new appended
+        # instead of the whole buffer written again four times a second.
+        fresh = list(row["log"])
+        if self.lines and fresh[:len(self.lines)] == self.lines:
+            self.buffer.insert(self.buffer.get_end_iter(),
+                               "\n" + "\n".join(fresh[len(self.lines):]))
+        else:
+            # A build that has not said anything yet, or a download, which
+            # never will: an empty pane looks like something failed to
+            # arrive.
+            self.buffer.set_text("\n".join(fresh) or "No output yet")
+        self.lines = fresh
 
         # Stay at the newest line, unless whoever is reading scrolled up.
         adjustment = self.scroll.get_vadjustment()
@@ -3068,39 +3081,30 @@ class Window(Adw.ApplicationWindow):
         self.problem_count = 0
 
         # nix says things no row was written for — obsolete channels, a
-        # substituter that went away mid-fetch. Keeping its own output one
-        # click away costs a collapsed row and means nothing is lost.
-        self.logview = Gtk.TextView(
-            editable=False, cursor_visible=False, monospace=True,
-            left_margin=12, right_margin=12, top_margin=8, bottom_margin=8,
-            wrap_mode=Gtk.WrapMode.WORD_CHAR,
-        )
-        self.logbuf = self.logview.get_buffer()
-        self.logscroll = Gtk.ScrolledWindow(child=self.logview, vexpand=True,
-                                            min_content_height=260)
-        self.logrow = Adw.ExpanderRow(title="Full nix output")
-        self.logrow.add_prefix(Gtk.Image(icon_name="utilities-terminal-symbolic"))
-        self.logrow.add_row(self.logscroll)
-        log_group = boxed_list()
-        log_group.append(self.logrow)
+        # substituter that went away mid-fetch. It used to sit in a row of
+        # its own at the foot of the page, which held a strip of the window
+        # open whether or not anyone ever opened it. It is the run's output,
+        # so it hangs on the run's node instead: click Rebuild, or the
+        # button in the header, and it is in the drawer with everything else.
+        self.output = collections.deque(maxlen=RAW_LINES * 2)
 
         self.rebuild_body = Gtk.Box(orientation=Gtk.Orientation.VERTICAL,
                                     spacing=12, margin_top=12, margin_bottom=12,
                                     margin_start=12, margin_end=12)
         self.rebuild_body.append(self.problems_heading)
         self.rebuild_body.append(self.problems)
-        self.rebuild_body.append(section("Details"))
-        self.rebuild_body.append(log_group)
-        # The plan takes the room and the rest takes what it needs: a
-        # scroller that stops growing at a third of the window, so a long
-        # list of downloads cannot push the plan off the page.
-        extras = Gtk.ScrolledWindow(
+        # All that is left down here is what nix called a problem, and a
+        # rebuild usually has none: the strip is not there at all until
+        # there is something to put in it, and never takes more than a
+        # third of the window when there is.
+        self.extras = Gtk.ScrolledWindow(
             child=self.rebuild_body, hscrollbar_policy=Gtk.PolicyType.NEVER,
             propagate_natural_height=True, max_content_height=260,
+            visible=False,
         )
         plan_side = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         plan_side.append(self.plan_views)
-        plan_side.append(extras)
+        plan_side.append(self.extras)
 
         # Collapsed: the output is a drawer over the plan rather than a
         # third of the window standing empty until something is clicked.
@@ -3790,7 +3794,7 @@ class Window(Adw.ApplicationWindow):
         self.steps = rebuild_steps(self.repo)
         self.replay = None
         self.record = []
-        self.logbuf.set_text("")
+        self.output.clear()
         self.carried = []
         self.rebuild_started = time.monotonic()
         # Measured before the switch, because afterwards there is nothing
@@ -3921,8 +3925,11 @@ class Window(Adw.ApplicationWindow):
 
     def draw_rebuild(self, snapshot):
         """Bring the page up to date with one instant of the stream."""
+        # Before the tree, because the tree is what carries it now.
+        if snapshot["raw"]:
+            self.log("\n".join(snapshot["raw"]))
         plan = self.draw_plan(compose(self.live_steps(snapshot),
-                                      self.rebuild_started))
+                                      self.rebuild_started, self.output))
         self.seen = {row["key"]: row for row in walk_plan(plan)}
         self.draw_log()
 
@@ -3937,9 +3944,7 @@ class Window(Adw.ApplicationWindow):
             self.problem_count = len(problems)
         self.problems.set_visible(bool(problems))
         self.problems_heading.set_visible(bool(problems))
-
-        if snapshot["raw"]:
-            self.log("\n".join(snapshot["raw"]))
+        self.extras.set_visible(bool(problems))
 
     def draw_log(self):
         """Keep the pane on something worth reading.
@@ -3957,8 +3962,15 @@ class Window(Adw.ApplicationWindow):
             self.pane.show(self.seen.get(self.watching))
             return
 
+        # The run and its steps are RUNNING for as long as the rebuild is,
+        # and following means following a derivation: they are held out, or
+        # the pane would settle on the run at the first tick and never leave
+        # it. Clicking the run is how its own output is read — this is about
+        # what the pane picks when nobody has clicked anything.
         running = [row for row in self.seen.values()
-                   if row.get("state") == RUNNING or row.get("state") is None]
+                   if row["key"][0] not in ("rebuild", "step")
+                   and (row.get("state") == RUNNING
+                        or row.get("state") is None)]
         if self.pane.follow.get_active():
             current = self.seen.get(self.watching)
             if current not in running:
@@ -3970,14 +3982,10 @@ class Window(Adw.ApplicationWindow):
         self.pane.show(self.seen.get(self.watching))
 
     def log(self, text):
-        end = self.logbuf.get_end_iter()
-        self.logbuf.insert(end, text + "\n")
-        # Keep the newest line in view without fighting a user who scrolled up.
-        adjustment = self.logscroll.get_vadjustment()
-        if adjustment.get_value() + adjustment.get_page_size() >= \
-                adjustment.get_upper() - 64:
-            GLib.idle_add(lambda: adjustment.set_value(
-                adjustment.get_upper() - adjustment.get_page_size()))
+        """What nix said that no row was made of. The drawer keeps it in
+        view and keeps whoever scrolled up where they were, the same as for
+        any other node — there is nothing special about this one now."""
+        self.output.extend(text.split("\n"))
 
     def step_finished(self, index, code):
         # Whatever the stream still holds is drawn once more before the page
@@ -4037,8 +4045,9 @@ class Window(Adw.ApplicationWindow):
         self.output_button.set_visible(True)
         if not self.problem_count:
             # nix said nothing a row was made of — a step that died before
-            # it started, or was killed. The full output is all there is.
-            self.logrow.set_expanded(True)
+            # it started, or was killed. The run's own output is all there
+            # is, so the drawer opens on the run.
+            self.watch(("rebuild",))
 
     # -- the last apply, kept and read back ------------------------------------
     def keep_step(self, index):
@@ -4075,7 +4084,6 @@ class Window(Adw.ApplicationWindow):
         self.apply_button.set_visible(False)
         self.back_button.set_visible(True)
         self.output_button.set_visible(True)
-        self.logrow.set_expanded(False)
         self.draw_replay()
 
     def draw_replay(self):
@@ -4087,11 +4095,13 @@ class Window(Adw.ApplicationWindow):
         if not self.replay:
             return
         self.clear_activity()
-        self.logbuf.set_text("")
+        self.output.clear()
+        self.log("\n".join(line for step in self.replay["steps"]
+                            for line in step["raw"]))
 
         steps = [dict(step, fraction=1.0, tail=step["raw"][-STEP_LINES:])
                  for step in self.replay["steps"]]
-        plan = self.draw_plan(compose(steps))
+        plan = self.draw_plan(compose(steps, output=self.output))
         self.seen = {row["key"]: row for row in walk_plan(plan)}
 
         problems = [problem for step in self.replay["steps"]
@@ -4103,8 +4113,7 @@ class Window(Adw.ApplicationWindow):
         self.problem_count = len(problems)
         self.problems.set_visible(bool(problems))
         self.problems_heading.set_visible(bool(problems))
-        self.log("\n".join(line for step in self.replay["steps"]
-                           for line in step["raw"]))
+        self.extras.set_visible(bool(problems))
         self.draw_log()
         # A record opens on what failed, so the drawer opens with it. There
         # is no build to watch here — reading is the only reason to be on
