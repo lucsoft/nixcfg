@@ -216,6 +216,16 @@ in
     preferences = {
       "intl.locale.requested" = "de,en-US";
     };
+    # The browser half of the mprisence bridge in home.nix: it reads the
+    # player state of SoundCloud and its like out of the page. Installed as a
+    # policy rather than by hand so the install survives a fresh profile;
+    # normal_installed instead of force_installed leaves it removable from
+    # about:addons like any other extension.
+    policies.ExtensionSettings."mprisence-bridge@lazykern.foo" = {
+      install_url =
+        "https://addons.mozilla.org/firefox/downloads/latest/mprisence-bridge/latest.xpi";
+      installation_mode = "normal_installed";
+    };
   };
 
   # Claude Code writes ~/.claude/settings.json itself — /config keeps the theme

@@ -164,6 +164,7 @@ in
     btop
     fastfetch
     claude-code
+    mprisence   # the daemon below runs it; this is for `mprisence web doctor`
 
     # wl-copy/wl-paste. A Wayland session ships no clipboard CLI at all, so
     # terminal programs cannot read the clipboard — this is what lets
@@ -251,6 +252,49 @@ in
   # generation and its packages are in place.
   home.activation.syncXdgMirror =
     lib.hm.dag.entryAfter [ "linkGeneration" ] "run ${xdg-mirror}";
+
+  # ---------------------------------------------------------------------------
+  # Discord rich presence
+  # ---------------------------------------------------------------------------
+
+  # Whatever is playing shows up as a Discord status. mprisence reads MPRIS
+  # off the session bus, so any local player is covered by the daemon alone.
+  #
+  # SoundCloud is not a local player though, and what Firefox publishes on
+  # MPRIS is the tab: the page title, no artist, no artwork, play/pause and
+  # nothing else. The bridge below is what makes it a track — the extension
+  # reads the site's own player state and hands it to the native host, which
+  # publishes a second MPRIS player (`mprisence_web`) for the daemon to pick
+  # up. The sites it knows ship with the package; SoundCloud is one of them,
+  # so neither side needs a config file.
+  systemd.user.services.mprisence = {
+    Unit = {
+      Description = "Discord rich presence for MPRIS players";
+      PartOf = [ "graphical-session.target" ];
+      After = [ "graphical-session.target" ];
+    };
+    Service = {
+      ExecStart = "${pkgs.mprisence}/bin/mprisence";
+      # Discord is usually not up yet at login, and the daemon exits when it
+      # cannot reach it. Restarting is how it waits.
+      Restart = "always";
+      RestartSec = 10;
+    };
+    Install.WantedBy = [ "graphical-session.target" ];
+  };
+
+  # The native messaging host, pointing Firefox at the binary to speak to.
+  # `mprisence web install` writes this file as well, but with the store path
+  # of whichever mprisence ran the command, so it would go stale at the next
+  # update. Declared here it is rewritten on every switch.
+  home.file.".mozilla/native-messaging-hosts/mprisence.web.bridge.json".text =
+    builtins.toJSON {
+      name = "mprisence.web.bridge";
+      description = "mprisence - sends browser media to MPRIS";
+      type = "stdio";
+      path = "${pkgs.mprisence}/bin/mprisence";
+      allowed_extensions = [ "mprisence-bridge@lazykern.foo" ];
+    };
 
   # ---------------------------------------------------------------------------
   # Dotfiles
