@@ -740,6 +740,23 @@ def session_stale():
     return bool(marker and marker.exists())
 
 
+def installable(changes):
+    """Whether a check found anything a rebuild would put on this machine.
+
+    A pin that moved without moving any package of yours is a line in the
+    lock file, not an update — most days of a stable channel are that. The
+    page and the Apply button both ask this, so they ask it in one place and
+    cannot drift apart.
+
+    A kernel rebuilt at an unchanged version moves no version number, so
+    every category can be empty while a reboot is still owed. That is the
+    one case a count on its own gets wrong, and it is why the reboot half is
+    measured rather than read off the diff.
+    """
+    return bool(sum(len(changes.get(key, [])) for key, _ in CATEGORIES)
+                or changes.get("reboot_added"))
+
+
 def change_tier(changes):
     """What will be owed once a change set has been applied.
 
@@ -3017,6 +3034,7 @@ class Window(Adw.ApplicationWindow):
         view_menu.append("List", "win.plan-view::list")
 
         menu = Gio.Menu()
+        menu.append("Write Pins Only", "win.write-only")
         menu.append_section("Rebuild View", view_menu)
         menu.append("Last Apply", "win.last-apply")
         menu.append("Sources", "win.sources")
@@ -3176,6 +3194,7 @@ class Window(Adw.ApplicationWindow):
         self.toasts = Adw.ToastOverlay(child=view)
         self.set_content(self.toasts)
 
+        self.actions = {}
         for name, handler in (
             ("apply-only", lambda *_: self.apply(commit=False, rebuild=True)),
             ("write-only", lambda *_: self.apply(commit=True, rebuild=False)),
@@ -3186,6 +3205,7 @@ class Window(Adw.ApplicationWindow):
             action = Gio.SimpleAction.new(name, None)
             action.connect("activate", handler)
             self.add_action(action)
+            self.actions[name] = action
 
         # Which view the rebuild draws its plan in. GSettings owns the
         # choice when its schema is installed and hands out an action bound
@@ -3294,11 +3314,27 @@ class Window(Adw.ApplicationWindow):
         Gtk.UriLauncher(uri=url).launch(self, None, None, None)
 
     def sync_apply(self, busy=False):
-        """There is nothing to apply until a check finds something, so the
-        button is absent rather than present-and-greyed."""
-        ready = bool(self.pending_text)
+        """There is nothing to apply until a check finds something to
+        install, so the button is absent rather than present-and-greyed.
+
+        Pins that moved are not that. The page says so in as many words, and
+        a suggested-action button in the header beside it was the window
+        arguing with itself — on most days of a stable channel, which is
+        when it was shown. When the diff could not be worked out at all the
+        button stays: deciding for someone on an answer the window does not
+        have is worse than offering it.
+        """
+        changes = self.detail.get("changes")
+        ready = bool(self.pending_text) and (changes is None
+                                             or installable(changes))
         self.apply_button.set_visible(ready)
         self.apply_button.set_sensitive(ready and not busy)
+        # Writing the pins is worth doing whether or not anything of yours
+        # changes, so that one is in the window menu as well, where it is
+        # still there on the days the button is not.
+        self.actions["apply-only"].set_enabled(ready and not busy)
+        self.actions["write-only"].set_enabled(bool(self.pending_text)
+                                               and not busy)
 
     def run_async(self, work, done):
         def worker():
@@ -3363,13 +3399,8 @@ class Window(Adw.ApplicationWindow):
 
     def render_changes(self, changes):
         subjects = self.detail.get("subjects", [])
-        total = sum(len(changes.get(key, [])) for key, _ in CATEGORIES)
 
-        # A kernel rebuilt at an unchanged version moves no version number,
-        # so the categories can all be empty while a reboot is still owed.
-        # That is the whole reason the reboot half is measured, and bailing
-        # out on the count alone would throw the measurement away.
-        if not total and not changes.get("reboot_added"):
+        if not installable(changes):
             # No lock file on purpose: an update is pending here, and an
             # owed rebuild would offer to build the very pins this page is
             # asking to replace.
@@ -3380,6 +3411,11 @@ class Window(Adw.ApplicationWindow):
             description = "The pins moved, but not through any of your packages."
             if pending:
                 description += f"\n\n{TIER_ACTION[pending]} an earlier rebuild."
+            # There is no Apply button on this page — there is nothing to
+            # install — so the way to move the pins anyway gets named.
+            if self.pending_text:
+                description += ("\n\nWrite Pins Only, in the menu, moves them "
+                                "anyway.")
             self.status.set_description(description)
             return
 
