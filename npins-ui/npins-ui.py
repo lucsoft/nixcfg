@@ -1888,6 +1888,11 @@ def walk_plan(nodes):
         yield from walk_plan(node["kids"])
 
 
+def straight(row):
+    """Does nothing under this row branch? Then it is a list, not a tree."""
+    return all(len(kid["kids"]) <= 1 for kid in walk_plan([row]))
+
+
 def load_settings():
     """The app's own settings, or None when the schema is not installed.
 
@@ -2294,73 +2299,173 @@ class PlanList(Gtk.Box):
 # the plan as a graph
 # -----------------------------------------------------------------------------
 class PlanGraph(Gtk.Widget):
-    """Cards laid out by depth, edges drawn behind them.
+    """Cards laid out by depth, edges drawn behind them, inside the window.
 
     The list says what is waiting for what; this says it in one look, which
-    is the thing a dependency tree is for. Cells are whatever the window
-    leaves room for, down to a floor, so a plan fits instead of scrolling.
+    is the thing a dependency tree is for — and a tree that runs off the
+    side of the window says nothing at all. A system rebuild plans more
+    leaves than a screen has columns, so the plan is drawn at whatever size
+    there is: siblings with no branch under them share a card, a line each,
+    and when that is still too wide the dullest subtrees fold into a card
+    that lists what is inside them. Nothing here scrolls sideways.
     """
 
     CARD_W, MIN_W, PAD, GAP_MIN, GAP_MAX = 210, 160, 12, 22, 72
     COLLAPSE = 320
+    # What a card gives up, in order, once there is nothing left to fold:
+    # the wrapped name, then the status under it, then the name itself.
+    DENSITY = (("full", 150), ("line", 112), ("pill", 72), ("dot", 24))
+    # Past this many lines a folded card stops reading as a list, and what
+    # is left over goes back to being the number it used to be.
+    LIST_MAX = 10
 
     def __init__(self):
         super().__init__()
         self.on_select = None
         self.shape = ()
-        self.cards = {}
-        self.nodes = {}
+        self.rows = {}              # key -> the plan's row, this instant
+        self.tree = {}              # key -> the keys drawn under it
+        self.groups = {}            # key -> the chains a packed card holds
+        self.parent = {}
+        self.level = {}
         self.roots = []
+        self.cards = {}
         self.places = {}
+        self.folded = set()
+        self.open = set()           # folds a click has pinned open
+        self.density = "full"
         self.geometry_cache = ()
         self.fades = {}
         self.states = ()
-        self.recentre = False
         self.columns = self.levels = 1
 
     # -- the model ------------------------------------------------------------
     def update(self, plan):
-        shape = tuple(row["key"] for row in walk_plan(plan))
+        self.rows = {row["key"]: row for row in walk_plan(plan)}
+        shape = tuple(self.rows)
         if shape != self.shape:
             self.shape = shape
             self.load(plan)
-        else:
-            for row in walk_plan(plan):
-                self.nodes[row["key"]].row = row
         self.refresh()
 
     def load(self, plan):
         for card in self.cards.values():
             card.unparent()
-        self.cards, self.nodes, self.places, self.fades = {}, {}, {}, {}
-        self.geometry_cache = ()
-        self.roots = [self.wrap(row) for row in plan]
-        self.recentre = True
-        for node in self.nodes.values():
-            card = self.card(node)
+        self.cards, self.tree, self.groups = {}, {}, {}
+        self.parent, self.level, self.places = {}, {}, {}
+        self.folded, self.open, self.fades = set(), set(), {}
+        self.density, self.geometry_cache = "full", ()
+        self.roots = [row["key"] for row in plan]
+        for row in plan:
+            self.index(row, None)
+        for key in self.tree:
+            card = self.card(key)
             card.set_parent(self)
-            self.cards[node] = card
+            self.cards[key] = card
         self.layout()
 
-    def wrap(self, row):
-        node = PlanNode(row)
-        self.nodes[row["key"]] = node
-        node.kids = [self.wrap(kid) for kid in row["kids"]]
-        return node
+    def index(self, row, parent):
+        """Walk the plan into the shape this view draws it in.
 
-    def walk(self, node):
-        yield node
-        for kid in node.kids:
-            yield from self.walk(kid)
+        Every row keeps a card of its own, except siblings with no branch
+        under them: those share one. A unit and the restart trigger under it
+        are a chain, not a tree — nix builds a chain in the one order it can
+        and has one of it going at a time — and a chain is a line, which is
+        the cheap direction. What is left spread out is what actually
+        branches.
+        """
+        key = row["key"]
+        self.parent[key], self.level[key] = parent, row["depth"]
+        flat = [kid for kid in row["kids"] if straight(kid)]
+        # One unbranching sibling is a card already; a group of one would
+        # only be the same card with a heading over it.
+        group = ("packed", key) if len(flat) > 1 else None
+        order = []
+        for kid in row["kids"]:
+            if group and straight(kid):
+                if group not in order:
+                    order.append(group)
+                continue
+            order.append(kid["key"])
+            self.index(kid, key)
+        self.tree[key] = order
+        if group:
+            self.tree[group], self.parent[group] = [], key
+            self.level[group] = row["depth"] + 1
+            self.groups[group] = [[kid["key"] for kid in walk_plan([head])]
+                                  for head in flat]
 
-    def card(self, node):
-        """Name over three lines, state beside it, and a foot line for what
-        the state cannot say on its own.
+    def kids(self, key):
+        return [] if key in self.folded else self.tree[key]
+
+    def above(self, key):
+        key = self.parent[key]
+        while key is not None:
+            yield key
+            key = self.parent[key]
+
+    def under(self, key):
+        """Every derivation below this one, packed cards spelled back out."""
+        for kid in self.tree[key]:
+            if kid in self.groups:
+                for chain in self.groups[kid]:
+                    yield from chain
+            else:
+                yield kid
+                yield from self.under(kid)
+
+    # -- what a card says -----------------------------------------------------
+    @staticmethod
+    def merge(states):
+        """One state for several: whatever the worst of them is doing."""
+        for state in (FAILED, RUNNING, PLANNED):
+            if state in states:
+                return state
+        return DONE
+
+    def chain(self, chain):
+        """A run of derivations with no branch in it, as one line.
+
+        The state is the whole run's, because only one of it is ever going;
+        the name is the one at the top, because the rest are that one's
+        inputs — unit-dbus-broker.service is what the line is for, and the
+        restart trigger under it is how that one is made.
+        """
+        rows = [self.rows[key] for key in chain if key in self.rows]
+        return {"key": chain[0], "name": rows[0]["name"],
+                "state": self.merge([row["state"] for row in rows]),
+                "done": sum(row.get("done") or 0 for row in rows),
+                "expected": sum(row.get("expected") or 0 for row in rows)}
+
+    def read(self, key):
+        """The row a card draws.
+
+        The plan's own for a derivation, and one made up here for a packed
+        card: that one stands for several derivations and is part of the
+        drawing rather than of the build, so the plan has no row for it.
+        """
+        if key not in self.groups:
+            row = self.rows[key]
+            return {**row, "detail": describe(row)}
+        lines = [self.chain(chain) for chain in self.groups[key]]
+        built = sum(1 for line in lines if line["state"] == DONE)
+        return {"key": key, "name": f"{len(lines)} inputs",
+                "state": self.merge([line["state"] for line in lines]),
+                "detail": f"{built} of {len(lines)} built", "fraction": None}
+
+    def state_of(self, key):
+        return self.read(key)["state"]
+
+    # -- the cards ------------------------------------------------------------
+    def card(self, key):
+        """Name over three lines, state beside it, a foot line for what the
+        state cannot say on its own, and a body for the derivations the card
+        stands for when it stands for more than one.
 
         Store paths are long and all the difference is in the middle, so a
         card that ellipsizes to one line says nothing; three fit most of
-        them whole. The foot carries the phase while it builds and the
-        count while it waits — and nothing at all once it is built.
+        them whole. The foot carries the phase while it builds and the count
+        while it waits — and nothing at all once it is built.
         """
         slot = StateSlot()
         title = Gtk.Label(xalign=0, wrap=True, lines=3, hexpand=True,
@@ -2371,7 +2476,14 @@ class PlanGraph(Gtk.Widget):
         head.append(slot)
         head.append(title)
 
-        detail = Gtk.Label(xalign=0, ellipsize=Pango.EllipsizeMode.END,
+        # Everything a card holds has to be able to ellipsize: every card is
+        # given the same width, and that width is the widest minimum any one
+        # of them asks for. One label insisting on its full text makes every
+        # card that wide, and at a narrow step they would overlap.
+        # hexpand, or the foot gives it the one character its minimum asks
+        # for and the status renders as a lone ellipsis.
+        detail = Gtk.Label(xalign=0, hexpand=True, max_width_chars=1,
+                           ellipsize=Pango.EllipsizeMode.END,
                            css_classes=["caption", "dim-label"])
         # Only the run and its steps have a fraction — nix counts
         # derivations, not the inside of one — so only they get a bar. It
@@ -2391,40 +2503,201 @@ class PlanGraph(Gtk.Widget):
             child=foot, reveal_child=True, transition_duration=self.COLLAPSE,
             transition_type=Gtk.RevealerTransitionType.SLIDE_UP)
 
+        body = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=1,
+                       margin_top=6, visible=False)
+
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL,
                       css_classes=["card", "plan-card"])
         box.append(head)
         box.append(reveal)
+        box.append(body)
         click = Gtk.GestureClick()
-        click.connect("pressed", lambda *_a, n=node: self.choose(n))
+        click.connect("pressed", lambda *_a, k=key: self.choose(k))
         box.add_controller(click)
-        box.parts = (slot, title, detail, bar, reveal)
+        box.parts = (slot, title, detail, bar, reveal, body)
+        box.lines = []
+        box.density = "full"
         return box
 
-    def choose(self, node):
-        if self.on_select:
-            self.on_select(node.row["key"])
+    def line(self, body):
+        """One derivation inside a card: a state, a name, and a click of its
+        own, so a packed card is still a list of things to read."""
+        slot = StateSlot()
+        label = Gtk.Label(xalign=0, hexpand=True, max_width_chars=1,
+                          ellipsize=Pango.EllipsizeMode.MIDDLE)
+        row = Gtk.Box(spacing=6, css_classes=["plan-line"])
+        row.key = None
+        click = Gtk.GestureClick()
+        click.connect("pressed", lambda *_a, r=row: self.choose(r.key))
+        row.add_controller(click)
+        row.append(slot)
+        row.append(label)
+        body.append(row)
+        return row, slot, label
+
+    def fill(self, card, items, extra=None):
+        """Put a line per derivation in a card, or take them all away.
+
+        The lines are kept and refilled rather than rebuilt: each one holds
+        a spinner or an icon mid-crossfade, and building the list again four
+        times a second throws every one of them away.
+        """
+        _slot, _title, _detail, _bar, _reveal, body = card.parts
+        wanted = len(items) + bool(extra)
+        while len(card.lines) < wanted:
+            card.lines.append(self.line(body))
+        for index, (row, slot, label) in enumerate(card.lines):
+            row.set_visible(index < wanted)
+            if index < len(items):
+                row.key = items[index]["key"]
+                label.set_label(items[index]["name"])
+                label.remove_css_class("dim-label")
+                slot.set_visible(True)
+                slot.show(items[index])
+            elif index < wanted:
+                row.key = None
+                label.set_label(extra)
+                label.add_css_class("dim-label")
+                slot.set_visible(False)
+        body.set_visible(bool(wanted))
+
+    def dress(self, key, card):
+        """Which of the card's parts this width can afford, and what it has
+        to list."""
+        slot, title, detail, bar, reveal, _body = card.parts
+        if card.density != self.density:
+            card.density = self.density
+            full = self.density == "full"
+            spelled = self.density in ("full", "line")
+            title.set_visible(self.density != "dot")
+            title.set_wrap(full)
+            title.set_lines(3 if full else 1)
+            reveal.set_visible(spelled)
+            bar.set_visible(full)
+            for name in ("pill", "dot"):
+                self.shade(card, name, name == self.density)
+
+        folded = key in self.folded
+        self.shade(card, "folded", folded)
+        if self.density not in ("full", "line"):
+            self.fill(card, [])
+        elif key in self.groups:
+            self.fill(card, [self.chain(chain)
+                             for chain in self.groups[key]])
+        elif folded:
+            inside = [self.rows[deep] for deep in self.under(key)]
+            rest = len(inside) - self.LIST_MAX
+            self.fill(card, inside[:self.LIST_MAX],
+                      f"+{rest} more inside" if rest > 0 else None)
+        else:
+            self.fill(card, [])
+        return slot, detail, bar, reveal
+
+    @staticmethod
+    def shade(card, name, wanted):
+        (card.add_css_class if wanted else card.remove_css_class)(name)
+
+    def choose(self, key):
+        """A click: open what is folded, fold again what a click opened, and
+        otherwise read whatever was clicked."""
+        if key is None:
+            return
+        if key in self.folded:
+            self.open.add(key)
+        elif key in self.open:
+            self.open.discard(key)
+        elif self.on_select and key in self.rows:
+            self.on_select(key)
+            return
+        self.refresh()
+
+    # -- how much of the plan fits --------------------------------------------
+    def spread(self, key, folded):
+        """Columns this subtree takes when it is drawn."""
+        if key in folded or not self.tree[key]:
+            return 1
+        return sum(self.spread(kid, folded) for kid in self.tree[key])
+
+    def dullness(self, key):
+        """Fold order: nothing left to show, then nothing to show yet, then
+        the deepest — a tail hidden costs less than a branch hidden."""
+        states = {self.rows[deep]["state"] for deep in self.under(key)}
+        interest = 0 if states == {DONE} else 1 if states == {PLANNED} else 2
+        return (interest, -self.level[key], -self.spread(key, ()))
+
+    def plan_folds(self):
+        """Fold subtrees away until the plan fits the window, dullest first.
+
+        Nothing on the path the build is on is ever folded, so what stays
+        spread out is what is happening. The rest is ranked by how little it
+        has left to say, and the deepest of those goes first, which takes
+        the tails off the tree and leaves its shape standing. A subtree with
+        one derivation in it is skipped: it is one column either way, and
+        folding it would only hide a name.
+
+        Only when there is nothing left to fold do the cards themselves give
+        way, which is what the densities are for.
+        """
+        room = self.get_width()
+        if room <= 1 or not self.tree:
+            return
+        live = set()
+        for key in self.tree:
+            if self.state_of(key) == RUNNING:
+                live.add(key)
+                live.update(self.above(key))
+
+        picks = [key for key in self.tree
+                 if self.tree[key] and self.level[key] and key not in live
+                 and key not in self.open and self.spread(key, ()) > 1]
+        picks.sort(key=self.dullness)
+
+        folded, step = set(), self.MIN_W + 8
+        for key in picks:
+            if sum(self.spread(root, folded)
+                   for root in self.roots) * step + 2 * self.PAD <= room:
+                break
+            if any(parent in folded for parent in self.above(key)):
+                continue
+            folded.add(key)
+        if folded != self.folded:
+            self.folded = folded
+            self.layout()
+            self.queue_resize()
+
+        width = (room - 2 * self.PAD) / self.columns
+        density = next((name for name, floor in self.DENSITY
+                        if width >= floor), "dot")
+        if density != self.density:
+            self.density = density
+            self.queue_resize()
 
     # -- layout ---------------------------------------------------------------
     def layout(self):
         """Leaves take the next free column, parents centre over their kids."""
-        self.column = 0
+        self.places, self.column = {}, 0
 
-        def place(node):
-            if node.kids:
-                xs = [place(kid) for kid in node.kids]
-                x = (min(xs) + max(xs)) / 2
+        def place(key):
+            kids = self.kids(key)
+            if kids:
+                columns = [place(kid) for kid in kids]
+                column = (min(columns) + max(columns)) / 2
             else:
-                x = self.column
+                column = self.column
                 self.column += 1
-            self.places[node] = x
-            return x
+            self.places[key] = column
+            return column
 
-        for root in self.roots:
-            place(root)
+        for key in self.roots:
+            place(key)
         self.columns = max(self.column, 1)
-        self.levels = max((node.row["depth"] for node in self.nodes.values()),
+        self.levels = max((self.level[key] for key in self.places),
                           default=0) + 1
+        # A card for something this width cannot show stays parented and is
+        # simply not drawn: building the cards again whenever a fold opens
+        # would throw away every crossfade halfway through.
+        for key, card in self.cards.items():
+            card.set_child_visible(key in self.places)
 
     def geometry(self):
         """Column step, card width, and where each level sits.
@@ -2441,17 +2714,18 @@ class PlanGraph(Gtk.Widget):
         # No card is ever allocated less than it asked for: a card squeezed
         # below its minimum re-measures for the rest of the frame and the
         # widget never settles enough to draw.
-        floor = max([self.MIN_W] + [card.measure(Gtk.Orientation.HORIZONTAL,
-                                                 -1)[0]
-                                    for card in self.cards.values()])
+        floor = max([self.MIN_W // 8]
+                    + [self.cards[key].measure(Gtk.Orientation.HORIZONTAL,
+                                               -1)[0]
+                       for key in self.places])
         card_w = max(floor, min(self.CARD_W, step_x - 8))
 
         tall, heights = {}, {}
-        for node, card in self.cards.items():
-            _min, natural, _b1, _b2 = card.measure(Gtk.Orientation.VERTICAL,
-                                                   int(card_w))
-            heights[node] = natural
-            depth = node.row["depth"]
+        for key in self.places:
+            _min, natural, _b1, _b2 = self.cards[key].measure(
+                Gtk.Orientation.VERTICAL, int(card_w))
+            heights[key] = natural
+            depth = self.level[key]
             tall[depth] = max(tall.get(depth, 0), natural)
 
         needed = sum(tall.values())
@@ -2465,56 +2739,39 @@ class PlanGraph(Gtk.Widget):
             y += tall.get(depth, 0) + gap
         return step_x, card_w, rows, heights
 
-    def box_of(self, node):
+    def box_of(self, key):
         """Where a card sits, from the last allocation. Measuring children
         from inside a snapshot never settles, so before the first one there
         is nothing to draw and the next frame has it all."""
-        if not self.geometry_cache:
+        if not self.geometry_cache or key not in self.places:
             return None
         step_x, card_w, rows, heights = self.geometry_cache
-        x = self.PAD + (self.places[node] + 0.5) * step_x - card_w / 2
-        return x, rows[node.row["depth"]], card_w, heights[node]
+        return (self.PAD + (self.places[key] + 0.5) * step_x - card_w / 2,
+                rows[self.level[key]], card_w, heights[key])
 
     def do_measure(self, orientation, _for_size):
         if orientation == Gtk.Orientation.HORIZONTAL:
-            floor = self.PAD * 2 + self.columns * (self.MIN_W + 8)
-            want = self.PAD * 2 + self.columns * (self.CARD_W + 16)
-            return (floor, want, -1, -1)
+            # It asks for no more than a handful of cards and will take far
+            # less: whatever it cannot fit, it folds away instead. A plan
+            # that asked for its full width is what used to drag the window
+            # off the side of the screen.
+            floor = self.PAD * 2 + self.MIN_W
+            want = self.PAD * 2 + min(self.columns, 6) * (self.CARD_W + 16)
         else:
             floor = self.PAD * 2 + self.levels * (46 + self.GAP_MIN)
             want = self.PAD * 2 + self.levels * (96 + 36)
-        return (floor, want, -1, -1)
-
-    def centre(self):
-        """Put the root in the middle of what can be seen.
-
-        A plan wider than the window opens on its top left corner, which is
-        a corner of a tree and reads as nothing. Done once per plan, so
-        scrolling somewhere and staying there still works."""
-        scroller = self.get_ancestor(Gtk.ScrolledWindow)
-        box = self.box_of(self.roots[0]) if self.roots else None
-        if scroller is None or box is None:
-            return
-        adjustment = scroller.get_hadjustment()
-        page = adjustment.get_page_size()
-        if not page:
-            return
-        self.recentre = False
-        adjustment.set_value(max(0, min(box[0] + box[2] / 2 - page / 2,
-                                        adjustment.get_upper() - page)))
+        return (floor, max(floor, want), -1, -1)
 
     def do_size_allocate(self, _width, _height, _baseline):
         if not self.cards:
             return
         self.geometry_cache = self.geometry()
-        for node, card in self.cards.items():
-            x, y, w, h = self.box_of(node)
+        for key in self.places:
+            x, y, w, h = self.box_of(key)
             rect = Gdk.Rectangle()
             rect.x, rect.y = int(x), int(y)
             rect.width, rect.height = int(w), int(h)
-            card.size_allocate(rect, -1)
-        if self.recentre:
-            GLib.idle_add(self.centre)
+            self.cards[key].size_allocate(rect, -1)
 
     def do_dispose(self):
         # A plain GtkWidget subclass owns its children by hand; leaving them
@@ -2529,16 +2786,16 @@ class PlanGraph(Gtk.Widget):
             0, 0, self.get_width(), self.get_height()))
         paint = Palette(self)
         cr.set_line_width(1.5)
-        for node in self.cards:
-            box = self.box_of(node)
+        for key in self.places:
+            box = self.box_of(key)
             if box is None:
                 break
             px, py, pw, ph = box
-            for kid in node.kids:
+            for kid in self.kids(key):
                 kx, ky, kw, _kh = self.box_of(kid)
                 # An edge into something already built is spent; one feeding
                 # what is building now is the path the build is on.
-                state = kid.row["state"]
+                state = self.state_of(kid)
                 if state == RUNNING:
                     cr.set_source_rgba(*paint.accent, .9)
                 else:
@@ -2552,49 +2809,49 @@ class PlanGraph(Gtk.Widget):
                 cr.stroke()
         Gtk.Widget.do_snapshot(self, snapshot)
 
-    # -- the cards ------------------------------------------------------------
+    # -- per redraw -----------------------------------------------------------
     def refresh(self):
-        for node, card in self.cards.items():
-            slot, title, detail, bar, reveal = card.parts
-            title.set_label(node.row["name"])
-            detail.set_label(describe(node.row))
-            slot.show(node.row)
-            fraction = node.row.get("fraction")
-            bar.set_visible(fraction is not None
-                            and node.row["state"] not in (DONE, FAILED))
+        self.plan_folds()
+        for key, card in self.cards.items():
+            row = self.read(key)
+            slot, detail, bar, reveal = self.dress(key, card)
+            card.parts[1].set_label(row["name"])
+            detail.set_label(row["detail"])
+            slot.show(row)
+            fraction = row.get("fraction")
+            bar.set_visible(fraction is not None and self.density == "full"
+                            and row["state"] not in (DONE, FAILED))
             bar.set_fraction(min(fraction or 0, 1.0))
-            self.settle(node, detail, reveal)
+            self.settle(card, row, detail, reveal)
             for state in (RUNNING, FAILED):
-                card.remove_css_class(state)
-            if node.row["state"] in (RUNNING, FAILED):
-                card.add_css_class(node.row["state"])
+                self.shade(card, state, row["state"] == state)
 
         # Only a state change can move the layout, and the page redraws four
         # times a second: asking for a new one on every redraw leaves the
         # widget permanently mid-resize.
-        shape = tuple(node.row["state"] for node in self.cards)
-        if shape != self.states:
-            self.states = shape
+        states = tuple(self.state_of(key) for key in self.cards)
+        if states != self.states:
+            self.states = states
             self.queue_resize()
         self.queue_draw()
 
-    def settle(self, node, detail, reveal):
+    def settle(self, card, row, detail, reveal):
         """Built is the end of the line: there is nothing left to say about
         a derivation that is done, so the status fades out and the foot
         slides shut under it, and the card gives back the height it was
         holding open for a word that will not change again."""
-        wanted = node.row["state"] != DONE
+        wanted = row["state"] != DONE
         if wanted == reveal.get_reveal_child():
             return
         reveal.set_reveal_child(wanted)
         if wanted:
-            self.fades.pop(node, None)
+            self.fades.pop(card, None)
             detail.set_opacity(1)
             return
         target = Adw.CallbackAnimationTarget.new(detail.set_opacity)
         fade = Adw.TimedAnimation.new(detail, 1, 0, self.COLLAPSE - 60, target)
         fade.set_easing(Adw.Easing.EASE_OUT_CUBIC)
-        self.fades[node] = fade
+        self.fades[card] = fade
         fade.play()
 
 
@@ -2789,10 +3046,10 @@ class Window(Adw.ApplicationWindow):
         self.list = PlanList()
         self.graph.on_select = self.watch
         self.list.on_select = self.watch
-        # The graph asks for the width its cards want; a rebuild with fifty
-        # downloads in it would otherwise drag the window that wide. Inside
-        # a scroller it fits when it can and scrolls when it cannot, and the
-        # window keeps a size a window can have.
+        # The graph draws itself at whatever width it is given and folds
+        # away what will not fit, so it never asks the window to grow. The
+        # scroller is for the other axis: a card listing what it stands for
+        # is a tall card, and a plan of those can outrun the window down.
         self.plan_views = Gtk.Stack(vexpand=True)
         self.plan_views.add_named(
             Gtk.ScrolledWindow(child=self.graph, vexpand=True), "graph")
@@ -3953,6 +4210,9 @@ listview.plan-list > row { padding: 0; }
 
 .plan-card { padding: 8px 10px; border-radius: 12px; }
 .plan-card label { font-size: .9em; }
+/* Adwaita asks 150px for a progress bar, which inside a card is the card:
+   the status beside it would be left with room for its ellipsis. */
+.plan-card progressbar, .plan-card progressbar trough { min-width: 24px; }
 /* An outline, not a border: a border takes room, and a card that grows by
    two pixels when it starts building shoves every card beside it. */
 .plan-card.running, .plan-card.failed {
@@ -3960,6 +4220,15 @@ listview.plan-list > row { padding: 0; }
 }
 .plan-card.running { outline-color: alpha(@accent_color, .6); }
 .plan-card.failed  { outline-color: alpha(@error_color, .6); }
+/* The two densities under the full card, for a window with no room left to
+   fold anything away: a pill keeps the name, a dot keeps only the state. */
+.plan-card.pill { padding: 5px 8px; border-radius: 9px; }
+.plan-card.dot  { padding: 3px; border-radius: 99px; min-width: 16px; }
+/* A folded card stands for everything under it, so it is drawn as the
+   stack it is: the cards behind it showing at the corner. */
+.plan-card.folded { box-shadow: 4px 4px 0 alpha(@window_fg_color, .10),
+                                8px 8px 0 alpha(@window_fg_color, .05); }
+.plan-line label { font-size: .85em; }
 
 .plan-log { font-family: monospace; font-size: .85em; }
 """
