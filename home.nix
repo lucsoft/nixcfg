@@ -260,13 +260,17 @@ in
   # Whatever is playing shows up as a Discord status. mprisence reads MPRIS
   # off the session bus, so any local player is covered by the daemon alone.
   #
-  # SoundCloud is not a local player though, and what Firefox publishes on
-  # MPRIS is the tab: the page title, no artist, no artwork, play/pause and
-  # nothing else. The bridge below is what makes it a track — the extension
-  # reads the site's own player state and hands it to the native host, which
-  # publishes a second MPRIS player (`mprisence_web`) for the daemon to pick
-  # up. The sites it knows ship with the package; SoundCloud is one of them,
-  # so neither side needs a config file.
+  # SoundCloud is not a local player though, and what Helium publishes on
+  # MPRIS is the tab. Title, artist and artwork are there — Chromium fills
+  # them from the Media Session API — but `xesam:url` is not, and that is the
+  # one field mprisence matches a website on, so every tab arrives as an
+  # unidentifiable "Helium" and is dropped.
+  #
+  # The bridge below is what makes it a track: the extension reads the site's
+  # own player state and hands it to the native host, which publishes a second
+  # MPRIS player (`mprisence_web`) for the daemon to pick up. The sites it
+  # knows ship with the package — SoundCloud is one of them — so neither side
+  # needs a config file.
   systemd.user.services.mprisence = {
     Unit = {
       Description = "Discord rich presence for MPRIS players";
@@ -283,17 +287,23 @@ in
     Install.WantedBy = [ "graphical-session.target" ];
   };
 
-  # The native messaging host, pointing Firefox at the binary to speak to.
-  # `mprisence web install` writes this file as well, but with the store path
-  # of whichever mprisence ran the command, so it would go stale at the next
-  # update. Declared here it is rewritten on every switch.
-  home.file.".mozilla/native-messaging-hosts/mprisence.web.bridge.json".text =
+  # The native messaging host, pointing Helium at the binary to speak to. It
+  # goes in the profile directory, which for Helium is its application ID and
+  # not the `chromium` that `mprisence web install` assumes — that command
+  # would also bake in the store path of whichever mprisence ran it, so it
+  # would go stale at the next update. Declared here it is rewritten on every
+  # switch. The second origin is the extension's unlisted build, carried
+  # along because upstream ships both IDs.
+  home.file.".config/net.imput.helium/NativeMessagingHosts/mprisence.web.bridge.json".text =
     builtins.toJSON {
       name = "mprisence.web.bridge";
       description = "mprisence - sends browser media to MPRIS";
       type = "stdio";
       path = "${pkgs.mprisence}/bin/mprisence";
-      allowed_extensions = [ "mprisence-bridge@lazykern.foo" ];
+      allowed_origins = [
+        "chrome-extension://pnkkjbdopihogobhhjbgapbpfccinjjo/"
+        "chrome-extension://pphdmbejbipjlocngoefnmjoijcbdejf/"
+      ];
     };
 
   # ---------------------------------------------------------------------------
@@ -342,7 +352,7 @@ in
     settings.StartupWMClass = "signal";
   };
 
-  # Firefox as the browser. Excluding GNOME Web already leaves it the only
+  # Helium as the browser. Excluding GNOME Web already leaves it the only
   # handler for http/https, but that makes the default an accident of
   # mimeinfo.cache ordering rather than a decision, so state it.
   #
@@ -352,11 +362,11 @@ in
   xdg.mimeApps = {
     enable = true;
     defaultApplications = {
-      "text/html" = "firefox.desktop";
-      "x-scheme-handler/http" = "firefox.desktop";
-      "x-scheme-handler/https" = "firefox.desktop";
-      "x-scheme-handler/about" = "firefox.desktop";
-      "x-scheme-handler/unknown" = "firefox.desktop";
+      "text/html" = "helium.desktop";
+      "x-scheme-handler/http" = "helium.desktop";
+      "x-scheme-handler/https" = "helium.desktop";
+      "x-scheme-handler/about" = "helium.desktop";
+      "x-scheme-handler/unknown" = "helium.desktop";
       "x-scheme-handler/claude-cli" = "claude-code-url-handler.desktop";
     };
   };

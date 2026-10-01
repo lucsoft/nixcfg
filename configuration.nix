@@ -97,7 +97,7 @@ in
   services.xserver.xkb.variant = "mac";
   console.keyMap = "mac-de-latin1";
 
-  # GNOME Web. Firefox is the browser here — see xdg.mimeApps in home.nix.
+  # GNOME Web. Helium is the browser here — see xdg.mimeApps in home.nix.
   environment.gnome.excludePackages = [ pkgs.epiphany ];
 
   fonts.packages = [ pkgs.twitter-color-emoji ];
@@ -207,25 +207,6 @@ in
     enable = true;
     openFirewall = true;   # TCP 47984/47989/47990/48010, UDP 47998-48000/48002/48010
     capSysAdmin = true;
-  };
-
-  # nixpkgs ships an en-US Firefox; German needs both the pack and a locale.
-  programs.firefox = {
-    enable = true;
-    languagePacks = [ "de" ];
-    preferences = {
-      "intl.locale.requested" = "de,en-US";
-    };
-    # The browser half of the mprisence bridge in home.nix: it reads the
-    # player state of SoundCloud and its like out of the page. Installed as a
-    # policy rather than by hand so the install survives a fresh profile;
-    # normal_installed instead of force_installed leaves it removable from
-    # about:addons like any other extension.
-    policies.ExtensionSettings."mprisence-bridge@lazykern.foo" = {
-      install_url =
-        "https://addons.mozilla.org/firefox/downloads/latest/mprisence-bridge/latest.xpi";
-      installation_mode = "normal_installed";
-    };
   };
 
   # Claude Code writes ~/.claude/settings.json itself — /config keeps the theme
