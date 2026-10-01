@@ -284,8 +284,18 @@ in
   #
   # 1.8 adds scoped selectors (`web_player:soundcloud`) and wants them; the
   # bare name keeps working, with a deprecation warning in the journal.
+  #
+  # The second entry is the one line Discord shows under the name. It defaults
+  # to the application's — "SoundCloud" — where Spotify puts the track, and
+  # `details` is the title. It has to sit on the website and not on
+  # [player.default]: a matched website does not layer over the browser's
+  # player config, it replaces it outright, so anything set there would never
+  # be read for a tab.
   xdg.configFile."mprisence/config.toml".text = ''
     allowed_players = ["soundcloud"]
+
+    [web_player.soundcloud]
+    status_display_type = "details"
   '';
 
   systemd.user.services.mprisence = {
