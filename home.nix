@@ -27,6 +27,14 @@ let
 
   npins-ui = pkgs.callPackage ./npins-ui { };
 
+  # blur-my-shell asks for `gi://Blur` and falls back to a cornerless blur
+  # when the import fails. That library is in no channel; the pin is the
+  # upstream blur-my-shell points at. It links libmutter, so it only ever
+  # matches the mutter the Shell is running — see rounded-blur/default.nix.
+  rounded-blur = pkgs.callPackage ./rounded-blur {
+    src = sources.gnome-rounded-blur;
+  };
+
   # Helium, a Chromium fork, is in no nixpkgs channel. The pin is a third
   # party's packaging repo, which is a flake — but its flake.nix only does
   # `callPackage ./helium.nix {}`, so calling that file directly skips the
@@ -193,7 +201,9 @@ in
       # Hide and tweak Shell UI elements.
       { package = pkgs.gnomeExtensions.just-perfection; }
 
-      # Blur behind the panel, the overview and the dash.
+      # Blur behind the panel, the overview and the dash. Its rounded corners
+      # need the gi://Blur library below; without it the blur is square and
+      # the extension says so in its preferences.
       { package = pkgs.gnomeExtensions.blur-my-shell; }
 
       # Turn the overview dash into a permanent dock.
@@ -205,6 +215,13 @@ in
       { package = pkgs.callPackage ./shaderbg { }; }
     ];
   };
+
+  # How the Shell is told where Blur-1.0.typelib is. gnome-shell is a systemd
+  # user unit, so environment.d reaches it, and its wrapper prepends its own
+  # typelib path rather than replacing this one. The extension imports the
+  # library when it is enabled, so this only takes effect after a logout.
+  systemd.user.sessionVariables.GI_TYPELIB_PATH =
+    "${rounded-blur}/lib/girepository-1.0";
 
   # GNOME keeps its own copy of the keyboard layout. It is seeded from the
   # system default at first login and never re-read, so the `de(mac)` in

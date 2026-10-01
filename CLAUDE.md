@@ -66,6 +66,11 @@ No channels, no flakes. Multiple pins live in `npins/sources.json`:
   names. Pinned to `main`, because the repo cuts no releases. The browser
   version is a literal inside `helium.nix`, so `npins update helium` is also
   what updates the browser.
+- **`gnome-rounded-blur`** — the `gi://Blur` library blur-my-shell imports to
+  round the corners of its blur; no channel carries it. Pinned to the release
+  tag. `rounded-blur/default.nix` builds it against the pinned mutter, and
+  `meson.build` names `libmutter-18` literally — that is mutter 50's ABI, so
+  a mutter bump fails to configure here until upstream moves the number.
 
 `nix.nixPath` in `configuration.nix` aims `<nixpkgs>` at the same pin, because
 that path is what standalone Home Manager builds against.

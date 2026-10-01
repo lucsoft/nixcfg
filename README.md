@@ -30,8 +30,9 @@ repo configures graphics — there is no proprietary driver to pull in.
 | `power.nix` | suspend/resume workarounds — transitional, see the file |
 | `plymouth/` | the boot splash theme — logo, progress bar, unit names |
 | `shaderbg/` | GNOME Shell extension — a GLSL shader as the desktop background |
+| `rounded-blur/` | packaging for the `gi://Blur` library blur-my-shell wants |
 | `home.nix` | Home Manager — my packages, dotfiles and user settings |
-| `npins/sources.json` | the pins: nixpkgs, nixpkgs-unstable, home-manager, helium |
+| `npins/sources.json` | the pins: nixpkgs, nixpkgs-unstable, home-manager, helium, gnome-rounded-blur |
 
 `npins/default.nix` is generated — never edit it by hand.
 
