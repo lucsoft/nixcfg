@@ -213,6 +213,11 @@ in
       # shaderbg/sources.nix. Local rather than from e.g.o because the only
       # GLSL wallpaper extension there stops at Shell 49.
       { package = pkgs.callPackage ./shaderbg { }; }
+
+      # Loads gnome-shell.css from this repo over the stock theme, which is
+      # how the panel pills and the dash outline are drawn. Open Bar used to
+      # generate that CSS from a preferences dialog, but it stops at Shell 49.
+      { package = pkgs.gnomeExtensions.user-stylesheet-font; }
     ];
   };
 
@@ -222,6 +227,12 @@ in
   # library when it is enabled, so this only takes effect after a logout.
   systemd.user.sessionVariables.GI_TYPELIB_PATH =
     "${rounded-blur}/lib/girepository-1.0";
+
+  # The stylesheet the extension above reads. Editing it needs a switch and
+  # then a toggle of the extension — it loads the file once, when enabled:
+  #   gnome-extensions disable user-stylesheet@tomaszgasior.pl
+  #   gnome-extensions enable  user-stylesheet@tomaszgasior.pl
+  xdg.configFile."gnome-shell/gnome-shell.css".source = ./gnome-shell.css;
 
   # GNOME keeps its own copy of the keyboard layout. It is seeded from the
   # system default at first login and never re-read, so the `de(mac)` in
