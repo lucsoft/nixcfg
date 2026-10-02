@@ -45,8 +45,8 @@
     "nixpkgs": {
       "type": "Channel",
       "name": "nixos-26.05",
-      "url": "https://releases.nixos.org/nixos/26.05/nixos-26.05.11006.4feb8eb8bf30/nixexprs.tar.xz",
-      "hash": "sha256-L1PjLZOpzMeubJPLcr0txsCSMdOqEN9xliZyFXnSLGs="
+      "url": "https://releases.nixos.org/nixos/26.05/nixos-26.05.11045.774debe7a0d1/nixexprs.tar.xz",
+      "hash": "sha256-S5MjznoY0gbQbcANPLz5RYjg+5/WQmFRgNbHcP+ydcg="
     },
     "nixpkgs-unstable": {
       "type": "Channel",
