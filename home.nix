@@ -162,6 +162,12 @@ in
       extraLibraries = pkgs: with pkgs; [ gamemode ];
     })
 
+    # On the real PATH, not just inside Lutris' sandbox: the Steam Gaming
+    # Mode entry below passes gamescope --mangoapp, and gamescope spawns
+    # mangoapp by a bare PATH lookup. Without it the session still starts,
+    # minus the overlay the Deck UI's "Performance" tab toggles.
+    mangohud
+
     # Nix tooling
     npins-ui    # Adwaita front end for npins
     npins       # updates the pins in npins/sources.json
@@ -410,6 +416,47 @@ in
     categories = [ "Network" "InstantMessaging" "Chat" ];
     mimeType = [ "x-scheme-handler/sgnl" "x-scheme-handler/signalcaptcha" ];
     settings.StartupWMClass = "signal";
+  };
+
+  # Steam's Deck UI — "Gaming Mode" — as an ordinary app, in a window on this
+  # desktop rather than as a session of its own.
+  #
+  # gamescope's own flags:
+  #
+  #   -e            Steam integration. This is what sets the STEAM_GAMESCOPE_*
+  #                 variables the client reads at startup to decide which of
+  #                 tearing, VRR, HDR and the scaling filters it may offer, and
+  #                 it makes gamescope treat Steam as the session's shell
+  #                 instead of as one more game window.
+  #   --mangoapp    the overlay behind the Deck UI's "Performance" tab. Upstream
+  #                 wants this rather than MangoHud on the game: mangoapp draws
+  #                 as a gamescope layer, so the overlay is composited over the
+  #                 game instead of injected into it.
+  #
+  # No -f and no -b on purpose — those are what would pin the window. Left
+  # alone, the nested window is an ordinary resizable one: gamescope's Wayland
+  # backend wraps itself in a libdecor frame, and its configure handler writes
+  # the new content size straight into the output size, so dragging the edge
+  # re-renders at the new resolution instead of scaling a fixed buffer. -W/-H
+  # only pick the size it opens at.
+  #
+  # The Steam flags are the SteamOS session's, minus two. -gamepadui is the one
+  # that actually swaps the UI over; -steamos3 unlocks the SteamOS half of it
+  # (power menu, the Performance tab, system settings); -steamdeck has the
+  # client present itself as Deck hardware. -steampal is left out because
+  # Jovian-NixOS drops it everywhere off real Deck hardware.
+  #
+  # Steam is single-instance: if the desktop client is already running this
+  # hands the command to it and the flags are ignored. Quit Steam first.
+  xdg.desktopEntries.steam-gamingmode = {
+    name = "Steam Gaming Mode";
+    genericName = "Steam Deck UI";
+    comment = "Steam's gamepad UI, in a resizable gamescope window";
+    exec = "gamescope -W 1920 -H 1080 -e --mangoapp -- steam -steamos3 -steamdeck -gamepadui";
+    icon = "steam";
+    terminal = false;
+    categories = [ "Game" ];
+    settings.StartupWMClass = "gamescope";
   };
 
   # Helium as the browser. Excluding GNOME Web already leaves it the only
