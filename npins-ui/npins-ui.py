@@ -2319,7 +2319,7 @@ class PlanList(Gtk.Box):
 # the plan as a graph
 # -----------------------------------------------------------------------------
 class PlanGraph(Gtk.Widget):
-    """Cards laid out by depth, edges drawn behind them, inside the window.
+    """Cards hung under their parents, edges drawn behind them, in here.
 
     The list says what is waiting for what; this says it in one look, which
     is the thing a dependency tree is for — and a tree that runs off the
@@ -2719,45 +2719,79 @@ class PlanGraph(Gtk.Widget):
         for key, card in self.cards.items():
             card.set_child_visible(key in self.places)
 
-    def geometry(self):
-        """Column step, card width, and where each level sits.
+    def widths(self, width):
+        """Column step and card width for an allocation that wide.
 
-        Every level is as tall as the tallest card in it and no taller: a
-        row of one-line names has no reason to take the room a row of
-        wrapped store paths needs. What is left over becomes the gap between
-        the levels, which is where the edges are drawn.
+        No card is ever allocated less than it asked for: a card squeezed
+        below its minimum re-measures for the rest of the frame and the
+        widget never settles enough to draw.
         """
-        width = max(self.get_width(), 1) - 2 * self.PAD
-        height = max(self.get_height(), 1) - 2 * self.PAD
-        step_x = width / self.columns
-
-        # No card is ever allocated less than it asked for: a card squeezed
-        # below its minimum re-measures for the rest of the frame and the
-        # widget never settles enough to draw.
+        step_x = (max(width, 1) - 2 * self.PAD) / self.columns
         floor = max([self.MIN_W // 8]
                     + [self.cards[key].measure(Gtk.Orientation.HORIZONTAL,
                                                -1)[0]
                        for key in self.places])
-        card_w = max(floor, min(self.CARD_W, step_x - 8))
+        return step_x, max(floor, min(self.CARD_W, step_x - 8))
 
-        tall, heights = {}, {}
-        for key in self.places:
-            _min, natural, _b1, _b2 = self.cards[key].measure(
-                Gtk.Orientation.VERTICAL, int(card_w))
-            heights[key] = natural
-            depth = self.level[key]
-            tall[depth] = max(tall.get(depth, 0), natural)
+    def chains(self, card_w):
+        """Every run from a root down to a leaf: how tall its cards are
+        together, and how many gaps are strung between them.
 
-        needed = sum(tall.values())
-        gaps = max(self.levels - 1, 1)
-        gap = min(self.GAP_MAX, max(self.GAP_MIN, (height - needed) / gaps))
-        top = self.PAD + max(0, (height - needed - gap * gaps) / 2)
+        A chain is what costs height, and the longest one is what the plan
+        has to fit into. Depth alone does not say it — a short branch of
+        wrapped store paths outgrows a long branch of one-line names.
+        """
+        found = []
 
-        rows, y = {}, top
-        for depth in range(self.levels):
-            rows[depth] = y
-            y += tall.get(depth, 0) + gap
-        return step_x, card_w, rows, heights
+        def walk(key, stacked, links):
+            stacked += self.cards[key].measure(Gtk.Orientation.VERTICAL,
+                                               int(card_w))[1]
+            kids = self.kids(key)
+            if not kids:
+                found.append((stacked, links))
+            for kid in kids:
+                walk(kid, stacked, links + 1)
+
+        for root in self.roots:
+            walk(root, 0, 0)
+        return found
+
+    def geometry(self):
+        """Column step, card width, and where each card sits.
+
+        A card hangs under its own parent rather than on a line it shares
+        with everything else at its depth. Pinned to a line, the tallest
+        card in a level set the height of every branch running through it,
+        and a branch that ended three levels up paid for that room anyway —
+        on a plan with one deep corner the rest of the tree was mostly gap.
+        The spacing is uniform instead, and it is the chain with the least
+        room to spare that says how wide: the tree still reaches the bottom
+        of the window, without the levels dragging each other down.
+        """
+        height = max(self.get_height(), 1) - 2 * self.PAD
+        step_x, card_w = self.widths(self.get_width())
+
+        heights = {key: self.cards[key].measure(Gtk.Orientation.VERTICAL,
+                                                int(card_w))[1]
+                   for key in self.places}
+        slack = [(height - tall) / links
+                 for tall, links in self.chains(card_w) if links]
+        gap = min(self.GAP_MAX,
+                  max(self.GAP_MIN, min(slack, default=self.GAP_MAX)))
+
+        tops = {}
+
+        def place(key, top):
+            tops[key] = top
+            for kid in self.kids(key):
+                place(kid, top + heights[key] + gap)
+
+        for root in self.roots:
+            place(root, 0)
+
+        deep = max((tops[key] + heights[key] for key in tops), default=0)
+        top = self.PAD + max(0, (height - deep) / 2)
+        return step_x, card_w, {key: y + top for key, y in tops.items()}, heights
 
     def box_of(self, key):
         """Where a card sits, from the last allocation. Measuring children
@@ -2765,11 +2799,11 @@ class PlanGraph(Gtk.Widget):
         is nothing to draw and the next frame has it all."""
         if not self.geometry_cache or key not in self.places:
             return None
-        step_x, card_w, rows, heights = self.geometry_cache
+        step_x, card_w, tops, heights = self.geometry_cache
         return (self.PAD + (self.places[key] + 0.5) * step_x - card_w / 2,
-                rows[self.level[key]], card_w, heights[key])
+                tops[key], card_w, heights[key])
 
-    def do_measure(self, orientation, _for_size):
+    def do_measure(self, orientation, for_size):
         if orientation == Gtk.Orientation.HORIZONTAL:
             # It asks for no more than a handful of cards and will take far
             # less: whatever it cannot fit, it folds away instead. A plan
@@ -2777,8 +2811,18 @@ class PlanGraph(Gtk.Widget):
             # off the side of the screen.
             floor = self.PAD * 2 + self.MIN_W
             want = self.PAD * 2 + min(self.columns, 6) * (self.CARD_W + 16)
+            return (floor, max(floor, want), -1, -1)
+
+        # The real answer needs a width to wrap the names against, and the
+        # first measure comes before there is one. Levels are the estimate
+        # until then; after that it is the longest chain, which is what the
+        # page is actually asked to hold.
+        floor = self.PAD * 2 + 46 + self.GAP_MIN
+        if self.places and for_size > 0:
+            _step_x, card_w = self.widths(for_size)
+            want = self.PAD * 2 + max(tall + links * self.GAP_MIN
+                                      for tall, links in self.chains(card_w))
         else:
-            floor = self.PAD * 2 + self.levels * (46 + self.GAP_MIN)
             want = self.PAD * 2 + self.levels * (96 + 36)
         return (floor, max(floor, want), -1, -1)
 
