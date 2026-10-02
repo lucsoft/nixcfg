@@ -1213,8 +1213,16 @@ def rebuild_steps(repo):
         # -f matters as much as --file above. Without it home-manager takes
         # ~/.config/home-manager/home.nix no matter which repo this window is
         # pointed at, so the two steps would build from different trees.
-        ("Building your home", ["home-manager", "switch",
-                                "-f", str(Path(repo) / "home.nix")]),
+        #
+        # home-manager is a shell script rather than nix, but --log-format is
+        # one of the options it hands straight to the nix-build it runs.
+        # Without it this step arrives as a page of activation lines and no
+        # plan at all: every row the page draws is made out of that event
+        # stream, and the home half was drawing nothing.
+        ("Building your home", [
+            "home-manager", "switch", "-f", str(Path(repo) / "home.nix"),
+            "--log-format", "internal-json",
+        ]),
     ]
 
 
