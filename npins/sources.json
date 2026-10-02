@@ -53,6 +53,22 @@
       "name": "nixos-unstable",
       "url": "https://releases.nixos.org/nixos/unstable/nixos-26.11pre1082427.b4fd65b198c5/nixexprs.tar.xz",
       "hash": "sha256-VyUI5WA3WdOB9kjb04A0pxE6XTWC6cG95ZkoPSv58F0="
+    },
+    "steamos-manager": {
+      "type": "GitRelease",
+      "repository": {
+        "type": "GitLab",
+        "repo_path": "holo/steamos-manager",
+        "server": "https://gitlab.steamos.cloud/"
+      },
+      "pre_releases": false,
+      "version_upper_bound": null,
+      "release_prefix": null,
+      "submodules": false,
+      "version": "v26.4.1",
+      "revision": "a0d399defebd60db30ba38325d9cf47dbda49bee",
+      "url": "https://gitlab.steamos.cloud/api/v4/projects/holo%2Fsteamos-manager/repository/archive.tar.gz?sha=v26.4.1",
+      "hash": "sha256-NVbYXZOd7+cUf0wDqptoHUBzHN/ukctcltir2axvAJo="
     }
   },
   "version": 7

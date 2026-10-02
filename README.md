@@ -31,9 +31,10 @@ repo configures graphics — there is no proprietary driver to pull in.
 | `plymouth/` | the boot splash theme — logo, progress bar, unit names |
 | `shaderbg/` | GNOME Shell extension — a GLSL shader as the desktop background |
 | `rounded-blur/` | packaging for the `gi://Blur` library blur-my-shell wants |
+| `steamos-manager/` | packaging for Valve's power daemon, plus this board's device file |
 | `gnome-shell.css` | panel pills and dash outline, loaded over the stock Shell theme |
 | `home.nix` | Home Manager — my packages, dotfiles and user settings |
-| `npins/sources.json` | the pins: nixpkgs, nixpkgs-unstable, home-manager, helium, gnome-rounded-blur |
+| `npins/sources.json` | the pins: nixpkgs, nixpkgs-unstable, home-manager, helium, gnome-rounded-blur, steamos-manager |
 
 `npins/default.nix` is generated — never edit it by hand.
 

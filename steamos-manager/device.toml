@@ -1,0 +1,49 @@
+# What steamos-manager is allowed to drive on this machine.
+#
+# Upstream ships one of these per supported device under data/devices and
+# picks between them by DMI. Its list is Steam Deck, Steam Machine, Steam
+# Frame and 25 handhelds — an ASRock desktop matches none of them, so
+# configuration.nix passes this file with --device-config, which skips the
+# DMI scan entirely.
+#
+# The [[device]] block is still worth stating. It is what the daemon reports
+# over D-Bus when the client asks what hardware this is, and omitting it only
+# gets "unknown".
+
+[[device]]
+dmi.sys_vendor = "ASRock"
+dmi.board_name = "B650I Lightning WiFi"
+device = "asrock_b650i"
+variant = "B650I Lightning WiFi"
+friendly_name = "ASRock B650I Lightning WiFi"
+
+# power1_cap on the amdgpu hwmon, in watts. The range is not a preference:
+# amdgpu exports power1_cap_min = 212000000 and power1_cap_max = 244000000 for
+# the dGPU, and the kernel rejects a write outside it. So this slider has a
+# 32 W window — a desktop Navi 32 is not a handheld, and the Deck's 3-15 W has
+# no equivalent here.
+[tdp_limit]
+method = "amdgpu_hwmon"
+
+[tdp_limit.range]
+min = 212
+max = 244
+
+# Auto / Low / High / Manual / Peak, through power_dpm_force_performance_level.
+# This one needs nothing special: the attribute is there by default.
+[gpu_performance]
+driver = "amdgpu"
+
+# Manual clock writes "s 0 <mhz>" then "s 1 <mhz>" to pp_od_clk_voltage, and
+# that file only appears once amdgpu overdrive is on — which is what the
+# ppfeaturemask kernel parameter in configuration.nix is for. Without it the
+# control still shows up and fails on use.
+#
+# The bounds are pp_dpm_sclk's own levels, 500 MHz and 2254 MHz. Its third
+# step, 56 MHz, is the standby state and not a clock to pin a game to.
+[gpu_performance.clocks]
+min = 500
+max = 2254
+
+[gpu_power_profile]
+driver = "amdgpu"

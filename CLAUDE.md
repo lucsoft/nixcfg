@@ -71,6 +71,12 @@ No channels, no flakes. Multiple pins live in `npins/sources.json`:
   tag. `rounded-blur/default.nix` builds it against the pinned mutter, and
   `meson.build` names `libmutter-18` literally — that is mutter 50's ABI, so
   a mutter bump fails to configure here until upstream moves the number.
+- **`steamos-manager`** — Valve's own, from `gitlab.steamos.cloud`, and no
+  channel carries it. It is the D-Bus API the Steam client probes to decide
+  which power settings its Deck UI may show, which is the only way to get a
+  TDP or GPU clock control there. Pinned to the release tag.
+  `steamos-manager/default.nix` builds it; `steamos-manager/device.toml`
+  describes this board, because upstream's own device table is handhelds only.
 
 `nix.nixPath` in `configuration.nix` aims `<nixpkgs>` at the same pin, because
 that path is what standalone Home Manager builds against.
