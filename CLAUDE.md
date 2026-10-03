@@ -77,6 +77,13 @@ No channels, no flakes. Multiple pins live in `npins/sources.json`:
   TDP or GPU clock control there. Pinned to the release tag.
   `steamos-manager/default.nix` builds it; `steamos-manager/device.toml`
   describes this board, because upstream's own device table is handhelds only.
+- **`jovian`** — Jovian-NixOS, for one file: `pkgs/decky-loader`, which no
+  channel carries. `configuration.nix` `callPackage`s it, so Decky builds from
+  source against the nixpkgs pinned above; none of Jovian's modules are
+  imported, and the systemd unit next to it is this repo's own. Pinned to
+  `development`, the default branch, because the repo cuts no releases. The
+  Decky version is a literal inside that file, so `npins update jovian` is also
+  what updates the loader.
 
 `nix.nixPath` in `configuration.nix` aims `<nixpkgs>` at the same pin, because
 that path is what standalone Home Manager builds against.

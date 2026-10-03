@@ -42,6 +42,19 @@
       "url": "https://github.com/nix-community/home-manager/archive/e5fcd298a00f08b6e8390baf04aa8edb62203070.tar.gz",
       "hash": "sha256-kaNo6xHiL31AbNNEreG0OTKf4j6Cxlo5bPawjX7lnbQ="
     },
+    "jovian": {
+      "type": "Git",
+      "repository": {
+        "type": "GitHub",
+        "owner": "Jovian-Experiments",
+        "repo": "Jovian-NixOS"
+      },
+      "branch": "development",
+      "submodules": false,
+      "revision": "23be28be9808ebc8f8bf1da5eed673fd6c6b62bc",
+      "url": "https://github.com/Jovian-Experiments/Jovian-NixOS/archive/23be28be9808ebc8f8bf1da5eed673fd6c6b62bc.tar.gz",
+      "hash": "sha256-ouYjiaMs7+wz287wTYKvbV8cJiOO6OFWfTEtm6kIjPY="
+    },
     "nixpkgs": {
       "type": "Channel",
       "name": "nixos-26.05",

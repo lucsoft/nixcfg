@@ -12,6 +12,14 @@ let
 
   # --device-config, because upstream's DMI table is handhelds only
   steamos-manager-device = ./steamos-manager/device.toml;
+
+  # Jovian's packaging of Decky, built from source against the nixpkgs pinned
+  # here. Only this one file is used; none of Jovian's modules are imported.
+  # The Decky version is a literal inside it, so `npins update jovian` is also
+  # what updates the loader.
+  decky-loader = pkgs.callPackage "${sources.jovian}/pkgs/decky-loader" { };
+
+  decky-state = "/var/lib/decky-loader";
 in
 
 {
@@ -178,6 +186,48 @@ in
 
   services.dbus.packages = [ steamos-manager ];
   environment.systemPackages = [ steamos-manager ];
+
+  # Decky, the plugin manager for the Deck UI. It reaches Steam the same way a
+  # devtools window would: Steam exposes its CEF on localhost, Decky attaches
+  # and injects its own frontend, which is why nothing about the Gaming Mode
+  # entry in home.nix has to change for it.
+  #
+  # That CEF port only opens when ~/.steam/steam/.cef-enable-remote-debugging
+  # exists. The file is already there, and it is Steam's own switch (Settings ->
+  # "Enable developer mode"), so it stays imperative — Steam does not stop
+  # listening when the file goes away again, so a declarative one would be a
+  # port this config could open but never close.
+  #
+  # The loader runs as root and setuids down per plugin; running it unprivileged
+  # is unsupported upstream. Plugins therefore land as `decky`, not as lucsoft,
+  # which keeps store-installed plugin backends out of the real home directory.
+  users.users.decky = {
+    group = "decky";
+    home = decky-state;
+    isSystemUser = true;
+  };
+  users.groups.decky = { };
+
+  systemd.services.decky-loader = {
+    description = "Steam Deck Plugin Loader";
+    wantedBy = [ "multi-user.target" ];
+    after = [ "network.target" ];
+    environment = {
+      UNPRIVILEGED_USER = "decky";
+      UNPRIVILEGED_PATH = decky-state;
+      PLUGIN_PATH = "${decky-state}/plugins";
+    };
+    preStart = ''
+      mkdir -p "${decky-state}"
+      chown -R decky: "${decky-state}"
+    '';
+    serviceConfig = {
+      ExecStart = "${decky-loader}/bin/decky-loader";
+      # plugin backends are children it must not take down with itself
+      KillMode = "process";
+      TimeoutStopSec = 45;
+    };
+  };
 
   services.sunshine = {
     enable = true;
