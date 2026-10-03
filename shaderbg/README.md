@@ -69,14 +69,19 @@ needs a buffer pass or a channel texture is visible before it fails to render.
 
 ## Speed
 
-Each shader has its own speed, set once and remembered. `sources.nix` carries
-the value a shader ships with; the preferences write into the `speeds`
-GSettings key, which holds only the ones actually tuned. That split is what
-lets the reset button exist, and it keeps the committed file meaningful
-instead of being overwritten by every nudge of the slider.
+Two numbers per shader, and they multiply.
+
+`sources.nix` holds the **base** — what the shader is checked in at. The
+preferences hold a **factor** on top of it, per shader, in the `speeds`
+GSettings key; 1.0 means the base, and only shaders actually adjusted appear
+there. So the committed number keeps meaning something after the slider has
+been touched, and reset has somewhere to go back to.
+
+An earlier version had the slider replace the base instead of scaling it,
+which made `sources.nix` meaningless the moment anyone touched it.
 
 Both scale the time base rather than the repaint rate, so slowing a shader
-down does not make it stutter.
+down does not make it stutter — and neither makes it cheaper, see below.
 
 ## Attribution, and what cannot go in here
 

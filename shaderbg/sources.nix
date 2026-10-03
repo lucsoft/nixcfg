@@ -8,11 +8,11 @@
 # size and full speed, so everything imported starts at 0.5 — a deliberately
 # slow first guess, not a judgement about that shader.
 #
-# Tuning happens in the extension's preferences, which writes into the `speeds`
-# GSettings key rather than here: one value per shader, set once, remembered.
-# A shader with no entry there follows the number below, which is also what the
-# reset button goes back to. Once a value has settled, move it into this file
-# so it survives as part of the configuration.
+# This is the *base*. The extension's preferences store a factor on top of it,
+# per shader, in the `speeds` GSettings key, and the two multiply. So the
+# number here keeps meaning something after the slider has been touched, the
+# reset button has somewhere to go back to, and a value that has settled can be
+# folded in here by multiplying it in and clearing the factor.
 #
 # `id` is the Shadertoy id, as in https://www.shadertoy.com/view/<id>, and is
 # kept for attribution rather than for fetching: Shadertoy defaults to
@@ -189,5 +189,12 @@
     name = "Gradient Flow";
     author = "hahnzhu";
     speed = 0.5;
+  }
+  {
+    id = null;
+    file = "_st.frag";
+    name = "ST TEST";
+    author = "test";
+    speed = 1.0;
   }
 ]

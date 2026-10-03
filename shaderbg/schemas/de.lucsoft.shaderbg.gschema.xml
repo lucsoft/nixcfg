@@ -4,12 +4,13 @@
 
     <key name="speeds" type="a{sd}">
       <default>{}</default>
-      <summary>Per-shader speed, keyed by file name</summary>
+      <summary>Per-shader speed factor, keyed by file name</summary>
       <description>
-        Set once per shader and remembered. A shader with no entry here runs at
-        the speed sources.nix gives it, so this holds only what has actually
-        been tuned. Scales the time base, not the repaint rate, which is why
-        slowing a shader down does not make it stutter.
+        A multiplier on the base speed sources.nix gives each shader, set once
+        and remembered. 1.0 means the base, and a shader with no entry here is
+        at 1.0, so this holds only what has actually been adjusted. Scales the
+        time base rather than the repaint rate, which is why slowing a shader
+        down does not make it stutter.
       </description>
     </key>
 

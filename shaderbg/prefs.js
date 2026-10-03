@@ -67,9 +67,8 @@ export default class ShaderBgPreferences extends ExtensionPreferences {
 
         const speed = new Adw.SpinRow({
             title: 'Speed',
-            subtitle: 'Scales the time base, so slowing down does not stutter',
             adjustment: new Gtk.Adjustment({
-                lower: 0.05, upper: 2.0, step_increment: 0.05, page_increment: 0.25,
+                lower: 0.05, upper: 4.0, step_increment: 0.05, page_increment: 0.5,
             }),
             digits: 2,
         });
@@ -98,20 +97,25 @@ export default class ShaderBgPreferences extends ExtensionPreferences {
                 link.uri = `https://www.shadertoy.com/view/${entry.id}`;
 
             speed.sensitive = !!entry;
-            reset.tooltip_text = entry
-                ? `Back to ${entry.speed ?? 1}, the value in sources.nix`
-                : '';
+            reset.tooltip_text = entry ? 'Back to the base speed' : '';
 
             if (!entry)
                 return;
 
             const tuned = settings.get_value('speeds').deepUnpack();
+            const base = entry.speed ?? 1;
+            const factor = tuned[entry.file] ?? 1;
+
+            // The slider is a factor on the base, not a replacement for it,
+            // so the number checked into sources.nix keeps meaning something
+            // after the slider has been touched.
+            speed.subtitle =
+                `Base ${base} × ${factor.toFixed(2)} = ${(base * factor).toFixed(3)}`;
 
             // Guard the write-back: assigning to .value fires notify::value,
-            // which would otherwise store the shader's own default as if it
-            // had been tuned by hand.
+            // which would otherwise store 1.0 as if it had been set by hand.
             settingValue = true;
-            speed.value = tuned[entry.file] ?? entry.speed ?? 1;
+            speed.value = factor;
             settingValue = false;
         };
 
@@ -212,9 +216,12 @@ export default class ShaderBgPreferences extends ExtensionPreferences {
             // glance: which ones have been tuned, and how far.
             const describe = () => {
                 const tuned = settings.get_value('speeds').deepUnpack();
-                const value = tuned[entry.file] ?? entry.speed ?? 1;
-                const marker = entry.file in tuned ? '' : ' (default)';
-                row.subtitle = `${entry.author ?? 'unknown'} · ${value}×${marker}`;
+                const base = entry.speed ?? 1;
+                const factor = tuned[entry.file] ?? 1;
+                const shown = factor === 1
+                    ? `${base}`
+                    : `${base} × ${factor.toFixed(2)} = ${(base * factor).toFixed(3)}`;
+                row.subtitle = `${entry.author ?? 'unknown'} · ${shown}`;
             };
             const speedsId = settings.connect('changed::speeds', describe);
             row.connect('destroy', () => settings.disconnect(speedsId));

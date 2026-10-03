@@ -25,23 +25,6 @@ uniform float iFrameF;
 uniform float iResX;
 uniform float iResY;
 
-// gl_FragCoord is not actor-local here. Measured: an actor at stage x=200
-// with an 80px pattern breaks at x=240, and a 70px vertical pattern on an
-// actor at y=200 breaks at 210, 280, 350 — so the coordinate is the stage
-// position, counted from the top left. On the desktop the background actor
-// sits at the origin and the difference never shows; in the overview the
-// workspace preview is offset, and the shader stood still while the actor
-// slid across it, which looks exactly like a mask.
-//
-// So the fragment is normalised inside the actor's on-screen rectangle and
-// then scaled to the monitor, which fixes the offset, the smaller preview
-// and any transform on top of it in one step. The y flip is the other half:
-// Shadertoy counts fragCoord.y upwards, this counts down.
-uniform float iOriginX;
-uniform float iOriginY;
-uniform float iExtentW;
-uniform float iExtentH;
-
 // Every channel carries the same locally generated noise, so one number
 // describes all four resolutions.
 uniform float iChannelSize;
@@ -117,7 +100,6 @@ void main()
     // not a wrong pixel, it is a hung GPU and a compositor reset. Ask how
     // this comment came to be written.
     vec2 res = max(vec2(iResX, iResY), vec2(1.0));
-    vec2 ext = max(vec2(iExtentW, iExtentH), vec2(1.0));
 
     iResolution = vec3(res, 1.0);
     iFrame = int(iFrameF);
@@ -127,18 +109,31 @@ void main()
     iChannelResolution[2] = iChannelResolution[0];
     iChannelResolution[3] = iChannelResolution[0];
 
-    // Inside the actor this is already 0..1; the clamp is the backstop that
-    // keeps fragCoord bounded by the monitor no matter what the uniforms say.
-    // A loop that marches until it passes some distance has to be able to
-    // finish, or the whole GPU stops.
+    // The actor's own texture coordinate, not gl_FragCoord.
     //
-    // No y flip. There was one for a while, on the strength of a headless
-    // measurement that said gl_FragCoord.y counts downwards — and on a
-    // virtual monitor it does. On a real KMS output it counts upwards, the
-    // way GL always has, so the flip turned every shader upside down on the
-    // only display that matters. Headless is not a reference for vertical
-    // orientation; check that one on the actual screen.
-    vec2 n = clamp((gl_FragCoord.xy - vec2(iOriginX, iOriginY)) / ext, 0.0, 1.0);
+    // gl_FragCoord is a position in the framebuffer, so using it meant
+    // working out where the actor currently sits on screen and subtracting
+    // that — every frame, because the overview moves its previews, scrolls
+    // them between workspaces and shrinks them during a search. Three
+    // separate bugs came out of that chase: the shader standing still like a
+    // mask while a preview slid across it, the picture reflowing during the
+    // open animation, and banding in the app grid where parts of the actor
+    // were painted at different moments with different geometry.
+    //
+    // cogl_tex_coord_in is interpolated across the quad that draws the
+    // effect's texture, so it is 0..1 over the actor by construction — under
+    // any position, any size, any transform, with nothing to keep in sync.
+    // Measured: the s = 0.5 edge lands at x = 1710 on a 3440-wide actor, the
+    // t = 0.5 edge at y = 720 of 1440.
+    //
+    // t runs downwards and Shadertoy counts upwards, hence the subtraction.
+    // Unlike gl_FragCoord, this does not depend on the framebuffer's y
+    // origin, so it should not differ between a real output and a virtual
+    // one — which is exactly the trap the previous version fell into.
+    //
+    // The clamp is left as a backstop: a loop that marches until it passes
+    // some distance has to be able to finish, or the whole GPU stops.
+    vec2 n = clamp(vec2(cogl_tex_coord_in[0].s, 1.0 - cogl_tex_coord_in[0].t), 0.0, 1.0);
 
     vec4 color = vec4(0.0, 0.0, 0.0, 1.0);
     mainImage(color, n * res);
@@ -322,15 +317,17 @@ export default class ShaderBgExtension extends Extension {
         return this._sources[((this._today() % count) + count) % count];
     }
 
-    // sources.nix carries the speed a shader ships with; the preferences write
-    // into `speeds` when one gets tuned. Only tuned shaders appear there, so
-    // the committed value stays the fallback rather than being copied around.
+    // Two numbers, and they multiply. sources.nix carries the base — the
+    // speed a shader is checked in at, arrived at by watching it — and the
+    // preferences store a factor on top of that, per shader. Replacing the
+    // base instead of scaling it made the committed value meaningless the
+    // moment the slider was touched.
     _speedOf(entry) {
         if (!entry)
             return 1;
 
         const tuned = this._settings.get_value('speeds').deepUnpack();
-        return tuned[entry.file] ?? entry.speed ?? 1;
+        return (entry.speed ?? 1) * (tuned[entry.file] ?? 1);
     }
 
     _readShader(file) {
@@ -543,28 +540,17 @@ export default class ShaderBgExtension extends Extension {
     // during a search, and each of those has to come out as the picture moving
     // with the preview rather than the preview sliding across a picture that
     // stays put.
+    // All that is left of the geometry is the resolution the shader composes
+    // for, which is the monitor's and has nothing to do with how large the
+    // actor happens to be drawn. Where the actor is no longer matters — see
+    // the note on cogl_tex_coord_in in the prelude.
     _setGeometry(actor, effect) {
         const monitor = Main.layoutManager.monitors[actor.monitor];
         if (!monitor)
             return;
 
-        // Graphene.Rect exposes origin and size as plain struct fields in GJS;
-        // there are no getters for them.
-        const { origin, size } = actor.get_transformed_extents();
-
-        // An actor that is not in the scene graph yet — which is exactly the
-        // case when the factory hands one over — has no extents. Falling back
-        // to the monitor keeps the numbers sane; clamping a zero to one does
-        // not, it just turns an infinite coordinate into a merely enormous
-        // one, and a raymarcher hangs on both.
-        const usable = size.width > 0 && size.height > 0;
-
         effect.setFloat('iResX', monitor.width);
         effect.setFloat('iResY', monitor.height);
-        effect.setFloat('iOriginX', usable ? origin.x : monitor.x);
-        effect.setFloat('iOriginY', usable ? origin.y : monitor.y);
-        effect.setFloat('iExtentW', usable ? size.width : monitor.width);
-        effect.setFloat('iExtentH', usable ? size.height : monitor.height);
     }
 
     // Fullscreen is handled per actor in the tick, because it is a property of
