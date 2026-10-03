@@ -1,11 +1,11 @@
 import Clutter from 'gi://Clutter';
-import Cogl from 'gi://Cogl';
 import GLib from 'gi://GLib';
 import GObject from 'gi://GObject';
+import Meta from 'gi://Meta';
 
+import * as Background from 'resource:///org/gnome/shell/ui/background.js';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import { Extension } from 'resource:///org/gnome/shell/extensions/extension.js';
-
 // Cogl speaks an old GLSL: no #version, no in/out, texture2D() rather than
 // texture(), and the fragment writes to cogl_color_out. Shadertoy assumes the
 // opposite of all four. This prelude is glued in front of every shader so the
@@ -110,17 +110,21 @@ class ShaderBgEffect extends Clutter.ShaderEffect {
     }
 });
 
+const EFFECT_NAME = 'shaderbg';
+
 export default class ShaderBgExtension extends Extension {
     enable() {
         this._settings = this.getSettings();
         this._sources = this._loadSources();
 
-        this._layers = [];
+        this._actors = new Map();
         this._tickId = 0;
         this._midnightId = 0;
         this._paused = false;
         this._time = 0;
         this._shaderSpeed = 1;
+        this._frame = 0;
+        this._source = null;
 
         this._settingsIds = [
             'changed::fps-cap',
@@ -136,14 +140,31 @@ export default class ShaderBgExtension extends Extension {
             'in-fullscreen-changed', () => this._updatePaused());
         this._sessionId = Main.sessionMode.connect(
             'updated', () => this._updatePaused());
-        this._monitorsId = Main.layoutManager.connect(
-            'monitors-changed', () => this._rebuild());
+
+        // The desktop is not the only background. The overview builds its own
+        // per workspace (workspace.js:978), which is why hooking only
+        // layoutManager._backgroundGroup left the old wallpaper showing there.
+        // Both go through this one factory, so patching it catches every
+        // background the Shell will ever make, including ones created later.
+        const self = this;
+        this._origCreateActor = Background.BackgroundManager.prototype._createBackgroundActor;
+        Background.BackgroundManager.prototype._createBackgroundActor = function () {
+            const actor = self._origCreateActor.call(this);
+            self._attach(actor);
+            return actor;
+        };
 
         this._rebuild();
         this._scheduleMidnight();
     }
 
     disable() {
+        if (this._origCreateActor) {
+            Background.BackgroundManager.prototype._createBackgroundActor =
+                this._origCreateActor;
+            this._origCreateActor = null;
+        }
+
         for (const id of this._settingsIds ?? [])
             this._settings.disconnect(id);
         this._settingsIds = null;
@@ -152,9 +173,7 @@ export default class ShaderBgExtension extends Extension {
             global.display.disconnect(this._displayId);
         if (this._sessionId)
             Main.sessionMode.disconnect(this._sessionId);
-        if (this._monitorsId)
-            Main.layoutManager.disconnect(this._monitorsId);
-        this._displayId = this._sessionId = this._monitorsId = 0;
+        this._displayId = this._sessionId = 0;
 
         this._stopTicker();
 
@@ -162,15 +181,13 @@ export default class ShaderBgExtension extends Extension {
             GLib.source_remove(this._midnightId);
         this._midnightId = 0;
 
-        this._destroyLayers();
+        this._detachAll();
         this._settings = null;
         this._sources = null;
     }
 
     // ---- shader set -------------------------------------------------------
 
-    // sources.json is generated from sources.nix at build time, so the set and
-    // the order it rotates in are part of the configuration, not of the code.
     _loadSources() {
         const path = GLib.build_filenamev([this.path, 'sources.json']);
         try {
@@ -183,12 +200,11 @@ export default class ShaderBgExtension extends Extension {
         } catch (err) {
             console.error(`shaderbg: cannot read sources.json — ${err}`);
         }
-        return FALLBACK;
+        return [{ file: 'drift.frag', name: 'drift', author: 'lucsoft', speed: 1 }];
     }
 
     // Days since the epoch, counted in local time. Monotonic across a day
-    // boundary, which is all the rotation needs — the absolute value never
-    // leaves this file except as a stored override marker.
+    // boundary, which is all the rotation needs.
     _today() {
         const now = new Date();
         const midnight = new Date(now.getFullYear(), now.getMonth(), now.getDate());
@@ -203,8 +219,8 @@ export default class ShaderBgExtension extends Extension {
         const index = this._settings.get_int('override-index');
         const day = this._settings.get_int('override-day');
 
-        // A hand-picked shader is deliberately tied to the day it was picked
-        // on, so "stay on this one" expires by itself at midnight.
+        // A hand-picked shader is tied to the day it was picked on, so "stay
+        // on this one" expires by itself at midnight.
         if (index >= 0 && index < count && day === this._today())
             return this._sources[index];
 
@@ -223,11 +239,41 @@ export default class ShaderBgExtension extends Extension {
         return null;
     }
 
-    // ---- actors -----------------------------------------------------------
+    // ---- attaching to the Shell's background actors -----------------------
+
+    _attach(actor) {
+        if (!this._source || this._actors.has(actor))
+            return;
+
+        actor.add_effect_with_name(EFFECT_NAME, new ShaderBgEffect(this._source));
+
+        // Keep the handler id: disable() has to take these back off again, or
+        // enabling a second time stacks another one on every surviving actor.
+        this._actors.set(actor, actor.connect('destroy', () => {
+            this._actors.delete(actor);
+        }));
+    }
+
+    _detachAll() {
+        for (const [actor, handlerId] of this._actors) {
+            actor.disconnect(handlerId);
+            if (actor.get_effect(EFFECT_NAME))
+                actor.remove_effect_by_name(EFFECT_NAME);
+        }
+        this._actors.clear();
+    }
+
+    // Walks the whole stage rather than one container: background actors live
+    // under window_group for the desktop and inside each workspace preview in
+    // the overview, and both may already exist when the extension is enabled.
+    _forEachBackground(fn, actor = global.stage) {
+        if (actor instanceof Meta.BackgroundActor)
+            fn(actor);
+        for (const child of actor.get_children())
+            this._forEachBackground(fn, child);
+    }
 
     _rebuild() {
-        this._destroyLayers();
-
         const entry = this._pick();
         if (!entry)
             return;
@@ -236,55 +282,31 @@ export default class ShaderBgExtension extends Extension {
         if (source === null)
             return;
 
+        // A ClutterShaderEffect takes its source exactly once
+        // (clutter_shader_effect_set_shader_source), so switching shaders
+        // means new effect objects, not new source on the old ones.
+        this._detachAll();
+
+        this._source = source;
         this._shaderSpeed = entry.speed ?? 1;
         this._time = 0;
+        this._frame = 0;
 
-        for (const monitor of Main.layoutManager.monitors) {
-            // ShaderEffect derives from ClutterOffscreenEffect: it filters what
-            // the actor paints, so an actor painting nothing never gets a pass.
-            // The opaque fill exists purely to give the shader a surface, and
-            // is overwritten by every fragment.
-            const actor = new Clutter.Actor({
-                x: monitor.x,
-                y: monitor.y,
-                width: monitor.width,
-                height: monitor.height,
-                reactive: false,
-                backgroundColor: new Cogl.Color({ red: 0, green: 0, blue: 0, alpha: 255 }),
-            });
-
-            const scale = monitor.geometry_scale || 1;
-            const effect = new ShaderBgEffect(source);
-            effect.setFloat('iResX', monitor.width * scale);
-            effect.setFloat('iResY', monitor.height * scale);
-            actor.add_effect(effect);
-
-            // _backgroundGroup sits at the bottom of window_group
-            // (ui/layout.js), and appending puts this above the stock
-            // MetaBackgroundActor but still below every window.
-            Main.layoutManager._backgroundGroup.add_child(actor);
-            this._layers.push({ actor, effect });
-        }
+        this._forEachBackground(a => this._attach(a));
 
         this._updatePaused();
         this._restartTicker();
     }
 
-    _destroyLayers() {
-        for (const { actor } of this._layers ?? [])
-            actor.destroy();
-        this._layers = [];
-    }
-
     // ---- driving the clock ------------------------------------------------
 
-    // A Clutter.Timeline would hang off the monitor's frame clock and so run at
-    // 144 Hz whether or not a wallpaper needs it. A plain timeout lets the
+    // A Clutter.Timeline would hang off the monitor's frame clock and so run
+    // at 144 Hz whether or not a wallpaper needs it. A plain timeout lets the
     // repaint rate be a setting.
     _restartTicker() {
         this._stopTicker();
 
-        if (this._paused || this._layers.length === 0)
+        if (this._paused || this._actors.size === 0)
             return;
 
         const fps = Math.max(1, this._settings.get_int('fps-cap'));
@@ -302,9 +324,9 @@ export default class ShaderBgExtension extends Extension {
         this._tickId = 0;
     }
 
-    // Time is accumulated rather than derived from a start stamp, so that
-    // changing the speed bends the curve from here on instead of making the
-    // shader jump, and so a pause costs nothing when it resumes.
+    // Time is accumulated rather than derived from a start stamp, so changing
+    // the speed bends the curve from here on instead of making the shader
+    // jump, and a pause costs nothing when it resumes.
     _tick() {
         const now = GLib.get_monotonic_time();
         const delta = (now - this._lastTick) / 1e6;
@@ -312,16 +334,26 @@ export default class ShaderBgExtension extends Extension {
 
         const speed = this._settings.get_double('speed') * this._shaderSpeed;
         this._time += delta * speed;
-        this._frame = (this._frame ?? 0) + 1;
+        this._frame++;
 
-        for (const { effect } of this._layers) {
+        for (const actor of this._actors.keys()) {
+            // The overview's workspace previews are background actors too, and
+            // there is one per workspace. Skipping the unmapped ones means they
+            // cost nothing until the overview is actually open.
+            if (!actor.mapped)
+                continue;
+
+            const effect = actor.get_effect(EFFECT_NAME);
+            if (!effect)
+                continue;
+
+            // Read the size every tick instead of at attach time: the overview
+            // previews are laid out after creation and resize with the monitor.
+            effect.setFloat('iResX', actor.width);
+            effect.setFloat('iResY', actor.height);
             effect.setFloat('iTime', this._time);
             effect.setFloat('iTimeDelta', delta * speed);
             effect.setFloat('iFrameF', this._frame);
-            // The effect's own queue, not the actor's: an offscreen effect
-            // caches its framebuffer, and only this invalidates that cache.
-            // Clutter.Actor.queue_repaint() is also simply gone in 50 —
-            // queue_redraw() is what replaced it.
             effect.queue_repaint();
         }
     }
