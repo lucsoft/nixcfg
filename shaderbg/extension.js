@@ -201,10 +201,9 @@ export default class ShaderBgExtension extends Extension {
         this._frame = 0;
         this._source = null;
 
-        this._settingsIds = [
-            'changed::fps-cap',
-            'changed::pause-fullscreen',
-        ].map(s => this._settings.connect(s, () => this._restartTicker()));
+        // fps-cap and pause-fullscreen are both read inside the tick now, so
+        // neither needs the clock torn down and rebuilt to take effect.
+        this._settingsIds = [];
 
         this._settingsIds.push(...[
             'changed::override-index',
@@ -229,21 +228,30 @@ export default class ShaderBgExtension extends Extension {
         // background the Shell will ever make, including ones created later.
         const self = this;
         this._origCreateActor = Background.BackgroundManager.prototype._createBackgroundActor;
-        Background.BackgroundManager.prototype._createBackgroundActor = function () {
+        this._patchedCreateActor = function () {
             const actor = self._origCreateActor.call(this);
             self._attach(actor);
             return actor;
         };
+        Background.BackgroundManager.prototype._createBackgroundActor =
+            this._patchedCreateActor;
 
         this._rebuild();
         this._scheduleMidnight();
     }
 
     disable() {
+        // Only unwind if the wrapper on the prototype is still ours. Another
+        // extension may have patched the same method after us, and restoring
+        // blindly would throw its version away.
         if (this._origCreateActor) {
-            Background.BackgroundManager.prototype._createBackgroundActor =
-                this._origCreateActor;
+            if (Background.BackgroundManager.prototype._createBackgroundActor ===
+                this._patchedCreateActor) {
+                Background.BackgroundManager.prototype._createBackgroundActor =
+                    this._origCreateActor;
+            }
             this._origCreateActor = null;
+            this._patchedCreateActor = null;
         }
 
         for (const id of this._settingsIds ?? [])
@@ -408,19 +416,30 @@ export default class ShaderBgExtension extends Extension {
         if (this._paused || this._actors.size === 0)
             return;
 
-        const fps = Math.max(1, this._settings.get_int('fps-cap'));
         this._lastTick = GLib.get_monotonic_time();
-        this._tickId = GLib.timeout_add(
-            GLib.PRIORITY_DEFAULT, Math.round(1000 / fps), () => {
-                this._tick();
-                return GLib.SOURCE_CONTINUE;
-            });
+        this._nextFrame = this._lastTick;
+
+        // Driven by the stage's frame clock rather than by wall time. A
+        // timeout asks for repaints whether or not the compositor is painting,
+        // so for a shader that cannot make the interval the requests just
+        // stack up — which is why capping the frame rate did nothing at all
+        // for the expensive ones. A timeline fires once per actual frame, so
+        // the cap below now means frames that get drawn.
+        //
+        // It also idles for free: when the background is culled behind a
+        // window, the repaints damage nothing, the stage stops updating, and
+        // the timeline stops being advanced.
+        this._timeline = Clutter.Timeline.new_for_actor(global.stage, 1000);
+        this._timeline.set_repeat_count(-1);
+        this._timeline.connect('new-frame', () => this._tick());
+        this._timeline.start();
     }
 
     _stopTicker() {
-        if (this._tickId)
-            GLib.source_remove(this._tickId);
-        this._tickId = 0;
+        if (this._timeline) {
+            this._timeline.stop();
+            this._timeline = null;
+        }
     }
 
     // Time is accumulated rather than derived from a start stamp, so changing
@@ -428,9 +447,30 @@ export default class ShaderBgExtension extends Extension {
     // jump, and a pause costs nothing when it resumes.
     _tick() {
         const now = GLib.get_monotonic_time();
+
+        // The cap is applied by skipping frames rather than by spacing a
+        // timer, so it stays honest when the display runs at 144 Hz and the
+        // shader can only manage a fraction of that.
+        //
+        // The deadline accumulates instead of being measured from the last
+        // tick. Comparing against the last tick looks equivalent and is not:
+        // at a cap equal to the refresh rate every frame lands a hair early,
+        // every one gets skipped, and 60 turns into 40. The one-millisecond
+        // slack absorbs that jitter; the clamp keeps a slow frame from
+        // building up a debt the next ones would have to sprint off.
+        const interval = 1e6 / Math.max(1, this._settings.get_int('fps-cap'));
+
+        if (now + 1000 < this._nextFrame)
+            return;
+
+        this._nextFrame += interval;
+        if (this._nextFrame < now)
+            this._nextFrame = now + interval;
+
         const delta = (now - this._lastTick) / 1e6;
         this._lastTick = now;
 
+        const pauseFullscreen = this._settings.get_boolean('pause-fullscreen');
         const speed = this._shaderSpeed;
         this._time += delta * speed;
         this._frame++;
@@ -440,6 +480,11 @@ export default class ShaderBgExtension extends Extension {
             // there is one per workspace. Skipping the unmapped ones means they
             // cost nothing until the overview is actually open.
             if (!actor.mapped)
+                continue;
+
+            // Per monitor, not per session: a game filling one screen is no
+            // reason to freeze the background on another.
+            if (pauseFullscreen && global.display.get_monitor_in_fullscreen(actor.monitor))
                 continue;
 
             const effect = actor.get_effect(EFFECT_NAME);
@@ -516,12 +561,10 @@ export default class ShaderBgExtension extends Extension {
         effect.setFloat('iExtentH', usable ? size.height : monitor.height);
     }
 
+    // Fullscreen is handled per actor in the tick, because it is a property of
+    // one monitor. What stops the clock outright is the session going away.
     _updatePaused() {
-        const hidden = this._settings.get_boolean('pause-fullscreen') &&
-            Main.layoutManager.monitors.some(
-                (_, i) => global.display.get_monitor_in_fullscreen(i));
-
-        const paused = hidden || Main.sessionMode.isLocked;
+        const paused = Main.sessionMode.isLocked;
         if (paused === this._paused)
             return;
 
