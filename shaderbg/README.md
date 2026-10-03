@@ -27,7 +27,7 @@ Cogl compiles an old GLSL. Shaders copied from Shadertoy usually need edits:
 | `#version`, `in`/`out` | not allowed, remove |
 | `texelFetch`, `textureLod` | unavailable |
 | output to `fragColor` | the prelude copies it to `cogl_color_out` |
-| multiple render passes | impossible, one `ClutterShaderEffect` is one pass |
+| multiple render passes | not built; one pipeline is one pass |
 | `iChannel0..3` textures | bound to a generated noise texture, see below |
 | `textureLod(s, uv, lod)` | `#define`d down to `texture2D(s, uv)`, the level is dropped |
 
@@ -113,11 +113,13 @@ here** rather than downloaded — noise is noise, a locally made one is
 equivalent where it matters, and nothing of Shadertoy's needs redistributing.
 A seeded xorshift fills the bytes, so it is the same texture every session.
 
-Binding it needs the effect's own pipeline, which an offscreen effect only has
-after it has painted once, so `_bindChannels` runs from the tick and skips any
-pipeline it has already seen. Layer 0 is the actor's own texture (the prelude's
-`tex`, never read); the four channels sit above it and the sampler uniform is
-simply the layer index.
+The channels are the pipeline's texture layers 0..3, bound once when the
+effect is built. A Cogl pipeline names its own samplers, so the prelude
+renames them — `#define iChannel0 cogl_sampler0` and so on — rather than
+declaring sampler uniforms to be set from outside. Layer 0 is always bound
+even for a shader that reads no channel at all: it existing is what makes
+Cogl emit `cogl_tex_coord0_in`, which is where the fragment coordinate comes
+from.
 
 Only shaders whose every channel is that noise are in the set. The ones
 wanting a photograph or a font atlas are not: binding noise would compile and
@@ -158,10 +160,13 @@ Frame rate, counted in a headless session via `stage::after-paint`:
 | a quarter of the fragments | 60 (ceiling) |
 
 So cost tracks fragment count almost exactly, and rendering the expensive
-shaders at half linear resolution — a quarter of the fragments — is the one
-lever that would work.
+shaders at half linear resolution — a quarter of the fragments — is the lever
+that works.
 
-**A `ClutterOffscreenEffect` cannot do it at all.** Not "the attempts did not
+### Why this is a ClutterEffect and not a ClutterShaderEffect
+
+`ClutterShaderEffect` derives from `ClutterOffscreenEffect`, and that class
+**cannot render at a lower resolution at all**. Not "the attempts did not
 work" — the mechanism forbids it. `clutter_offscreen_effect_pre_paint` ties
 three things together:
 
@@ -172,41 +177,89 @@ three things together:
 The viewport is the target and the modelview is scaled by stage over target,
 and those two cancel exactly. Pixel density is therefore pinned, and the only
 free parameter is `resource_scale` — which is `ceilf()`'d, so it can only go
-up.
+up. Shrinking the paint volume doubles the modelview scale to compensate,
+giving a **crop at full density**; overriding `vfunc_create_texture` changes
+only the texture, so rendering runs past it and is clipped. Three attempts,
+three different wrong pictures, one cause.
 
-Working through what that means for each way in:
+The way out is the one gnome-shell itself takes. `ShellBlurEffect` renders its
+blur at a third of the resolution, and its first line is the whole answer:
 
-- Shrinking the paint volume halves `target`, so the modelview scale doubles:
-  the content is drawn twice as large into a half-size buffer. That is a
-  **crop at full density**, not a downsample. Stretching the crop back out
-  afterwards magnifies half the picture.
-- `vfunc_create_texture` changes only the texture. The viewport still comes
-  from `target`, so rendering runs past the smaller texture and is clipped.
+    G_DEFINE_TYPE (ShellBlurEffect, shell_blur_effect, CLUTTER_TYPE_EFFECT)
 
-Both follow from the same coupling, which is why three attempts produced
-three different kinds of wrong picture and none of them produced a smaller
-one.
+A plain `ClutterEffect` derives nothing from anything. It is handed a paint
+node and sets the buffer, the viewport and the projection by hand:
 
-So the content route is not a fallback after failures, it is the only one
-that can work — and it is sound for the same reason the others are not: there
-the framebuffer, the viewport and the projection are set by hand instead of
-being derived from each other.
+    data->texture     = cogl_texture_2d_new_with_size (ctx, new_width, new_height);
+    data->framebuffer = cogl_offscreen_new_with_texture (data->texture);
+    graphene_matrix_scale (&projection, 2.0 / width, -2.0 / height, 1.f);
 
-Stop using `ShaderEffect` and replace the
-`MetaBackgroundActor`'s **content** instead — not add an actor, because a
-plain actor is not a `MetaCullable` and would lose the automatic "costs
-nothing behind a window" behaviour that is worth more than the downscale
-(53.9 W → 17.3 W, measured). A `Clutter.Content` whose `paint_content`
-renders through `clutter_layer_node_new_to_framebuffer` into an own texture
-keeps the actor, and therefore the culling, intact.
+So `ShaderBgEffect` derives from `Clutter.Effect` and implements one vfunc,
+`paint_node`, building two nested nodes:
 
-Every piece of that is introspected: `cogl_texture_2d_new_with_size`,
-`cogl_offscreen_new_with_texture`, `cogl_pipeline_new`, `cogl_snippet_new`
-with `COGL_SNIPPET_HOOK_FRAGMENT`, `cogl_pipeline_set_uniform_1f` and
-`clutter_layer_node_new_to_framebuffer`. It is a replacement of the render
-path, not a setting, and it wants doing in one deliberate pass.
+    LayerNode(buffer, present)   draws its children into the buffer, then
+      rectangle 0..actor         draws the buffer over the whole actor
+      PipelineNode(shader)
+        rectangle 0..buffer      fills the buffer, at the buffer's size
 
-One thing to know before starting: **downscaling alone saves nothing.** Load
+The shader runs once per buffer pixel and the buffer is stretched afterwards,
+with linear filtering. It stays an **effect on the background actor**, so
+`MetaBackgroundActor` keeps its own content and stays a `MetaCullable` — which
+matters more than the downscaling does, because Mutter dropping the background
+once a window covers it is worth 53.9 W against 17.3 W. Replacing the actor's
+content, or hanging a child actor off it, both lose that; the child-actor
+version was built and measured at 105 W with a window in front.
+
+One trap the move brings with it: a Cogl snippet's body is emitted **after**
+the shader source, so every `#define` the shader made is still in force over
+it. Two shaders in this set open by defining `t` as `iTime`, which rewrote the
+body's `cogl_tex_coord0_in.t` into `cogl_tex_coord0_in.iTime`. Everything of
+ours therefore lives in `_sb_fragment()`, declared ahead of the shader source
+where no macro of the shader's can reach it, and the body is one call.
+
+### Deciding which shaders get downscaled
+
+Not by watching the frame rate. A shader that reaches the cap has only said
+"fast enough", not how much room is left — at a cap of 30 and 30 fps a frame
+may have taken 1 ms or 30 ms. Raising the resolution to find out and lowering
+it again when it does not hold is an oscillation, not a measurement.
+
+So the frame *time* is measured, once per shader, with the cap lifted for two
+seconds, and the scale follows in one step:
+
+- **Always at full resolution**, whatever it is currently drawn at. A
+  downscaled shader is usually limited by the display rather than by itself,
+  and a frame time pinned to the refresh rate says nothing — a shader put on
+  a quarter could then never be shown to have earned its way back up.
+- **The gap between the effect's own paints**, not the stage's. Mutter stops
+  painting the background entirely once a window covers it, and counting
+  stage frames would read a culled background as a slow shader.
+- **Gaps over 400 ms are dropped** as the background not being on screen at
+  all. That cutoff is the one thing here that is a judgement rather than a
+  derivation: a shader genuinely slower than 2.5 fps is past helping and
+  belongs at the smallest step anyway.
+- **The median** of what is left, so one frame that waited on something else
+  does not drag the verdict.
+- The largest of 1.0, 0.5, 0.25 whose predicted time fits the budget, and
+  because cost is fragment count the prediction is the measured time times
+  the square of the step.
+- The budget is half the cap's interval, **but never below the refresh
+  interval**. The shader cannot paint faster than the display refreshes, so
+  asking for less than that is asking for something nothing can deliver — at
+  144 Hz and a cap of 120 the budget alone would be 4.2 ms against a floor of
+  6.9 ms, and every shader would be downscaled for failing an impossible test.
+
+Nothing is ever derived from the outcome of a previous change, which is what
+keeps it from swinging. The verdict is kept per shader *and* per screen
+resolution, so plugging in another monitor means a fresh measurement rather
+than a stale one.
+
+The square law understates the cheap end — oceanic takes 57 ms at full
+resolution and 32 ms at half, against 14 ms predicted, because part of each
+frame is fixed overhead. Understating is the safe direction: it never picks a
+step coarser than needed.
+
+One thing that is easy to get wrong: **downscaling alone saves nothing.** Load
 is fragments per frame times frames per second, and freeing capacity just
 raises the frame rate — measured, oceanic at half the fragments went from
 17.6 to 31.0 fps at an unchanged 51 W. The saving comes from pairing a lower
@@ -216,7 +269,7 @@ the card still sits at 98 %, because it does not clock down between frames.
 ## Why the set is smaller than the list it came from
 
 Of 52 picked shaders, 16 are in. The rest are not rejections, they are things
-a single `ClutterShaderEffect` cannot do yet:
+the render path does not do yet:
 
 | | count | why |
 |---|---|---|
@@ -225,12 +278,11 @@ a single `ClutterShaderEffect` cannot do yet:
 | needs a photo, font or audio channel | 15 | noise is not a substitute for those |
 | restrictive licence | 3 | see above |
 
-**Buffer passes are not impossible, only unbuilt.** One `ClutterShaderEffect`
-is one program and one pass, so they cannot come for free — but the pieces to
-do it by hand are all introspected: `cogl_texture_2d_new_with_size`,
-`cogl_offscreen_new_with_texture`, `cogl_pipeline_new`, `clutter_pipeline_node_new`
-and `clutter_paint_node_get_framebuffer`. What it takes is a small render
-graph: a framebuffer per buffer pass, each with its own program, ping-ponged
+**Buffer passes are not impossible, only unbuilt** — and markedly closer than
+they were. One pipeline is one program and one pass, but the effect now owns
+its framebuffer, its pipeline and its paint nodes outright, so a second pass
+is another of each rather than a new mechanism. What it takes is a small
+render graph: a framebuffer per buffer pass, each with its own program, ping-ponged
 between frames because a Shadertoy buffer reads its own previous frame, all
 resized with the monitor, and finally bound as the image pass's channels.
 That is a project, not an afternoon, and it would bring back the other

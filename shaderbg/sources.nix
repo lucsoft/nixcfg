@@ -14,6 +14,12 @@
 # reset button has somewhere to go back to, and a value that has settled can be
 # folded in here by multiplying it in and clearing the factor.
 #
+# `scale` is optional and almost never wanted. The extension times each shader
+# once and draws the demanding ones at half or a quarter of the screen's
+# resolution by itself; a number here overrides that measurement outright and
+# is the place to put a shader whose look depends on being drawn at full
+# resolution, or one the timing gets wrong.
+#
 # `id` is the Shadertoy id, as in https://www.shadertoy.com/view/<id>, and is
 # kept for attribution rather than for fetching: Shadertoy defaults to
 # CC BY-NC-SA and this repository is public. `null` marks a shader written

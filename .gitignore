@@ -5,3 +5,4 @@ bench-results/
 
 # python bytecode from running npins-ui.py directly
 __pycache__/
+.claude/

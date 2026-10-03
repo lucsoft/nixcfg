@@ -23,6 +23,28 @@
       </description>
     </key>
 
+    <key name="auto-downscale" type="b">
+      <default>true</default>
+      <summary>Draw demanding shaders at a lower resolution</summary>
+      <description>
+        Some shaders are far more work to draw than others. When this is on,
+        each one is timed once and the demanding ones are drawn at half or a
+        quarter of the screen's resolution and scaled back up, which looks
+        slightly softer and costs a great deal less. Shaders that can keep up
+        are left at full resolution.
+      </description>
+    </key>
+
+    <key name="scales" type="a{sd}">
+      <default>{}</default>
+      <summary>The resolution each shader was found to manage</summary>
+      <description>
+        What the timing came out at, remembered per shader and per screen
+        resolution so it is not measured again at every login. Clearing this
+        makes every shader be timed afresh.
+      </description>
+    </key>
+
     <key name="pause-fullscreen" type="b">
       <default>true</default>
       <summary>Pause while a window is fullscreen</summary>

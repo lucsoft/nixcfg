@@ -89,7 +89,7 @@ export default class ShaderBgPreferences extends ExtensionPreferences {
 
             row.title = entry ? entry.name : 'No shaders configured';
             row.subtitle = entry
-                ? (entry.author ?? 'unknown')
+                ? `${entry.author ?? 'unknown'} · ${this._scaleLabel(settings, entry)}`
                 : 'No shaders available';
 
             link.visible = !!entry?.id;
@@ -140,12 +140,42 @@ export default class ShaderBgPreferences extends ExtensionPreferences {
         // Picking another shader in the list below has to move this group with
         // it, or the slider would quietly keep editing the one that was running
         // when the window opened.
-        const ids = ['changed::override-index', 'changed::override-day']
-            .map(s => settings.connect(s, refresh));
+        const ids = [
+            'changed::override-index',
+            'changed::override-day',
+            'changed::scales',
+            'changed::auto-downscale',
+        ].map(s => settings.connect(s, refresh));
         group.connect('destroy', () => ids.forEach(id => settings.disconnect(id)));
 
         refresh();
         return group;
+    }
+
+    // What resolution this shader ends up being drawn at. The extension keys
+    // its measurements by shader *and* screen resolution, and this window has
+    // no reliable way to know which screen the background is on — so a single
+    // match is reported and several are not, which is honest and is also the
+    // case that never comes up on one monitor.
+    _scaleLabel(settings, entry) {
+        const names = {
+            1: 'full resolution',
+            0.5: 'half resolution',
+            0.25: 'quarter resolution',
+        };
+
+        if (typeof entry.scale === 'number')
+            return `${names[entry.scale] ?? `${entry.scale}× resolution`}, set by hand`;
+
+        if (!settings.get_boolean('auto-downscale'))
+            return 'full resolution';
+
+        const measured = settings.get_value('scales').deepUnpack();
+        const hits = Object.keys(measured).filter(k => k.startsWith(`${entry.file}@`));
+        if (hits.length !== 1)
+            return 'not timed yet';
+
+        return names[measured[hits[0]]] ?? `${measured[hits[0]]}× resolution`;
     }
 
     _playbackGroup(settings) {
@@ -169,6 +199,32 @@ export default class ShaderBgPreferences extends ExtensionPreferences {
         });
         settings.bind('pause-fullscreen', pause, 'active', Gio.SettingsBindFlags.DEFAULT);
         group.add(pause);
+
+        const downscale = new Adw.SwitchRow({
+            title: 'Lower the resolution of demanding shaders',
+            subtitle: 'Each shader is timed once; the heavy ones are drawn ' +
+                'smaller and scaled up, which looks softer and costs much less',
+        });
+
+        // Each shader is only timed once, so there has to be a way to ask for
+        // it again — after a driver update, or simply because the verdict
+        // looks wrong.
+        const forget = new Gtk.Button({
+            icon_name: 'view-refresh-symbolic',
+            tooltip_text: 'Time every shader again',
+            valign: Gtk.Align.CENTER,
+            css_classes: ['flat'],
+        });
+        forget.connect('clicked', () =>
+            settings.set_value('scales', new GLib.Variant('a{sd}', {})));
+
+        settings.bind('auto-downscale', downscale, 'active',
+            Gio.SettingsBindFlags.DEFAULT);
+        settings.bind('auto-downscale', forget, 'sensitive',
+            Gio.SettingsBindFlags.GET);
+
+        downscale.add_suffix(forget);
+        group.add(downscale);
 
         return group;
     }
