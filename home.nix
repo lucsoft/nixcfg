@@ -433,12 +433,31 @@ in
   #                 as a gamescope layer, so the overlay is composited over the
   #                 game instead of injected into it.
   #
+  #   --xwayland-count 2
+  #                 two X displays instead of one, which is what makes Steam
+  #                 track the window size. gamescope only pushes a new mode to
+  #                 display 0 — Steam's — when more than one exists; with the
+  #                 default single display the nested resolution is fixed at
+  #                 startup and a resize just scales the same buffer up. With
+  #                 two, a drag reaches Steam as an ordinary monitor mode
+  #                 change, the same event as repatching a cable, and its UI
+  #                 relayouts. Games land on display 1 and keep -W/-H, so
+  #                 resizing does not disturb one that is running.
+  #   --force-grab-cursor
+  #                 locks the pointer to the window. gamescope normally grabs
+  #                 only once the client hides its cursor, and explicitly
+  #                 exempts Steam's own windows from that test, so Big Picture
+  #                 would never grab on its own. This is a real Wayland
+  #                 pointer lock with a persistent lifetime: mutter drops it
+  #                 whenever the window loses focus, so Alt+Tab still gets the
+  #                 mouse back. -g is deliberately not here — that grabs the
+  #                 keyboard too and would take Alt+Tab away with it.
+  #
   # No -f and no -b on purpose — those are what would pin the window. Left
   # alone, the nested window is an ordinary resizable one: gamescope's Wayland
   # backend wraps itself in a libdecor frame, and its configure handler writes
-  # the new content size straight into the output size, so dragging the edge
-  # re-renders at the new resolution instead of scaling a fixed buffer. -W/-H
-  # only pick the size it opens at.
+  # the new content size straight into the output size. -W/-H only pick the
+  # size it opens at.
   #
   # The Steam flags are the SteamOS session's, minus two. -gamepadui is the one
   # that actually swaps the UI over; -steamos3 unlocks the SteamOS half of it
@@ -452,7 +471,7 @@ in
     name = "Steam Gaming Mode";
     genericName = "Steam Deck UI";
     comment = "Steam's gamepad UI, in a resizable gamescope window";
-    exec = "gamescope -W 1920 -H 1080 -e --mangoapp -- steam -steamos3 -steamdeck -gamepadui";
+    exec = "gamescope -W 1920 -H 1080 --xwayland-count 2 --force-grab-cursor -e --mangoapp -- steam -steamos3 -steamdeck -gamepadui";
     icon = "steam";
     terminal = false;
     categories = [ "Game" ];
