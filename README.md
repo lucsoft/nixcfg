@@ -35,7 +35,7 @@ repo configures graphics — there is no proprietary driver to pull in.
 | `gamescope/` | one patch: let the window set both Xwayland modes, not Steam |
 | `gnome-shell.css` | panel pills and dash outline, loaded over the stock Shell theme |
 | `home.nix` | Home Manager — my packages, dotfiles and user settings |
-| `npins/sources.json` | the pins: nixpkgs, nixpkgs-unstable, home-manager, helium, gnome-rounded-blur, steamos-manager, jovian |
+| `npins/sources.json` | the pins: nixpkgs, nixpkgs-unstable, home-manager, helium, gnome-rounded-blur, steamos-manager |
 
 `npins/default.nix` is generated — never edit it by hand.
 
