@@ -48,20 +48,34 @@ Two things that look like bugs and are not:
 
 Shadertoy sits behind a Cloudflare managed challenge. Every path answers HTTP
 403 to a plain client — `/api/v1/` and the front page included, because the
-challenge is in front of the application, so an API key does not help on its
-own. It has to come from a browser.
+challenge sits in front of the application. An API key does not help: the
+block happens before the request ever reaches Shadertoy. It has to come from a
+browser that has solved the challenge.
 
-1. Create a key at <https://www.shadertoy.com/howto> while logged in.
-2. Open any shadertoy.com page and its browser console.
-3. Paste the key into `import.js`, paste the file, run it.
-4. A `shaders.json` downloads with code, title and author for every id.
+No key is needed, though. `import.js` uses the same internal endpoint the site
+itself uses, same-origin, with the clearance cookie the browser already holds:
+open any shadertoy.com page, paste the file into the console, and a
+`shaders.json` downloads with every pass of every shader.
 
-The key is needed once and must not be committed.
+That can be driven rather than pasted, which is how this set was imported:
+start the browser with `--remote-debugging-port=9222` and a throwaway
+`--user-data-dir`, then send the same expression over the devtools protocol.
+A plain Chromium passes the challenge on its own, so no login is involved.
 
-Then split the JSON into `shaders/*.frag`, add the entries to `sources.nix`,
-and set each `speed`. `import.js` records every render pass, not just the image
-one, so a shader that needs a buffer pass or a channel texture is visible
-before it fails to compile.
+Then split the JSON into `shaders/*.frag` and add the entries to `sources.nix`.
+`import.js` records every render pass, not just the image one, so a shader that
+needs a buffer pass or a channel texture is visible before it fails to render.
+
+## Speed
+
+Each shader has its own speed, set once and remembered. `sources.nix` carries
+the value a shader ships with; the preferences write into the `speeds`
+GSettings key, which holds only the ones actually tuned. That split is what
+lets the reset button exist, and it keeps the committed file meaningful
+instead of being overwritten by every nudge of the slider.
+
+Both scale the time base rather than the repaint rate, so slowing a shader
+down does not make it stutter.
 
 ## Attribution
 

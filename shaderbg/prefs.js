@@ -49,35 +49,21 @@ export default class ShaderBgPreferences extends ExtensionPreferences {
         return sources[((day % sources.length) + sources.length) % sources.length];
     }
 
+    // Speed belongs to the shader, not to the extension: each one is tuned once
+    // and remembered. sources.nix holds what a shader ships with, the `speeds`
+    // key holds only the ones actually adjusted, so an untouched shader keeps
+    // following the committed value and the reset button has something to go
+    // back to.
     _todayGroup(settings, sources) {
         const group = new Adw.PreferencesGroup({ title: 'Running now' });
-        const entry = this._current(settings, sources);
 
-        const row = new Adw.ActionRow({
-            title: entry ? entry.name : 'No shaders configured',
-            subtitle: entry
-                ? `${entry.author ?? 'unknown'} · speed ${entry.speed ?? 1}`
-                : 'sources.nix is empty, falling back to drift.frag',
+        const row = new Adw.ActionRow();
+        const link = new Gtk.LinkButton({
+            label: 'Shadertoy',
+            valign: Gtk.Align.CENTER,
         });
-
-        if (entry?.id) {
-            const link = new Gtk.LinkButton({
-                label: 'Shadertoy',
-                uri: `https://www.shadertoy.com/view/${entry.id}`,
-                valign: Gtk.Align.CENTER,
-            });
-            row.add_suffix(link);
-        }
-
+        row.add_suffix(link);
         group.add(row);
-        return group;
-    }
-
-    _playbackGroup(settings) {
-        const group = new Adw.PreferencesGroup({
-            title: 'Playback',
-            description: 'Speed multiplies the per-shader value from sources.nix.',
-        });
 
         const speed = new Adw.SpinRow({
             title: 'Speed',
@@ -87,8 +73,80 @@ export default class ShaderBgPreferences extends ExtensionPreferences {
             }),
             digits: 2,
         });
-        settings.bind('speed', speed, 'value', Gio.SettingsBindFlags.DEFAULT);
+
+        const reset = new Gtk.Button({
+            icon_name: 'edit-undo-symbolic',
+            valign: Gtk.Align.CENTER,
+            css_classes: ['flat'],
+        });
+        speed.add_suffix(reset);
         group.add(speed);
+
+        let entry = null;
+        let settingValue = false;
+
+        const refresh = () => {
+            entry = this._current(settings, sources);
+
+            row.title = entry ? entry.name : 'No shaders configured';
+            row.subtitle = entry
+                ? (entry.author ?? 'unknown')
+                : 'sources.nix is empty, falling back to drift.frag';
+
+            link.visible = !!entry?.id;
+            if (entry?.id)
+                link.uri = `https://www.shadertoy.com/view/${entry.id}`;
+
+            speed.sensitive = !!entry;
+            reset.tooltip_text = entry
+                ? `Back to ${entry.speed ?? 1}, the value in sources.nix`
+                : '';
+
+            if (!entry)
+                return;
+
+            const tuned = settings.get_value('speeds').deepUnpack();
+
+            // Guard the write-back: assigning to .value fires notify::value,
+            // which would otherwise store the shader's own default as if it
+            // had been tuned by hand.
+            settingValue = true;
+            speed.value = tuned[entry.file] ?? entry.speed ?? 1;
+            settingValue = false;
+        };
+
+        speed.connect('notify::value', () => {
+            if (settingValue || !entry)
+                return;
+            const next = settings.get_value('speeds').deepUnpack();
+            next[entry.file] = speed.value;
+            settings.set_value('speeds', new GLib.Variant('a{sd}', next));
+        });
+
+        reset.connect('clicked', () => {
+            if (!entry)
+                return;
+            const next = settings.get_value('speeds').deepUnpack();
+            delete next[entry.file];
+            settings.set_value('speeds', new GLib.Variant('a{sd}', next));
+            refresh();
+        });
+
+        // Picking another shader in the list below has to move this group with
+        // it, or the slider would quietly keep editing the one that was running
+        // when the window opened.
+        const ids = ['changed::override-index', 'changed::override-day']
+            .map(s => settings.connect(s, refresh));
+        group.connect('destroy', () => ids.forEach(id => settings.disconnect(id)));
+
+        refresh();
+        return group;
+    }
+
+    _playbackGroup(settings) {
+        const group = new Adw.PreferencesGroup({
+            title: 'Playback',
+        });
 
         const fps = new Adw.SpinRow({
             title: 'Frames per second',
@@ -146,10 +204,21 @@ export default class ShaderBgPreferences extends ExtensionPreferences {
 
             const row = new Adw.ActionRow({
                 title: entry.name ?? entry.file,
-                subtitle: entry.author ?? '',
                 activatable_widget: check,
             });
             row.add_prefix(check);
+
+            // Showing the speed here is what makes the set reviewable at a
+            // glance: which ones have been tuned, and how far.
+            const describe = () => {
+                const tuned = settings.get_value('speeds').deepUnpack();
+                const value = tuned[entry.file] ?? entry.speed ?? 1;
+                const marker = entry.file in tuned ? '' : ' (default)';
+                row.subtitle = `${entry.author ?? 'unknown'} · ${value}×${marker}`;
+            };
+            const speedsId = settings.connect('changed::speeds', describe);
+            row.connect('destroy', () => settings.disconnect(speedsId));
+            describe();
 
             check.connect('toggled', () => {
                 if (!check.active)

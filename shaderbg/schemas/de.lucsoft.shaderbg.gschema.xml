@@ -2,14 +2,14 @@
 <schemalist>
   <schema id="de.lucsoft.shaderbg" path="/de/lucsoft/shaderbg/">
 
-    <key name="speed" type="d">
-      <default>1.0</default>
-      <range min="0.05" max="2.0"/>
-      <summary>Global speed multiplier</summary>
+    <key name="speeds" type="a{sd}">
+      <default>{}</default>
+      <summary>Per-shader speed, keyed by file name</summary>
       <description>
-        Multiplied on top of the per-shader speed from sources.nix. Scales the
-        time base, not the repaint rate, so slowing a shader down does not make
-        it stutter.
+        Set once per shader and remembered. A shader with no entry here runs at
+        the speed sources.nix gives it, so this holds only what has actually
+        been tuned. Scales the time base, not the repaint rate, which is why
+        slowing a shader down does not make it stutter.
       </description>
     </key>
 

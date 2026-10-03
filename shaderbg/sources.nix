@@ -3,12 +3,16 @@
 # every later entry lands on, which does not matter — the rotation keeps no
 # state and nothing is owed to a particular date.
 #
-# `speed` is the per-shader time scale, and it is the field that actually gets
-# edited. Shadertoy shaders are authored against a small preview pane and a
-# good many of them are unwatchable at full size and full speed; the slider in
-# the extension's preferences only multiplies on top of this, so the per-shader
-# value is where a shader is made livable. Everything imported starts at 0.5 as
-# a deliberately slow first guess, not as a judgement about that shader.
+# `speed` is the time scale a shader ships with. Shadertoy shaders are authored
+# against a small preview pane and a good many of them are unwatchable at full
+# size and full speed, so everything imported starts at 0.5 — a deliberately
+# slow first guess, not a judgement about that shader.
+#
+# Tuning happens in the extension's preferences, which writes into the `speeds`
+# GSettings key rather than here: one value per shader, set once, remembered.
+# A shader with no entry there follows the number below, which is also what the
+# reset button goes back to. Once a value has settled, move it into this file
+# so it survives as part of the configuration.
 #
 # `id` is the Shadertoy id, as in https://www.shadertoy.com/view/<id>, and is
 # kept for attribution rather than for fetching: Shadertoy defaults to

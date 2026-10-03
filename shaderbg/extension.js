@@ -132,6 +132,7 @@ export default class ShaderBgExtension extends Extension {
         this._paused = false;
         this._time = 0;
         this._shaderSpeed = 1;
+        this._entry = null;
         this._frame = 0;
         this._source = null;
 
@@ -144,6 +145,12 @@ export default class ShaderBgExtension extends Extension {
             'changed::override-index',
             'changed::override-day',
         ].map(s => this._settings.connect(s, () => this._rebuild())));
+
+        // Re-read rather than rebuild: the speed only scales the time base, so
+        // there is no reason to throw away the effects and start the shader over.
+        this._settingsIds.push(this._settings.connect('changed::speeds', () => {
+            this._shaderSpeed = this._speedOf(this._entry);
+        }));
 
         this._displayId = global.display.connect(
             'in-fullscreen-changed', () => this._updatePaused());
@@ -236,6 +243,17 @@ export default class ShaderBgExtension extends Extension {
         return this._sources[((this._today() % count) + count) % count];
     }
 
+    // sources.nix carries the speed a shader ships with; the preferences write
+    // into `speeds` when one gets tuned. Only tuned shaders appear there, so
+    // the committed value stays the fallback rather than being copied around.
+    _speedOf(entry) {
+        if (!entry)
+            return 1;
+
+        const tuned = this._settings.get_value('speeds').deepUnpack();
+        return tuned[entry.file] ?? entry.speed ?? 1;
+    }
+
     _readShader(file) {
         const path = GLib.build_filenamev([this.path, 'shaders', file]);
         try {
@@ -297,7 +315,8 @@ export default class ShaderBgExtension extends Extension {
         this._detachAll();
 
         this._source = source;
-        this._shaderSpeed = entry.speed ?? 1;
+        this._entry = entry;
+        this._shaderSpeed = this._speedOf(entry);
         this._time = 0;
         this._frame = 0;
 
@@ -341,7 +360,7 @@ export default class ShaderBgExtension extends Extension {
         const delta = (now - this._lastTick) / 1e6;
         this._lastTick = now;
 
-        const speed = this._settings.get_double('speed') * this._shaderSpeed;
+        const speed = this._shaderSpeed;
         this._time += delta * speed;
         this._frame++;
 
