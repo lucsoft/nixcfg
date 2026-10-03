@@ -77,11 +77,44 @@ instead of being overwritten by every nudge of the slider.
 Both scale the time base rather than the repaint rate, so slowing a shader
 down does not make it stutter.
 
-## Attribution
+## Attribution, and what cannot go in here
 
 Shadertoy defaults to CC BY-NC-SA 3.0. This repository is public, so every
 entry in `sources.nix` carries its `id` and `author`, and the preferences
 window links back to the original.
+
+That default is not universal, and the exceptions matter. Several well-known
+authors — Inigo Quilez among them — attach a licence that reads:
+
+> You cannot host, display, distribute or share this Work neither as is or
+> altered, in any form including physical and digital.
+
+Checking into a public repository is hosting and distributing. **Any shader
+carrying that notice has to stay out**, however good it looks. Two had already
+been committed before anyone read the headers; they were removed again.
+
+So the import is not finished when a shader compiles. Grep the code before
+adding it, remembering that the notice wraps across lines:
+
+    tr '\n' ' ' < shader.frag |
+      grep -iE 'cannot host, display, distribute|sole copyright owner'
+
+## Why the set is smaller than the list it came from
+
+Of 52 picked shaders, 16 are in. The rest are not rejections, they are things
+a single `ClutterShaderEffect` cannot do yet:
+
+| | count | why |
+|---|---|---|
+| in the set | 16 | single image pass, no inputs |
+| needs a buffer pass | 14 | multipass; one effect is one pass |
+| needs an `iChannel` texture | 20 | no texture is bound to the channels |
+| restrictive licence | 2 | see above |
+
+The channel ones are the big block, and they are reachable:
+`clutter_offscreen_effect_get_pipeline` is introspected, so Shadertoy's stock
+textures could be bound to layers 1–4 and the `iChannelN` uniforms pointed at
+them. That would roughly double the set.
 
 ## Testing
 

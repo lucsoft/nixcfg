@@ -79,13 +79,6 @@
     speed = 0.5;
   }
   {
-    id = "mds3DX";
-    file = "generative-art-deco-4.frag";
-    name = "generative art deco 4";
-    author = "morisil";
-    speed = 0.5;
-  }
-  {
     id = "MdyGzR";
     file = "lights-in-smoke.frag";
     name = "Lights in Smoke";
@@ -121,13 +114,6 @@
     speed = 0.5;
   }
   {
-    id = "lsl3RH";
-    file = "warping-procedural-2.frag";
-    name = "Warping - procedural 2";
-    author = "iq";
-    speed = 0.5;
-  }
-  {
     id = "3l23Rh";
     file = "protean-clouds.frag";
     name = "Protean clouds";
@@ -139,6 +125,13 @@
     file = "shader-art-coding-introduction.frag";
     name = "Shader Art Coding Introduction";
     author = "kishimisu";
+    speed = 0.5;
+  }
+  {
+    id = "XsXXDn";
+    file = "creation-by-silexars.frag";
+    name = "Creation by Silexars";
+    author = "Danguafer";
     speed = 0.5;
   }
 ]
