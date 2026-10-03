@@ -118,6 +118,61 @@ Only shaders whose every channel is that noise are in the set. The ones
 wanting a photograph or a font atlas are not: binding noise would compile and
 run, and look nothing like what their author made.
 
+## What a shader costs
+
+Measured on the RX 7800 XT in a live session at 3440×1440, 60 fps cap, with
+nothing else running. Baseline without the extension: **10.7 W**.
+
+| | over baseline | GPU |
+|---|---:|---:|
+| oceanic, tiny-clouds, sun-surface, protean-clouds | +39 … +46 W | 92–99 % |
+| structured-vol-sampling, clearly-a-bug | +31 … +37 W | 67–78 % |
+| star-nest, 2d-voxels | +22 … +24 W | 61–63 % |
+| the other sixteen | +3 … +17 W | 9–30 % |
+
+A 13× spread, in two clean groups with almost nothing between them.
+
+Three things that are not levers, each of which looked like one:
+
+- **Speed.** It scales the time base. The same fragments are computed either
+  way, so a shader at 0.05 costs exactly what it costs at 1.0.
+- **Frame rate.** Measured oceanic at 60, 30, 20, 10, 5 and 1 fps: 53–57 W and
+  96–100 % every time. Once a frame takes longer than the interval, asking for
+  fewer frames changes nothing.
+- **Watts, as a measurement.** At 100 % GPU the power figure saturates, so it
+  cannot tell a shader that is 2× too slow from one that is 10× too slow.
+  Halving the fragment count showed *no* change in watts — and a 2× change in
+  frame rate. Count frames, not watts.
+
+Frame rate, counted in a headless session via `stage::after-paint`:
+
+| oceanic at | fps |
+|---|---:|
+| full resolution | 18 |
+| half the fragments | 37 |
+| a quarter of the fragments | 60 (ceiling) |
+
+So cost tracks fragment count almost exactly, and rendering the expensive
+shaders at half linear resolution — a quarter of the fragments — is the one
+lever that would work.
+
+**It is not implemented.** Two attempts failed:
+
+- `vfunc_create_texture` is documented for *bigger* textures only, and the
+  viewport is set from the requested target size rather than the texture's
+  (`clutter-offscreen-effect.c:424`), so a smaller texture is clipped rather
+  than scaled.
+- Shrinking the paint volume in `vfunc_modify_paint_volume` does shrink the
+  framebuffer and does raise the frame rate — oceanic went 18 → 32 fps — but
+  Clutter then draws the smaller buffer at its own size, so the shader covers
+  part of the screen and the rest is framebuffer garbage. Overriding
+  `vfunc_paint_target` to stretch it back came out black.
+
+The pieces for doing it properly are all introspected —
+`cogl_texture_2d_new_with_size`, `cogl_offscreen_new_with_texture`,
+`clutter_layer_node_new_to_framebuffer` — but it means rendering through an
+own paint node tree rather than a `ShaderEffect`.
+
 ## Why the set is smaller than the list it came from
 
 Of 52 picked shaders, 16 are in. The rest are not rejections, they are things
