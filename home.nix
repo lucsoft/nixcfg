@@ -236,6 +236,17 @@ in
       ];
     };
 
+  # Widevine, which the DRM-protected tracks on SoundCloud ask for. Helium
+  # ships the CDM as a component instead of bundling it, so dropping the
+  # library beside the binary registers nothing — tried, measured. What the
+  # browser does read at startup is the hint file its component updater would
+  # have written, naming the directory the CDM sits in. That updater never
+  # runs here, so the file is ours to write.
+  home.file.".config/net.imput.helium/WidevineCdm/latest-component-updated-widevine-cdm".text =
+    builtins.toJSON {
+      Path = "${pkgs.widevine-cdm}/share/google/chrome/WidevineCdm";
+    };
+
 
   programs.git = {
     enable = true;
