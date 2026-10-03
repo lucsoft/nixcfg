@@ -202,9 +202,11 @@ export default class ShaderBgExtension extends Extension {
         this._frame = 0;
         this._source = null;
 
-        // fps-cap and pause-fullscreen are both read inside the tick now, so
-        // neither needs the clock torn down and rebuilt to take effect.
-        this._settingsIds = [];
+        // pause-fullscreen is read inside the tick, but the timer's interval is
+        // the cap, so changing that one has to rebuild it.
+        this._settingsIds = [
+            this._settings.connect('changed::fps-cap', () => this._restartTicker()),
+        ];
 
         this._settingsIds.push(...[
             'changed::override-index',
@@ -420,29 +422,32 @@ export default class ShaderBgExtension extends Extension {
             return;
 
         this._lastTick = GLib.get_monotonic_time();
-        this._nextFrame = this._lastTick;
 
-        // Driven by the stage's frame clock rather than by wall time. A
-        // timeout asks for repaints whether or not the compositor is painting,
-        // so for a shader that cannot make the interval the requests just
-        // stack up — which is why capping the frame rate did nothing at all
-        // for the expensive ones. A timeline fires once per actual frame, so
-        // the cap below now means frames that get drawn.
+        // A timer, deliberately, and not a Clutter.Timeline on the frame
+        // clock. The timeline paces exactly — measured 60.0, 30.1, 15.2 and
+        // 5.0 fps against a timer's 40, 24, 13.5 and 4.8 — but it achieves
+        // that by being advanced every single frame, which keeps the stage
+        // updating at the display's rate whatever the cap says. That showed
+        // up as a floor of about 20 % GPU that would not move between a cap
+        // of 60 and a cap of 5: not the shader, just the compositor never
+        // being allowed back to sleep.
         //
-        // It also idles for free: when the background is culled behind a
-        // window, the repaints damage nothing, the stage stops updating, and
-        // the timeline stops being advanced.
-        this._timeline = Clutter.Timeline.new_for_actor(global.stage, 1000);
-        this._timeline.set_repeat_count(-1);
-        this._timeline.connect('new-frame', () => this._tick());
-        this._timeline.start();
+        // A timer wakes it only when a frame is wanted. The price is that
+        // requests land between vblanks, so the achieved rate quantises to
+        // the refresh rate and comes out under the cap. For a wallpaper that
+        // is much the better trade.
+        const fps = Math.max(1, this._settings.get_int('fps-cap'));
+        this._tickId = GLib.timeout_add(
+            GLib.PRIORITY_DEFAULT, Math.round(1000 / fps), () => {
+                this._tick();
+                return GLib.SOURCE_CONTINUE;
+            });
     }
 
     _stopTicker() {
-        if (this._timeline) {
-            this._timeline.stop();
-            this._timeline = null;
-        }
+        if (this._tickId)
+            GLib.source_remove(this._tickId);
+        this._tickId = 0;
     }
 
     // Time is accumulated rather than derived from a start stamp, so changing
@@ -450,25 +455,6 @@ export default class ShaderBgExtension extends Extension {
     // jump, and a pause costs nothing when it resumes.
     _tick() {
         const now = GLib.get_monotonic_time();
-
-        // The cap is applied by skipping frames rather than by spacing a
-        // timer, so it stays honest when the display runs at 144 Hz and the
-        // shader can only manage a fraction of that.
-        //
-        // The deadline accumulates instead of being measured from the last
-        // tick. Comparing against the last tick looks equivalent and is not:
-        // at a cap equal to the refresh rate every frame lands a hair early,
-        // every one gets skipped, and 60 turns into 40. The one-millisecond
-        // slack absorbs that jitter; the clamp keeps a slow frame from
-        // building up a debt the next ones would have to sprint off.
-        const interval = 1e6 / Math.max(1, this._settings.get_int('fps-cap'));
-
-        if (now + 1000 < this._nextFrame)
-            return;
-
-        this._nextFrame += interval;
-        if (this._nextFrame < now)
-            this._nextFrame = now + interval;
 
         const delta = (now - this._lastTick) / 1e6;
         this._lastTick = now;
