@@ -1,0 +1,38 @@
+Let GAMESCOPE_IGNORE_STEAM_MODE_CONTROL drop Steam's mode requests.
+
+In Gaming Mode the Steam client asserts a resolution of its own through
+the GAMESCOPE_XWAYLAND_MODE_CONTROL root property, and re-asserts it
+whenever the mode changes underneath it. On a Deck that is right: the
+panel is fixed and Steam owns it. In a resizable nested window it fights
+the window manager, and the window wins the frame while Steam wins the
+resolution -- so dragging the edge only scales a stale buffer.
+
+Not sent upstream: gating on an environment variable suits one machine,
+upstream would want this driven by the backend reporting whether its
+output size is user-controlled.
+
+--- a/src/steamcompmgr.cpp
++++ b/src/steamcompmgr.cpp
+@@ -6066,9 +6066,19 @@
+ 			{
+ 				bool root_size_identical = server->ctx->root_width == width && server->ctx->root_height == height;
+ 
+-				wlserver_lock();
+-				wlserver_set_xwayland_server_mode( server_idx, width, height, g_nOutputRefresh );
+-				wlserver_unlock();
++				if ( getenv( "GAMESCOPE_IGNORE_STEAM_MODE_CONTROL" ) )
++				{
++					// Steam owns the mode on a Deck. In a resizable nested
++					// window the user owns it, so drop the request and still
++					// clear the property so Steam does not keep retrying.
++					root_size_identical = true;
++				}
++				else
++				{
++					wlserver_lock();
++					wlserver_set_xwayland_server_mode( server_idx, width, height, g_nOutputRefresh );
++					wlserver_unlock();
++				}
+ 
+ 				if ( root_size_identical )
+ 				{

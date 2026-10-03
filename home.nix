@@ -255,14 +255,16 @@ in
     };
   };
 
-  # --xwayland-count 2 is what makes Steam follow a resize: it sees a mode
-  # change on its own X display. --force-grab-cursor locks the pointer, which
-  # Steam is otherwise special-cased out of.
+  # Resizing the window needs all three of these together: --xwayland-count 2
+  # so gamescope reports the new size to Steam's X display at all, the patched
+  # gamescope from configuration.nix, and the variable that arms the patch --
+  # otherwise Steam asserts 1920x1080 back over every drag.
+  # --force-grab-cursor locks the pointer, which Steam is special-cased out of.
   xdg.desktopEntries.steam-gamingmode = {
     name = "Steam Gaming Mode";
     genericName = "Steam Deck UI";
     comment = "Steam's gamepad UI, in a resizable gamescope window";
-    exec = "gamescope -W 1920 -H 1080 --xwayland-count 2 --force-grab-cursor -e --mangoapp -- steam -steamos3 -steamdeck -gamepadui";
+    exec = "env GAMESCOPE_IGNORE_STEAM_MODE_CONTROL=1 gamescope -W 1920 -H 1080 --xwayland-count 2 --force-grab-cursor -e --mangoapp -- steam -steamos3 -steamdeck -gamepadui";
     icon = "steam";
     terminal = false;
     categories = [ "Game" ];

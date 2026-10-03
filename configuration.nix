@@ -142,6 +142,12 @@ in
   programs.gamemode.enable = true;
   programs.gamescope.enable = true;
 
+  # Patched so Steam cannot take the resolution back; see the patch header
+  # and the Gaming Mode entry in home.nix, which sets the variable.
+  programs.gamescope.package = pkgs.gamescope.overrideAttrs (o: {
+    patches = (o.patches or [ ]) ++ [ ./gamescope/ignore-steam-mode-control.patch ];
+  });
+
   systemd.services.steamos-manager = {
     description = "SteamOS Manager, privileged half";
     wantedBy = [ "multi-user.target" ];
