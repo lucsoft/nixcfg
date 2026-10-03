@@ -28,7 +28,8 @@ Cogl compiles an old GLSL. Shaders copied from Shadertoy usually need edits:
 | `texelFetch`, `textureLod` | unavailable |
 | output to `fragColor` | the prelude copies it to `cogl_color_out` |
 | multiple render passes | impossible, one `ClutterShaderEffect` is one pass |
-| `iChannel0..3` textures | declared so the shader compiles, but sample black |
+| `iChannel0..3` textures | bound to a generated noise texture, see below |
+| `textureLod(s, uv, lod)` | `#define`d down to `texture2D(s, uv)`, the level is dropped |
 
 `iTime`, `iTimeDelta`, `iFrame`, `iResolution`, `iMouse`, `iDate` and
 `iSampleRate` all exist; only the first four carry real values.
@@ -99,6 +100,24 @@ adding it, remembering that the notice wraps across lines:
     tr '\n' ' ' < shader.frag |
       grep -iE 'cannot host, display, distribute|sole copyright owner'
 
+## Channel textures
+
+Shadertoy's single most-used input is a 256×256 RGBA noise image: of the
+channel uses across this set, nine want exactly that one. It is **generated
+here** rather than downloaded — noise is noise, a locally made one is
+equivalent where it matters, and nothing of Shadertoy's needs redistributing.
+A seeded xorshift fills the bytes, so it is the same texture every session.
+
+Binding it needs the effect's own pipeline, which an offscreen effect only has
+after it has painted once, so `_bindChannels` runs from the tick and skips any
+pipeline it has already seen. Layer 0 is the actor's own texture (the prelude's
+`tex`, never read); the four channels sit above it and the sampler uniform is
+simply the layer index.
+
+Only shaders whose every channel is that noise are in the set. The ones
+wanting a photograph or a font atlas are not: binding noise would compile and
+run, and look nothing like what their author made.
+
 ## Why the set is smaller than the list it came from
 
 Of 52 picked shaders, 16 are in. The rest are not rejections, they are things
@@ -106,15 +125,21 @@ a single `ClutterShaderEffect` cannot do yet:
 
 | | count | why |
 |---|---|---|
-| in the set | 16 | single image pass, no inputs |
-| needs a buffer pass | 14 | multipass; one effect is one pass |
-| needs an `iChannel` texture | 20 | no texture is bound to the channels |
-| restrictive licence | 2 | see above |
+| in the set | 20 | single image pass; noise channels are fine |
+| needs a buffer pass | 14 | multipass, see below |
+| needs a photo, font or audio channel | 15 | noise is not a substitute for those |
+| restrictive licence | 3 | see above |
 
-The channel ones are the big block, and they are reachable:
-`clutter_offscreen_effect_get_pipeline` is introspected, so Shadertoy's stock
-textures could be bound to layers 1–4 and the `iChannelN` uniforms pointed at
-them. That would roughly double the set.
+**Buffer passes are not impossible, only unbuilt.** One `ClutterShaderEffect`
+is one program and one pass, so they cannot come for free — but the pieces to
+do it by hand are all introspected: `cogl_texture_2d_new_with_size`,
+`cogl_offscreen_new_with_texture`, `cogl_pipeline_new`, `clutter_pipeline_node_new`
+and `clutter_paint_node_get_framebuffer`. What it takes is a small render
+graph: a framebuffer per buffer pass, each with its own program, ping-ponged
+between frames because a Shadertoy buffer reads its own previous frame, all
+resized with the monitor, and finally bound as the image pass's channels.
+That is a project, not an afternoon, and it would bring back the other
+fourteen.
 
 ## Testing
 

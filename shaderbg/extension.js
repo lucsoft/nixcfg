@@ -1,4 +1,5 @@
 import Clutter from 'gi://Clutter';
+import Cogl from 'gi://Cogl';
 import GLib from 'gi://GLib';
 import GObject from 'gi://GObject';
 import Meta from 'gi://Meta';
@@ -33,6 +34,10 @@ uniform float iResY;
 uniform float iCoordScaleX;
 uniform float iCoordScaleY;
 
+// Every channel carries the same locally generated noise, so one number
+// describes all four resolutions.
+uniform float iChannelSize;
+
 uniform sampler2D iChannel0;
 uniform sampler2D iChannel1;
 uniform sampler2D iChannel2;
@@ -47,6 +52,15 @@ vec3  iChannelResolution[4];
 float iChannelTime[4];
 
 #define texture texture2D
+
+// textureLod picks a mip level, and Cogl's GLSL has no fragment-stage
+// equivalent — texture2DLod is vertex-only before an ARB extension that
+// cannot be enabled from here, because Cogl prepends its own code and
+// #extension has to come first in the file. Dropping the level is the
+// honest approximation: distant detail aliases slightly, and thirteen of
+// the twenty channel shaders compile instead of none.
+#define textureLod(s, uv, l) texture2D(s, uv)
+#define texture2DLod(s, uv, l) texture2D(s, uv)
 
 // Functions GLSL gained in 1.30 that Shadertoy authors use freely and Cogl's
 // dialect does not have. They are defined under private names and #defined
@@ -92,6 +106,11 @@ void main()
     iResolution = vec3(iResX, iResY, 1.0);
     iFrame = int(iFrameF);
 
+    iChannelResolution[0] = vec3(iChannelSize, iChannelSize, 1.0);
+    iChannelResolution[1] = iChannelResolution[0];
+    iChannelResolution[2] = iChannelResolution[0];
+    iChannelResolution[3] = iChannelResolution[0];
+
     vec4 color = vec4(0.0, 0.0, 0.0, 1.0);
     mainImage(color, gl_FragCoord.xy * vec2(iCoordScaleX, iCoordScaleY));
     cogl_color_out = vec4(color.rgb, 1.0);
@@ -120,6 +139,29 @@ class ShaderBgEffect extends Clutter.ShaderEffect {
 });
 
 const EFFECT_NAME = 'shaderbg';
+
+// Shadertoy's most-used input by a wide margin is a 256x256 RGBA noise image,
+// and nine of the channel uses in this set want exactly that. It is generated
+// here rather than shipped: noise is noise, a locally made one is equivalent
+// where it matters, and nothing of Shadertoy's has to be redistributed to get
+// it. The generator is seeded so the texture is the same every session.
+const CHANNEL_SIZE = 256;
+
+function noiseTexture(context) {
+    const bytes = new Uint8Array(CHANNEL_SIZE * CHANNEL_SIZE * 4);
+
+    let state = 0x2545f491;
+    for (let i = 0; i < bytes.length; i++) {
+        state ^= state << 13;
+        state ^= state >>> 17;
+        state ^= state << 5;
+        bytes[i] = state & 0xff;
+    }
+
+    return Cogl.Texture2D.new_from_data(
+        context, CHANNEL_SIZE, CHANNEL_SIZE,
+        Cogl.PixelFormat.RGBA_8888, CHANNEL_SIZE * 4, bytes);
+}
 
 export default class ShaderBgExtension extends Extension {
     enable() {
@@ -384,6 +426,8 @@ export default class ShaderBgExtension extends Extension {
             if (!monitor || actor.width <= 0 || actor.height <= 0)
                 continue;
 
+            this._bindChannels(effect);
+
             effect.setFloat('iResX', monitor.width);
             effect.setFloat('iResY', monitor.height);
             effect.setFloat('iCoordScaleX', monitor.width / actor.width);
@@ -393,6 +437,34 @@ export default class ShaderBgExtension extends Extension {
             effect.setFloat('iFrameF', this._frame);
             effect.queue_repaint();
         }
+    }
+
+    // An offscreen effect has no pipeline until it has painted once, and it
+    // may build a new one later, so this is checked per tick rather than at
+    // attach time — but the actual binding only happens when the pipeline is
+    // one we have not seen.
+    _bindChannels(effect) {
+        const pipeline = effect.get_pipeline();
+        if (!pipeline || effect._sbPipeline === pipeline)
+            return;
+
+        if (!this._noise) {
+            const context = global.stage.context.get_backend().get_cogl_context();
+            this._noise = noiseTexture(context);
+        }
+
+        // Layer 0 is the actor's own offscreen texture, which the prelude
+        // declares as `tex` and the shaders never read. The channels go above
+        // it, and the sampler uniform is the layer index.
+        for (let i = 0; i < 4; i++) {
+            const layer = i + 1;
+            pipeline.set_layer_texture(layer, this._noise);
+            pipeline.set_layer_wrap_mode(layer, Cogl.PipelineWrapMode.REPEAT);
+            effect.set_uniform_value(`iChannel${i}`, layer);
+        }
+
+        effect.setFloat('iChannelSize', CHANNEL_SIZE);
+        effect._sbPipeline = pipeline;
     }
 
     _updatePaused() {

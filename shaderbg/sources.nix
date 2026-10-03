@@ -134,4 +134,39 @@
     author = "Danguafer";
     speed = 0.5;
   }
+  {
+    id = "Mt3GWs";
+    file = "structured-vol-sampling.frag";
+    name = "Structured Vol Sampling";
+    author = "huwb";
+    speed = 0.5;
+  }
+  {
+    id = "lsBfDz";
+    file = "tiny-clouds.frag";
+    name = "[SH17A] Tiny Clouds";
+    author = "stubbe";
+    speed = 0.5;
+  }
+  {
+    id = "4sXGRM";
+    file = "oceanic.frag";
+    name = "Oceanic";
+    author = "frankenburgh";
+    speed = 0.5;
+  }
+  {
+    id = "tdG3Rd";
+    file = "base-warp-fbm.frag";
+    name = "Base warp fBM";
+    author = "trinketMage";
+    speed = 0.5;
+  }
+  {
+    id = "XlSSzK";
+    file = "sun-surface.frag";
+    name = "Sun surface";
+    author = "Duke";
+    speed = 0.5;
+  }
 ]
