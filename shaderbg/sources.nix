@@ -51,13 +51,6 @@
     speed = 0.5;
   }
   {
-    id = "MtSBDc";
-    file = "golfing-ether-361-chars.frag";
-    name = "Golfing Ether - 361 chars";
-    author = "GregRostami";
-    speed = 0.5;
-  }
-  {
     id = "4s2yW1";
     file = "bokeh-paralax.frag";
     name = "Bokeh Paralax";
@@ -111,7 +104,7 @@
     file = "star-nest.frag";
     name = "Star Nest";
     author = "Kali";
-    speed = 0.5;
+    speed = 0.1;
   }
   {
     id = "3l23Rh";
@@ -139,14 +132,14 @@
     file = "structured-vol-sampling.frag";
     name = "Structured Vol Sampling";
     author = "huwb";
-    speed = 0.5;
+    speed = 0.01;
   }
   {
     id = "lsBfDz";
     file = "tiny-clouds.frag";
     name = "[SH17A] Tiny Clouds";
     author = "stubbe";
-    speed = 0.5;
+    speed = 0.1;
   }
   {
     id = "4sXGRM";
@@ -160,13 +153,41 @@
     file = "base-warp-fbm.frag";
     name = "Base warp fBM";
     author = "trinketMage";
-    speed = 0.5;
+    speed = 0.04;
   }
   {
     id = "XlSSzK";
     file = "sun-surface.frag";
     name = "Sun surface";
     author = "Duke";
+    speed = 0.25;
+  }
+  {
+    id = "DdcfzH";
+    file = "lava-lamp-gradient.frag";
+    name = "Lava Lamp Gradient";
+    author = "welches";
+    speed = 0.5;
+  }
+  {
+    id = "t3VGWz";
+    file = "glossy-gradient-smooth.frag";
+    name = "Glossy gradient smooth";
+    author = "biasia";
+    speed = 0.5;
+  }
+  {
+    id = "w3dSWj";
+    file = "oil-flow-color-mix.frag";
+    name = "Oil flow color mix";
+    author = "biasia";
+    speed = 0.5;
+  }
+  {
+    id = "wdyczG";
+    file = "gradient-flow.frag";
+    name = "Gradient Flow";
+    author = "hahnzhu";
     speed = 0.5;
   }
 ]

@@ -25,14 +25,22 @@ uniform float iFrameF;
 uniform float iResX;
 uniform float iResY;
 
-// gl_FragCoord runs over the actor, which is not always the monitor. The
-// overview's workspace preview is allocated smaller — and animates to that
-// size over several frames. Feeding its size in as iResolution made every
-// shader recompose itself during the transition instead of simply appearing
-// scaled down. So iResolution stays the monitor, and the coordinates are
-// stretched to match: same picture, fewer samples.
-uniform float iCoordScaleX;
-uniform float iCoordScaleY;
+// gl_FragCoord is not actor-local here. Measured: an actor at stage x=200
+// with an 80px pattern breaks at x=240, and a 70px vertical pattern on an
+// actor at y=200 breaks at 210, 280, 350 — so the coordinate is the stage
+// position, counted from the top left. On the desktop the background actor
+// sits at the origin and the difference never shows; in the overview the
+// workspace preview is offset, and the shader stood still while the actor
+// slid across it, which looks exactly like a mask.
+//
+// So the fragment is normalised inside the actor's on-screen rectangle and
+// then scaled to the monitor, which fixes the offset, the smaller preview
+// and any transform on top of it in one step. The y flip is the other half:
+// Shadertoy counts fragCoord.y upwards, this counts down.
+uniform float iOriginX;
+uniform float iOriginY;
+uniform float iExtentW;
+uniform float iExtentH;
 
 // Every channel carries the same locally generated noise, so one number
 // describes all four resolutions.
@@ -103,7 +111,15 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord);
 
 void main()
 {
-    iResolution = vec3(iResX, iResY, 1.0);
+    // Clamped, not trusted. A uniform that has not been set yet reads as 0,
+    // and dividing by that gives an infinite fragCoord — which a raymarching
+    // shader turns into a loop that never meets its exit condition. That is
+    // not a wrong pixel, it is a hung GPU and a compositor reset. Ask how
+    // this comment came to be written.
+    vec2 res = max(vec2(iResX, iResY), vec2(1.0));
+    vec2 ext = max(vec2(iExtentW, iExtentH), vec2(1.0));
+
+    iResolution = vec3(res, 1.0);
     iFrame = int(iFrameF);
 
     iChannelResolution[0] = vec3(iChannelSize, iChannelSize, 1.0);
@@ -111,8 +127,15 @@ void main()
     iChannelResolution[2] = iChannelResolution[0];
     iChannelResolution[3] = iChannelResolution[0];
 
+    // Inside the actor this is already 0..1; the clamp is the backstop that
+    // keeps fragCoord bounded by the monitor no matter what the uniforms say.
+    // A loop that marches until it passes some distance has to be able to
+    // finish, or the whole GPU stops.
+    vec2 n = clamp((gl_FragCoord.xy - vec2(iOriginX, iOriginY)) / ext, 0.0, 1.0);
+    n.y = 1.0 - n.y;
+
     vec4 color = vec4(0.0, 0.0, 0.0, 1.0);
-    mainImage(color, gl_FragCoord.xy * vec2(iCoordScaleX, iCoordScaleY));
+    mainImage(color, n * res);
     cogl_color_out = vec4(color.rgb, 1.0);
 }
 `;
@@ -314,7 +337,13 @@ export default class ShaderBgExtension extends Extension {
         if (!this._source || this._actors.has(actor))
             return;
 
-        actor.add_effect_with_name(EFFECT_NAME, new ShaderBgEffect(this._source));
+        const effect = new ShaderBgEffect(this._source);
+        actor.add_effect_with_name(EFFECT_NAME, effect);
+
+        // Give the geometry before the actor is ever painted. The first paint
+        // can happen before the first tick, and a shader that runs with zeroed
+        // uniforms is the hang described in the prelude.
+        this._setGeometry(actor, effect);
 
         // Keep the handler id: disable() has to take these back off again, or
         // enabling a second time stacks another one on every surviving actor.
@@ -417,21 +446,9 @@ export default class ShaderBgExtension extends Extension {
             if (!effect)
                 continue;
 
-            // The resolution the shader composes for is the monitor's, never
-            // the actor's — see the note on iCoordScale in the prelude. Both
-            // are read every tick rather than at attach time, because the
-            // overview previews are laid out after creation and the monitor
-            // itself can change under us.
-            const monitor = Main.layoutManager.monitors[actor.monitor];
-            if (!monitor || actor.width <= 0 || actor.height <= 0)
-                continue;
-
             this._bindChannels(effect);
+            this._setGeometry(actor, effect);
 
-            effect.setFloat('iResX', monitor.width);
-            effect.setFloat('iResY', monitor.height);
-            effect.setFloat('iCoordScaleX', monitor.width / actor.width);
-            effect.setFloat('iCoordScaleY', monitor.height / actor.height);
             effect.setFloat('iTime', this._time);
             effect.setFloat('iTimeDelta', delta * speed);
             effect.setFloat('iFrameF', this._frame);
@@ -465,6 +482,38 @@ export default class ShaderBgExtension extends Extension {
 
         effect.setFloat('iChannelSize', CHANNEL_SIZE);
         effect._sbPipeline = pipeline;
+    }
+
+    // The resolution a shader composes for is the monitor's, and the rectangle
+    // it is mapped onto is wherever the actor currently sits on screen, after
+    // every ancestor transform — that is the space gl_FragCoord is measured in.
+    // Both are re-read constantly: the overview lays its previews out after
+    // creating them, scrolls them sideways between workspaces and shrinks them
+    // during a search, and each of those has to come out as the picture moving
+    // with the preview rather than the preview sliding across a picture that
+    // stays put.
+    _setGeometry(actor, effect) {
+        const monitor = Main.layoutManager.monitors[actor.monitor];
+        if (!monitor)
+            return;
+
+        // Graphene.Rect exposes origin and size as plain struct fields in GJS;
+        // there are no getters for them.
+        const { origin, size } = actor.get_transformed_extents();
+
+        // An actor that is not in the scene graph yet — which is exactly the
+        // case when the factory hands one over — has no extents. Falling back
+        // to the monitor keeps the numbers sane; clamping a zero to one does
+        // not, it just turns an infinite coordinate into a merely enormous
+        // one, and a raymarcher hangs on both.
+        const usable = size.width > 0 && size.height > 0;
+
+        effect.setFloat('iResX', monitor.width);
+        effect.setFloat('iResY', monitor.height);
+        effect.setFloat('iOriginX', usable ? origin.x : monitor.x);
+        effect.setFloat('iOriginY', usable ? origin.y : monitor.y);
+        effect.setFloat('iExtentW', usable ? size.width : monitor.width);
+        effect.setFloat('iExtentH', usable ? size.height : monitor.height);
     }
 
     _updatePaused() {
