@@ -24,6 +24,15 @@ uniform float iFrameF;
 uniform float iResX;
 uniform float iResY;
 
+// gl_FragCoord runs over the actor, which is not always the monitor. The
+// overview's workspace preview is allocated smaller — and animates to that
+// size over several frames. Feeding its size in as iResolution made every
+// shader recompose itself during the transition instead of simply appearing
+// scaled down. So iResolution stays the monitor, and the coordinates are
+// stretched to match: same picture, fewer samples.
+uniform float iCoordScaleX;
+uniform float iCoordScaleY;
+
 uniform sampler2D iChannel0;
 uniform sampler2D iChannel1;
 uniform sampler2D iChannel2;
@@ -84,7 +93,7 @@ void main()
     iFrame = int(iFrameF);
 
     vec4 color = vec4(0.0, 0.0, 0.0, 1.0);
-    mainImage(color, gl_FragCoord.xy);
+    mainImage(color, gl_FragCoord.xy * vec2(iCoordScaleX, iCoordScaleY));
     cogl_color_out = vec4(color.rgb, 1.0);
 }
 `;
@@ -347,10 +356,19 @@ export default class ShaderBgExtension extends Extension {
             if (!effect)
                 continue;
 
-            // Read the size every tick instead of at attach time: the overview
-            // previews are laid out after creation and resize with the monitor.
-            effect.setFloat('iResX', actor.width);
-            effect.setFloat('iResY', actor.height);
+            // The resolution the shader composes for is the monitor's, never
+            // the actor's — see the note on iCoordScale in the prelude. Both
+            // are read every tick rather than at attach time, because the
+            // overview previews are laid out after creation and the monitor
+            // itself can change under us.
+            const monitor = Main.layoutManager.monitors[actor.monitor];
+            if (!monitor || actor.width <= 0 || actor.height <= 0)
+                continue;
+
+            effect.setFloat('iResX', monitor.width);
+            effect.setFloat('iResY', monitor.height);
+            effect.setFloat('iCoordScaleX', monitor.width / actor.width);
+            effect.setFloat('iCoordScaleY', monitor.height / actor.height);
             effect.setFloat('iTime', this._time);
             effect.setFloat('iTimeDelta', delta * speed);
             effect.setFloat('iFrameF', this._frame);
