@@ -1,18 +1,5 @@
 /* Loaded on top of the stock Shell theme by the user-stylesheet extension,
-   which reads ~/.config/gnome-shell/gnome-shell.css. This is the candybar
-   look Open Bar used to generate — Open Bar itself stops at Shell 49. */
-
-/* One pill per top bar item. The stock theme already gives .panel-button
-   border-radius: 999px and a 3px transparent border, so only the fill and
-   the gap are missing. Quick settings is a single button, which is why its
-   icons stay inside one wide pill instead of getting one each. */
-#panel .panel-button {
-  background-color: rgba(255, 255, 255, 0.08);
-  margin: 3px 2px;
-}
-
-/* Hover and :active stay the theme's, which layer an inset box-shadow over
-   this background rather than replacing it. */
+   which reads ~/.config/gnome-shell/gnome-shell.css. */
 
 /* The dash outline. blur-my-shell fills the background behind it, so this
    is only the hairline. */

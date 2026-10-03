@@ -33,7 +33,7 @@ repo configures graphics — there is no proprietary driver to pull in.
 | `rounded-blur/` | packaging for the `gi://Blur` library blur-my-shell wants |
 | `steamos-manager/` | packaging for Valve's power daemon, plus this board's device file |
 | `gamescope/` | one patch: let the window set both Xwayland modes, not Steam |
-| `gnome-shell.css` | panel pills and dash outline, loaded over the stock Shell theme |
+| `gnome-shell.css` | the dash outline, loaded over the stock Shell theme |
 | `home.nix` | Home Manager — my packages, dotfiles and user settings |
 | `npins/sources.json` | the pins: nixpkgs, nixpkgs-unstable, home-manager, helium, gnome-rounded-blur, steamos-manager |
 
