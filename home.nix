@@ -269,7 +269,10 @@ in
   # Resizing the window needs all three of these together: --xwayland-count 2
   # so gamescope reports the new size to Steam's X display at all, the patched
   # gamescope from configuration.nix, and the variable that arms the patch --
-  # otherwise Steam asserts 1920x1080 back over every drag.
+  # otherwise Steam asserts 1920x1080 back over every drag. With the patch, -W
+  # and -H are only the size the window opens at: both Xwayland displays, the
+  # one Steam draws on and the one games run on, follow the window from there,
+  # at whatever refresh rate the monitor under it reports.
   # --force-grab-cursor locks the pointer, which Steam is special-cased out of.
   xdg.desktopEntries.steam-gamingmode = {
     name = "Steam Gaming Mode";

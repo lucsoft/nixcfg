@@ -1,4 +1,4 @@
-Let GAMESCOPE_IGNORE_STEAM_MODE_CONTROL drop Steam's mode requests.
+Let GAMESCOPE_IGNORE_STEAM_MODE_CONTROL give the Xwayland mode to the window.
 
 In Gaming Mode the Steam client asserts a resolution of its own through
 the GAMESCOPE_XWAYLAND_MODE_CONTROL root property, and re-asserts it
@@ -6,6 +6,15 @@ whenever the mode changes underneath it. On a Deck that is right: the
 panel is fixed and Steam owns it. In a resizable nested window it fights
 the window manager, and the window wins the frame while Steam wins the
 resolution -- so dragging the edge only scales a stale buffer.
+
+Dropping those requests leaves the game's Xwayland with nobody driving
+it. steamcompmgr pushes the output size to server 0 alone, so Steam's own
+display follows the window while the game's keeps the mode it was created
+with: -W/-H, at the 60Hz fallback, since the host's real rate only
+arrives with the first wp_presentation_feedback, which is after the
+servers exist. A game then runs 1920x1080 at 60 inside a 144Hz window no
+matter how large that window is. So the second hunk points every server
+at the output, not just the first.
 
 Not sent upstream: gating on an environment variable suits one machine,
 upstream would want this driven by the backend reporting whether its
@@ -36,3 +45,37 @@ output size is user-controlled.
  
  				if ( root_size_identical )
  				{
+@@ -8554,11 +8564,28 @@
+ 		{
+ 			if ( g_nXWaylandCount > 1 )
+ 			{
+-				g_nNestedHeight = ( g_nNestedWidth * g_nOutputHeight ) / g_nOutputWidth;
+-				wlserver_lock();
+-				// Update only Steam, the root ctx, with the new output size for now
+-				wlserver_set_xwayland_server_mode( 0, g_nOutputWidth, g_nOutputHeight, g_nOutputRefresh );
+-				wlserver_unlock();
++				if ( getenv( "GAMESCOPE_IGNORE_STEAM_MODE_CONTROL" ) )
++				{
++					// Steam's requests are dropped above, and they were the only
++					// thing that ever moved the game's Xwayland off the size and
++					// rate it was born with. Hand every server the window, so a
++					// game sees the display the Deck UI already sees.
++					g_nNestedWidth = g_nOutputWidth;
++					g_nNestedHeight = g_nOutputHeight;
++
++					wlserver_lock();
++					for ( size_t i = 0; wlserver_get_xwayland_server( i ); i++ )
++						wlserver_set_xwayland_server_mode( i, g_nOutputWidth, g_nOutputHeight, g_nOutputRefresh );
++					wlserver_unlock();
++				}
++				else
++				{
++					g_nNestedHeight = ( g_nNestedWidth * g_nOutputHeight ) / g_nOutputWidth;
++					wlserver_lock();
++					// Update only Steam, the root ctx, with the new output size for now
++					wlserver_set_xwayland_server_mode( 0, g_nOutputWidth, g_nOutputHeight, g_nOutputRefresh );
++					wlserver_unlock();
++				}
+ 			}
+ 
+ 			// XXX(JoshA): Remake this. It sucks.
