@@ -131,8 +131,14 @@ void main()
     // keeps fragCoord bounded by the monitor no matter what the uniforms say.
     // A loop that marches until it passes some distance has to be able to
     // finish, or the whole GPU stops.
+    //
+    // No y flip. There was one for a while, on the strength of a headless
+    // measurement that said gl_FragCoord.y counts downwards — and on a
+    // virtual monitor it does. On a real KMS output it counts upwards, the
+    // way GL always has, so the flip turned every shader upside down on the
+    // only display that matters. Headless is not a reference for vertical
+    // orientation; check that one on the actual screen.
     vec2 n = clamp((gl_FragCoord.xy - vec2(iOriginX, iOriginY)) / ext, 0.0, 1.0);
-    n.y = 1.0 - n.y;
 
     vec4 color = vec4(0.0, 0.0, 0.0, 1.0);
     mainImage(color, n * res);
