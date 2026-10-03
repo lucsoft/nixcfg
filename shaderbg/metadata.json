@@ -1,7 +1,7 @@
 {
   "uuid": "shaderbg@lucsoft.de",
   "name": "shaderbg",
-  "description": "Draws a Shadertoy fragment shader as the desktop background, picking a different one from the set each day.",
+  "description": "An animated desktop background drawn by a GLSL shader, with a different one each day.",
   "shell-version": ["50"],
   "settings-schema": "de.lucsoft.shaderbg",
   "url": "https://github.com/lucsoft/nixcfg",

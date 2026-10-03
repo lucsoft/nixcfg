@@ -90,14 +90,14 @@ export default class ShaderBgPreferences extends ExtensionPreferences {
             row.title = entry ? entry.name : 'No shaders configured';
             row.subtitle = entry
                 ? (entry.author ?? 'unknown')
-                : 'sources.nix is empty, falling back to drift.frag';
+                : 'No shaders available';
 
             link.visible = !!entry?.id;
             if (entry?.id)
                 link.uri = `https://www.shadertoy.com/view/${entry.id}`;
 
             speed.sensitive = !!entry;
-            reset.tooltip_text = entry ? 'Back to the base speed' : '';
+            reset.tooltip_text = entry ? 'Back to its normal speed' : '';
 
             if (!entry)
                 return;
@@ -109,8 +109,9 @@ export default class ShaderBgPreferences extends ExtensionPreferences {
             // The slider is a factor on the base, not a replacement for it,
             // so the number checked into sources.nix keeps meaning something
             // after the slider has been touched.
-            speed.subtitle =
-                `Base ${base} × ${factor.toFixed(2)} = ${(base * factor).toFixed(3)}`;
+            speed.subtitle = factor === 1
+                ? 'Running at its normal speed'
+                : `${factor.toFixed(2)}× its normal speed`;
 
             // Guard the write-back: assigning to .value fires notify::value,
             // which would otherwise store 1.0 as if it had been set by hand.
@@ -154,7 +155,7 @@ export default class ShaderBgPreferences extends ExtensionPreferences {
 
         const fps = new Adw.SpinRow({
             title: 'Frames per second',
-            subtitle: 'The monitor runs at 144; a wallpaper has no reason to',
+            subtitle: 'Lower draws less and uses less power',
             adjustment: new Gtk.Adjustment({
                 lower: 5, upper: 144, step_increment: 5, page_increment: 15,
             }),
@@ -164,7 +165,7 @@ export default class ShaderBgPreferences extends ExtensionPreferences {
 
         const pause = new Adw.SwitchRow({
             title: 'Pause on fullscreen',
-            subtitle: 'Drops the timer while something covers the screen',
+            subtitle: 'Stop animating when a fullscreen window covers the screen',
         });
         settings.bind('pause-fullscreen', pause, 'active', Gio.SettingsBindFlags.DEFAULT);
         group.add(pause);
@@ -175,7 +176,7 @@ export default class ShaderBgPreferences extends ExtensionPreferences {
     _pickGroup(settings, sources) {
         const group = new Adw.PreferencesGroup({
             title: `All shaders (${sources.length})`,
-            description: 'Picking one keeps it until midnight, then the rotation resumes.',
+            description: 'Picking one keeps it until midnight, then the daily rotation resumes.',
         });
 
         // The -1 button doubles as the radio group's anchor, so "follow the
@@ -183,7 +184,7 @@ export default class ShaderBgPreferences extends ExtensionPreferences {
         const rotate = new Gtk.CheckButton({ valign: Gtk.Align.CENTER });
         const rotateRow = new Adw.ActionRow({
             title: 'Follow the daily rotation',
-            subtitle: 'One shader per day, in the order given by sources.nix',
+            subtitle: 'One shader per day, in a fixed order',
             activatable_widget: rotate,
         });
         rotateRow.add_prefix(rotate);
@@ -216,12 +217,10 @@ export default class ShaderBgPreferences extends ExtensionPreferences {
             // glance: which ones have been tuned, and how far.
             const describe = () => {
                 const tuned = settings.get_value('speeds').deepUnpack();
-                const base = entry.speed ?? 1;
                 const factor = tuned[entry.file] ?? 1;
-                const shown = factor === 1
-                    ? `${base}`
-                    : `${base} × ${factor.toFixed(2)} = ${(base * factor).toFixed(3)}`;
-                row.subtitle = `${entry.author ?? 'unknown'} · ${shown}`;
+                row.subtitle = factor === 1
+                    ? `${entry.author ?? 'unknown'}`
+                    : `${entry.author ?? 'unknown'} · ${factor.toFixed(2)}× speed`;
             };
             const speedsId = settings.connect('changed::speeds', describe);
             row.connect('destroy', () => settings.disconnect(speedsId));

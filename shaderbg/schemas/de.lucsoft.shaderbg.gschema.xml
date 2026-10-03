@@ -4,23 +4,22 @@
 
     <key name="speeds" type="a{sd}">
       <default>{}</default>
-      <summary>Per-shader speed factor, keyed by file name</summary>
+      <summary>How fast each shader animates</summary>
       <description>
-        A multiplier on the base speed sources.nix gives each shader, set once
-        and remembered. 1.0 means the base, and a shader with no entry here is
-        at 1.0, so this holds only what has actually been adjusted. Scales the
-        time base rather than the repaint rate, which is why slowing a shader
-        down does not make it stutter.
+        A factor on each shader's normal speed, remembered per shader. 1.0 is
+        normal, lower is slower, higher is faster. Only shaders that have been
+        adjusted appear here.
       </description>
     </key>
 
     <key name="fps-cap" type="i">
       <default>30</default>
       <range min="5" max="144"/>
-      <summary>Repaint rate</summary>
+      <summary>Frames per second</summary>
       <description>
-        How often the background is redrawn per second. The monitor runs at
-        144 Hz; there is no reason for a wallpaper to.
+        How often the background is redrawn each second. Lower values draw
+        less and use less power; the background still animates, just less
+        smoothly.
       </description>
     </key>
 
@@ -28,26 +27,26 @@
       <default>true</default>
       <summary>Pause while a window is fullscreen</summary>
       <description>
-        Drops the repaint timer entirely while something covers the screen,
-        rather than rendering a background nobody can see.
+        Stop animating the background while a fullscreen window covers the
+        screen, so nothing is spent drawing something nobody can see.
       </description>
     </key>
 
     <key name="override-index" type="i">
       <default>-1</default>
-      <summary>Hand-picked shader index</summary>
+      <summary>Shader chosen by hand</summary>
       <description>
-        Index into sources.nix, or -1 to follow the daily rotation. Paired with
-        override-day so the choice expires on its own.
+        Which shader to show instead of today's. -1 follows the daily
+        rotation.
       </description>
     </key>
 
     <key name="override-day" type="i">
       <default>-1</default>
-      <summary>Day the override was set</summary>
+      <summary>Day the choice was made</summary>
       <description>
-        Days since the epoch, local time. When this no longer matches today,
-        override-index is ignored and the rotation resumes.
+        A hand-picked shader lasts until midnight. This records the day it was
+        picked, so the choice expires on its own.
       </description>
     </key>
 
