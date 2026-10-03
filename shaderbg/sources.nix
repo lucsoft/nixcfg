@@ -190,11 +190,4 @@
     author = "hahnzhu";
     speed = 0.5;
   }
-  {
-    id = null;
-    file = "_st.frag";
-    name = "ST TEST";
-    author = "test";
-    speed = 1.0;
-  }
 ]
