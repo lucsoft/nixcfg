@@ -41,14 +41,14 @@
     file = "2d-voxels.frag";
     name = "2D Voxels";
     author = "nimitz";
-    speed = 0.5;
+    speed = 0.05;
   }
   {
     id = "33cGDj";
     file = "clearly-a-bug.frag";
     name = "Clearly a bug";
     author = "mrange";
-    speed = 0.5;
+    speed = 0.05;
   }
   {
     id = "4s2yW1";
@@ -62,14 +62,14 @@
     file = "worley-noise-waters.frag";
     name = "Worley Noise Waters";
     author = "Kyle273";
-    speed = 0.5;
+    speed = 1.5;
   }
   {
     id = "lslGWr";
     file = "simplicity.frag";
     name = "Simplicity";
     author = "JoshP";
-    speed = 0.5;
+    speed = 0.1;
   }
   {
     id = "MdyGzR";
@@ -90,7 +90,7 @@
     file = "ether.frag";
     name = "Ether";
     author = "nimitz";
-    speed = 0.5;
+    speed = 0.1;
   }
   {
     id = "wlVGWd";
@@ -111,14 +111,14 @@
     file = "protean-clouds.frag";
     name = "Protean clouds";
     author = "nimitz";
-    speed = 0.5;
+    speed = 0.05;
   }
   {
     id = "mtyGWy";
     file = "shader-art-coding-introduction.frag";
     name = "Shader Art Coding Introduction";
     author = "kishimisu";
-    speed = 0.5;
+    speed = 0.1;
   }
   {
     id = "XsXXDn";
