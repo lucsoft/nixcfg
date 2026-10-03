@@ -161,25 +161,38 @@ So cost tracks fragment count almost exactly, and rendering the expensive
 shaders at half linear resolution — a quarter of the fragments — is the one
 lever that would work.
 
-**It is not implemented.** Three attempts on `ClutterShaderEffect` failed,
-each differently, and they are written down so a fourth does not repeat them:
+**A `ClutterOffscreenEffect` cannot do it at all.** Not "the attempts did not
+work" — the mechanism forbids it. `clutter_offscreen_effect_pre_paint` ties
+three things together:
 
-1. `vfunc_create_texture` is documented for *bigger* textures only, and the
-   viewport is set from the requested target size rather than the texture's
-   (`clutter-offscreen-effect.c:424`), so a smaller texture is clipped rather
-   than scaled.
-2. Shrinking the paint volume in `vfunc_modify_paint_volume` does shrink the
-   framebuffer and does raise the frame rate — oceanic went 18 → 32 fps — but
-   Clutter then draws the smaller buffer at its own size, so the shader covers
-   part of the screen and the rest is framebuffer garbage.
-3. Adding a `vfunc_paint_target` that redraws the texture over the actor's
-   full box, with the pipeline colour set from the paint opacity the way
-   `clutter_offscreen_effect_real_paint_target` does, still came out black.
+    target        = paint volume size × ceilf(resource_scale)
+    viewport      = 0, 0, target_width, target_height
+    modelview    ×= stage_width / target_width, stage_height / target_height
 
-`resource_scale` is not a way in either: the framebuffer size uses
-`ceilf(resource_scale)`, so nothing below 1 has any effect.
+The viewport is the target and the modelview is scaled by stage over target,
+and those two cancel exactly. Pixel density is therefore pinned, and the only
+free parameter is `resource_scale` — which is `ceilf()`'d, so it can only go
+up.
 
-What is left is to stop using `ShaderEffect` and replace the
+Working through what that means for each way in:
+
+- Shrinking the paint volume halves `target`, so the modelview scale doubles:
+  the content is drawn twice as large into a half-size buffer. That is a
+  **crop at full density**, not a downsample. Stretching the crop back out
+  afterwards magnifies half the picture.
+- `vfunc_create_texture` changes only the texture. The viewport still comes
+  from `target`, so rendering runs past the smaller texture and is clipped.
+
+Both follow from the same coupling, which is why three attempts produced
+three different kinds of wrong picture and none of them produced a smaller
+one.
+
+So the content route is not a fallback after failures, it is the only one
+that can work — and it is sound for the same reason the others are not: there
+the framebuffer, the viewport and the projection are set by hand instead of
+being derived from each other.
+
+Stop using `ShaderEffect` and replace the
 `MetaBackgroundActor`'s **content** instead — not add an actor, because a
 plain actor is not a `MetaCullable` and would lose the automatic "costs
 nothing behind a window" behaviour that is worth more than the downscale
