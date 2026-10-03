@@ -161,22 +161,44 @@ So cost tracks fragment count almost exactly, and rendering the expensive
 shaders at half linear resolution — a quarter of the fragments — is the one
 lever that would work.
 
-**It is not implemented.** Two attempts failed:
+**It is not implemented.** Three attempts on `ClutterShaderEffect` failed,
+each differently, and they are written down so a fourth does not repeat them:
 
-- `vfunc_create_texture` is documented for *bigger* textures only, and the
-  viewport is set from the requested target size rather than the texture's
-  (`clutter-offscreen-effect.c:424`), so a smaller texture is clipped rather
-  than scaled.
-- Shrinking the paint volume in `vfunc_modify_paint_volume` does shrink the
-  framebuffer and does raise the frame rate — oceanic went 18 → 32 fps — but
-  Clutter then draws the smaller buffer at its own size, so the shader covers
-  part of the screen and the rest is framebuffer garbage. Overriding
-  `vfunc_paint_target` to stretch it back came out black.
+1. `vfunc_create_texture` is documented for *bigger* textures only, and the
+   viewport is set from the requested target size rather than the texture's
+   (`clutter-offscreen-effect.c:424`), so a smaller texture is clipped rather
+   than scaled.
+2. Shrinking the paint volume in `vfunc_modify_paint_volume` does shrink the
+   framebuffer and does raise the frame rate — oceanic went 18 → 32 fps — but
+   Clutter then draws the smaller buffer at its own size, so the shader covers
+   part of the screen and the rest is framebuffer garbage.
+3. Adding a `vfunc_paint_target` that redraws the texture over the actor's
+   full box, with the pipeline colour set from the paint opacity the way
+   `clutter_offscreen_effect_real_paint_target` does, still came out black.
 
-The pieces for doing it properly are all introspected —
-`cogl_texture_2d_new_with_size`, `cogl_offscreen_new_with_texture`,
-`clutter_layer_node_new_to_framebuffer` — but it means rendering through an
-own paint node tree rather than a `ShaderEffect`.
+`resource_scale` is not a way in either: the framebuffer size uses
+`ceilf(resource_scale)`, so nothing below 1 has any effect.
+
+What is left is to stop using `ShaderEffect` and replace the
+`MetaBackgroundActor`'s **content** instead — not add an actor, because a
+plain actor is not a `MetaCullable` and would lose the automatic "costs
+nothing behind a window" behaviour that is worth more than the downscale
+(53.9 W → 17.3 W, measured). A `Clutter.Content` whose `paint_content`
+renders through `clutter_layer_node_new_to_framebuffer` into an own texture
+keeps the actor, and therefore the culling, intact.
+
+Every piece of that is introspected: `cogl_texture_2d_new_with_size`,
+`cogl_offscreen_new_with_texture`, `cogl_pipeline_new`, `cogl_snippet_new`
+with `COGL_SNIPPET_HOOK_FRAGMENT`, `cogl_pipeline_set_uniform_1f` and
+`clutter_layer_node_new_to_framebuffer`. It is a replacement of the render
+path, not a setting, and it wants doing in one deliberate pass.
+
+One thing to know before starting: **downscaling alone saves nothing.** Load
+is fragments per frame times frames per second, and freeing capacity just
+raises the frame rate — measured, oceanic at half the fragments went from
+17.6 to 31.0 fps at an unchanged 51 W. The saving comes from pairing a lower
+resolution with the frame cap. Capping alone does not work either: at 5 fps
+the card still sits at 98 %, because it does not clock down between frames.
 
 ## Why the set is smaller than the list it came from
 
