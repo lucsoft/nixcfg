@@ -3,7 +3,9 @@
 let
   sources = import ./npins;
 
-  unstable = import sources.nixpkgs-unstable { };
+  # Same config as the main pkgs: bottles' FHS env pulls in lsfg-vk, which is
+  # unfree, and a bare import would not see nixpkgs.config below.
+  unstable = import sources.nixpkgs-unstable { inherit (pkgs) config system; };
 
   npins-ui = pkgs.callPackage ./npins-ui { };
 
