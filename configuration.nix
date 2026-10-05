@@ -68,6 +68,17 @@ in
   networking.hostName = "nixos";
   networking.networkmanager.enable = true;
 
+  # Keys only — there is no password worth brute-forcing a public port with.
+  services.openssh = {
+    enable = true;
+    openFirewall = true;
+    settings = {
+      PasswordAuthentication = false;
+      KbdInteractiveAuthentication = false;
+      PermitRootLogin = "no";
+    };
+  };
+
   time.timeZone = "Europe/Berlin";
 
   i18n.defaultLocale = "de_DE.UTF-8";
@@ -130,6 +141,10 @@ in
     description = "lucsoft";
     # input/uinput for Sunshine
     extraGroups = [ "networkmanager" "wheel" "input" "uinput" ];
+    openssh.authorizedKeys.keys = [
+      # ~/.ssh/id_ed25519.pub on this machine
+      "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDQjtXFsbUxTkLB2H7sE+F6J2ZYbOmQORkk0Za0Gf7Uk mail@lucsoft.de"
+    ];
   };
 
   programs.steam = {
