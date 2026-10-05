@@ -144,6 +144,7 @@ in
     openssh.authorizedKeys.keys = [
       # ~/.ssh/id_ed25519.pub on this machine
       "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDQjtXFsbUxTkLB2H7sE+F6J2ZYbOmQORkk0Za0Gf7Uk mail@lucsoft.de"
+      "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJWMrv1BL5cTjJsT1fukAYEuq4DQMcN5/i++OKUIMGID lucsoft@laptop"
     ];
   };
 
