@@ -4,8 +4,13 @@ let
   sources = import ./npins;
 
   # Same config as the main pkgs: bottles' FHS env pulls in lsfg-vk, which is
-  # unfree, and a bare import would not see nixpkgs.config below.
-  unstable = import sources.nixpkgs-unstable { inherit (pkgs) config system; };
+  # unfree, and a bare import would not see nixpkgs.config below. The platform
+  # spelled out the long way because `inherit (pkgs) system` is what 26.05
+  # warns about, and the `localSystem` the warning points at recurses here.
+  unstable = import sources.nixpkgs-unstable {
+    inherit (pkgs) config;
+    inherit (pkgs.stdenv.hostPlatform) system;
+  };
 
   npins-ui = pkgs.callPackage ./npins-ui { };
 
