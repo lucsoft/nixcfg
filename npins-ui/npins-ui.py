@@ -1632,10 +1632,16 @@ class RebuildStream:
         # because that is what it is doing now — settling it here rather
         # than by sort order, which is what used to flip such a row between
         # arrived and arriving on alternate redraws.
-        rows = list(live.values())
-        rows += [dict(row) for path, row in self.fetched.items()
-                 if path not in live]
-        return sorted(rows, key=lambda row: row["started"])
+        # Tail order: what has arrived, in the order it arrived, and what is
+        # still coming after it. A download has no place in the graph —
+        # nothing waits for one — so the view reads them as a list that
+        # scrolls, and a list that scrolls wants its newest line at the
+        # bottom. Sorting by when each *started* put a slow early download
+        # above fifty that finished while it ran.
+        rows = [dict(row) for path, row in self.fetched.items()
+                if path not in live]
+        rows += sorted(live.values(), key=lambda row: row["started"])
+        return rows
 
     # -- read from the main loop ----------------------------------------------
     def snapshot(self):
@@ -2007,6 +2013,11 @@ def prune(roots, budget):
     def walk(node, above):
         parent[node["key"]] = above
         order.append(node)
+        # Downloads are one card however many of them there are — the graph
+        # reads them as a list rather than a branch — so they do not spend
+        # the budget the derivations are competing for.
+        if node["key"][0] == "downloads":
+            return
         for kid in node["kids"]:
             walk(kid, node["key"])
 
@@ -2036,6 +2047,8 @@ def prune(roots, budget):
         keep.update(line)
 
     def rebuild(node):
+        if node["key"][0] == "downloads":
+            return dict(node)        # kept whole; the walk never went in
         return {**node, "kids": [rebuild(kid) for kid in node["kids"]
                                  if kid["key"] in keep]}
 
@@ -2051,16 +2064,20 @@ def download_group(index, rows):
     branch rather than being scattered through a plan they are not part of.
     """
     arriving = [row for row in rows if row["state"] == RUNNING]
+    done = sum(row["done"] for row in rows)
+    expected = sum(row["expected"] for row in rows)
     return {
         "key": ("downloads", index),
         "kind": DOWNLOAD,
         "name": f"{len(rows)} download{'' if len(rows) == 1 else 's'}",
         "state": RUNNING if arriving else DONE,
         "waiting": len(arriving),
-        "detail": "",
-        "done": sum(row["done"] for row in rows),
-        "expected": sum(row["expected"] for row in rows),
-        "fraction": None,
+        # How many, beside how much: bytes alone cannot say that ninety of
+        # ninety-six are in, and the count is the half that finishes.
+        "detail": f"{len(rows) - len(arriving)} of {len(rows)}",
+        "done": done,
+        "expected": expected,
+        "fraction": (done / expected) if expected else None,
         "started": min(row["started"] for row in rows),
         "log": [],
         "kids": rows,
@@ -2442,6 +2459,10 @@ class PlanGraph(Gtk.Widget):
 
     CARD_W, MIN_W, PAD, GAP_MIN, GAP_MAX = 210, 160, 12, 22, 72
     COLLAPSE = 320
+    # How tall the downloads card's list is. Enough lines to see one go by
+    # and read the one before it; past that it is a log, and there is a
+    # drawer for logs.
+    TAIL_H = 148
     # What a card gives up, in order, once there is nothing left to fold:
     # the wrapped name, then the status under it, then the name itself.
     DENSITY = (("full", 150), ("line", 112), ("pill", 72), ("dot", 24))
@@ -2529,6 +2550,14 @@ class PlanGraph(Gtk.Widget):
         """
         key = row["key"]
         self.parent[key], self.level[key] = parent, row["depth"]
+        # Downloads stop here. Nothing waits for a download, so they have no
+        # shape worth drawing — hung in the tree they were a wall of ninety
+        # names in a card two hundred pixels wide, which is a list pretending
+        # to be a graph. One card stands for all of them and tails them
+        # instead; see `card`.
+        if key[0] == "downloads":
+            self.tree[key] = []
+            return
         flat = [kid for kid in row["kids"] if straight(kid)]
         # One unbranching sibling is a card already; a group of one would
         # only be the same card with a heading over it.
@@ -2668,11 +2697,31 @@ class PlanGraph(Gtk.Widget):
                       css_classes=["card", "plan-card"])
         box.append(head)
         box.append(reveal)
-        box.append(body)
+        # A downloads card is the one that does not grow with what it holds.
+        # Its list is every path the step fetched, in the order they
+        # arrived, in a window of its own that keeps to the newest of them —
+        # and gets out of the way the moment anyone scrolls back, the same
+        # bargain the output drawer strikes. Without this it was the tallest
+        # thing on the page by an order of magnitude, and the one with the
+        # least shape to show for the room.
+        if key[0] == "downloads":
+            body.set_visible(True)
+            body.set_margin_top(0)
+            tail = Gtk.ScrolledWindow(
+                child=body, margin_top=6, visible=False,
+                hscrollbar_policy=Gtk.PolicyType.NEVER,
+                propagate_natural_height=False,
+                height_request=self.TAIL_H,
+                css_classes=["download-tail"])
+            box.append(tail)
+        else:
+            tail = None
+            box.append(body)
         click = Gtk.GestureClick()
         click.connect("pressed", lambda *_a, k=key: self.choose(k))
         box.add_controller(click)
         box.parts = (slot, title, detail, bar, reveal, body)
+        box.tail = tail
         box.lines = []
         box.density = "full"
         return box
@@ -2717,7 +2766,18 @@ class PlanGraph(Gtk.Widget):
                 label.set_label(extra)
                 label.add_css_class("dim-label")
                 slot.set_visible(False)
-        body.set_visible(bool(wanted))
+        if card.tail is None:
+            body.set_visible(bool(wanted))
+            return
+        card.tail.set_visible(bool(wanted))
+        # Stay at the newest line, unless whoever is reading scrolled up —
+        # and pick it back up when they scroll down to it again, which falls
+        # out of asking where the view is rather than keeping a flag.
+        adjustment = card.tail.get_vadjustment()
+        if adjustment.get_value() + adjustment.get_page_size() >= \
+                adjustment.get_upper() - 24:
+            GLib.idle_add(lambda: adjustment.set_value(
+                adjustment.get_upper() - adjustment.get_page_size()))
 
     def dress(self, key, card):
         """Which of the card's parts this width can afford, and what it has
@@ -2739,6 +2799,8 @@ class PlanGraph(Gtk.Widget):
         self.shade(card, "folded", folded)
         if self.density not in ("full", "line"):
             self.fill(card, [])
+        elif card.tail is not None:
+            self.fill(card, self.rows[key]["kids"])
         elif key in self.groups:
             self.fill(card, [self.chain(chain)
                              for chain in self.groups[key]])
@@ -4467,6 +4529,14 @@ listview.plan-list > row { padding: 0; }
 .plan-card.folded { box-shadow: 4px 4px 0 alpha(@window_fg_color, .10),
                                 8px 8px 0 alpha(@window_fg_color, .05); }
 .plan-line label { font-size: .85em; }
+
+/* The downloads card's list. Sunk into the card rather than drawn on it, so
+   that it reads as a window onto something longer, which is what it is. */
+.download-tail {
+    background: alpha(@window_fg_color, .05);
+    border-radius: 8px;
+    padding: 2px 4px;
+}
 
 .plan-log { font-family: monospace; font-size: .85em; }
 """
