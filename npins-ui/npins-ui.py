@@ -1188,10 +1188,20 @@ PLAN_ENTRY = re.compile(r"^\s+(/nix/store/\S+\.drv)$")
 # hands over; the rest the activity stream moves it through.
 PLANNED, RUNNING, DONE, FAILED = "planned", "running", "done", "failed"
 
-# A plan bigger than this is not a plan anyone reads. It is only a guard
-# against a rebuild that plans hundreds of derivations: the graph would draw
-# them a few pixels wide and the list would scroll for a minute.
-PLAN_NODES = 80
+# How many cards the graph will draw. A guard on the *drawing* and nothing
+# else: the graph lays its cards out by hand, so every one of them costs a
+# measure, and a thousand of them a few pixels wide says nothing anyway. The
+# list has no such limit — a GtkListView recycles its rows — and neither does
+# the model, because a budget that reaches the model becomes a budget on the
+# truth. That is what it used to be, and every count on the page was wrong
+# for as long as a rebuild had more to do than this.
+GRAPH_CARDS = 80
+
+# Build output held across the whole run, in lines. Per build it is TAIL; this
+# is the ceiling on all of them together, so that a thousand-derivation
+# rebuild cannot grow the model without bound. Lines rather than derivations:
+# what costs memory is the text, and a build that said nothing costs nothing.
+TAIL_BUDGET = 40_000
 
 # Which view a rebuild opens in when nothing has said otherwise. The schema
 # carries the same default; this is what a run from a checkout falls back to.
@@ -1274,13 +1284,14 @@ class Activity:
     """One thing nix is doing right now: a build, or a download."""
 
     __slots__ = ("kind", "name", "detail", "log", "done", "expected",
-                 "started", "drv")
+                 "started", "drv", "path")
 
     def __init__(self, kind, name, detail=""):
         self.kind = kind
         self.name = name
         self.detail = detail
         self.drv = ""
+        self.path = ""
         self.log = collections.deque(maxlen=TAIL)
         self.done = self.expected = 0
         self.started = time.monotonic()
@@ -1307,10 +1318,18 @@ class RebuildStream:
         # whole run: a build that has finished still has output worth
         # reading, and after the page is archived it is the only copy.
         self.tails = collections.OrderedDict()    # drv -> its last output
-        # Downloads that have arrived. A rebuild that only moves a pin
-        # builds nothing and downloads everything, and without this the
-        # page would have nothing to show for it once they finish.
-        self.fetched = collections.OrderedDict()  # name -> the finished row
+        self.tail_lines = 0                       # what those weigh, in lines
+        # Downloads that have arrived, keyed by store path rather than by
+        # name: two paths can carry the same name — a package built twice
+        # over a pin move, a 32-bit driver beside its 64-bit twin — and
+        # keyed by name the second would land on the first, which reads as
+        # a download that finished and then started over.
+        #
+        # Kept for the whole run and never evicted. A rebuild that only
+        # moves a pin builds nothing and downloads everything, so these are
+        # most of what the page has to show; and every count on the page is
+        # a sum over them, which an eviction would quietly walk backwards.
+        self.fetched = collections.OrderedDict()  # store path -> finished row
         self.problems = list(problems)  # what nix called an error or a warning
         self.raw = collections.deque(maxlen=RAW_LINES)
         self.pending = []     # raw lines the view has not been handed yet
@@ -1378,7 +1397,9 @@ class RebuildStream:
             # Where from, not the full URL: one row has no space for a nar
             # hash, and which cache answered is the part worth seeing.
             host = urlparse(str(fields[1])).netloc or str(fields[1])
-            self.live[ident] = Activity(DOWNLOAD, package_name(fields[0]), host)
+            activity = Activity(DOWNLOAD, package_name(fields[0]), host)
+            activity.path = str(fields[0])
+            self.live[ident] = activity
 
     def stopped(self, ident):
         activity = self.live.pop(ident, None)
@@ -1395,24 +1416,25 @@ class RebuildStream:
         # then the builder's output is the only thing that says why. Hold the
         # last few so the message can be given back its evidence.
         if activity and activity.kind == DOWNLOAD:
-            self.fetched[activity.name] = {
-                "key": (DOWNLOAD, activity.name), "kind": DOWNLOAD,
+            self.fetched[activity.path or activity.name] = {
+                "key": (DOWNLOAD, activity.path or activity.name),
+                "kind": DOWNLOAD,
                 "name": activity.name, "state": DONE,
                 "detail": activity.detail,
                 "done": activity.expected or activity.done,
                 "expected": activity.expected, "started": activity.started,
                 "waiting": 0, "log": [], "kids": [],
             }
-            while len(self.fetched) > PLAN_NODES:
-                self.fetched.popitem(last=False)
         if activity and activity.kind == BUILD and activity.log:
             self.recent[activity.name] = list(activity.log)
             while len(self.recent) > RECENT:
                 self.recent.popitem(last=False)
             if activity.drv:
                 self.tails[activity.drv] = list(activity.log)
-                while len(self.tails) > PLAN_NODES:
-                    self.tails.popitem(last=False)
+                self.tail_lines += len(activity.log)
+                while self.tail_lines > TAIL_BUDGET and len(self.tails) > 1:
+                    _drv, dropped = self.tails.popitem(last=False)
+                    self.tail_lines -= len(dropped)
 
     def result(self, event):
         ident, kind = event.get("id"), event.get("type")
@@ -1427,7 +1449,13 @@ class RebuildStream:
                 # two differ by whatever the compression won.
                 activity = self.live.get(self.parents.get(ident))
                 if activity:
-                    activity.done, activity.expected = fields[0], fields[1]
+                    activity.done = fields[0]
+                    # nix opens a transfer before it knows the length and
+                    # says 0 until the headers are in. Once a size is known
+                    # it is kept: a 0 arriving later is the absence of an
+                    # answer, not an answer, and letting it through takes
+                    # the progress ring away from a download mid-flight.
+                    activity.expected = fields[1] or activity.expected
         elif kind == RES_BUILD_LOG_LINE and fields:
             activity = self.live.get(ident)
             if activity:
@@ -1547,12 +1575,17 @@ class RebuildStream:
         list draws its connector lines off depth/last/pipes. Which child is
         the last one depends on the order of the walk, so it is decided here,
         once, rather than in each view.
-        """
-        nodes = []
 
+        Every planned derivation is in here, however many that is. It used to
+        stop at the first eighty, which cost nothing in memory and everything
+        in truth: which eighty depended on the order of `forest()`, and that
+        order moves under the walk whenever `resolve_graph` hands back a new
+        set of edges. Nodes appeared and vanished between redraws, and every
+        count derived from them — what a step is waiting for, how much of a
+        packed card is built — walked backwards with them. What the graph
+        can draw is the graph's business; see GRAPH_CARDS.
+        """
         def carry(drv, kids, depth, last, pipes):
-            if len(nodes) >= PLAN_NODES:
-                return None
             activity = self.by_drv.get(drv)
             node = {
                 "key": ("node", drv),
@@ -1569,22 +1602,15 @@ class RebuildStream:
                 "pipes": pipes,
                 "kids": [],
             }
-            nodes.append(node)
             below = pipes + ((not last,) if depth else ())
             for index, (kid, sub) in enumerate(kids):
-                child = carry(kid, sub, depth + 1, index == len(kids) - 1,
-                              below)
-                if child is not None:
-                    node["kids"].append(child)
+                node["kids"].append(carry(kid, sub, depth + 1,
+                                          index == len(kids) - 1, below))
             return node
 
         forest = self.forest()
-        roots = []
-        for index, (drv, kids) in enumerate(forest):
-            root = carry(drv, kids, 0, index == len(forest) - 1, ())
-            if root is not None:
-                roots.append(root)
-        return roots
+        return [carry(drv, kids, 0, index == len(forest) - 1, ())
+                for index, (drv, kids) in enumerate(forest)]
 
     def downloads(self):
         """What this step fetched, as nodes — the ones still arriving and
@@ -1595,13 +1621,21 @@ class RebuildStream:
         is the whole story, so it is kept instead, and it hangs under the
         step that fetched it rather than in a list of its own.
         """
-        live = [{"key": (DOWNLOAD, a.name), "kind": DOWNLOAD, "name": a.name,
-                 "state": RUNNING, "detail": a.detail, "done": a.done,
-                 "expected": a.expected, "started": a.started, "waiting": 0,
-                 "log": [], "kids": []}
-                for a in self.live.values() if a.kind == DOWNLOAD]
-        done = [dict(row) for row in self.fetched.values()]
-        return sorted(live + done, key=lambda row: row["started"])
+        live = {a.path or a.name:
+                {"key": (DOWNLOAD, a.path or a.name), "kind": DOWNLOAD,
+                 "name": a.name, "state": RUNNING, "detail": a.detail,
+                 "done": a.done, "expected": a.expected,
+                 "started": a.started, "waiting": 0, "log": [], "kids": []}
+                for a in self.live.values() if a.kind == DOWNLOAD}
+        # A path can be in both: nix reopens a copy for one it is fetching
+        # again, from a second substituter or after a retry. Running wins,
+        # because that is what it is doing now — settling it here rather
+        # than by sort order, which is what used to flip such a row between
+        # arrived and arriving on alternate redraws.
+        rows = list(live.values())
+        rows += [dict(row) for path, row in self.fetched.items()
+                 if path not in live]
+        return sorted(rows, key=lambda row: row["started"])
 
     # -- read from the main loop ----------------------------------------------
     def snapshot(self):
@@ -1951,6 +1985,64 @@ def relayout(roots):
     return roots
 
 
+def prune(roots, budget):
+    """The plan cut to what a hand-laid view can draw, chosen by what is
+    happening rather than by where the walk happened to stop.
+
+    The graph owns every card it draws and measures each one by hand, so the
+    number of them has to be bounded somewhere. It used to be bounded in the
+    model, which made the bound a lie about the build; here it only decides
+    what is on screen, and the counts the cards carry are still sums over
+    the whole plan.
+
+    Rank, worst first: the run and its steps, because they are the frame the
+    rest hangs in and a tree without them is not a tree; then what failed,
+    then what is building, then what is still to come, then what is done.
+    Keeping a node keeps its ancestors — an orphan cannot be drawn — and
+    ties go to whoever the walk reached first, so the choice holds still
+    between redraws instead of shifting with the edges.
+    """
+    order, parent = [], {}
+
+    def walk(node, above):
+        parent[node["key"]] = above
+        order.append(node)
+        for kid in node["kids"]:
+            walk(kid, node["key"])
+
+    for root in roots:
+        walk(root, None)
+    if len(order) <= budget:
+        return roots
+
+    RANK = {FAILED: 1, RUNNING: 2, PLANNED: 3, DONE: 4}
+    by_key = {node["key"]: node for node in order}
+    ranked = sorted(
+        enumerate(order),
+        key=lambda pair: (0 if pair[1]["key"][0] in ("rebuild", "step")
+                          else RANK.get(pair[1].get("state"), 3), pair[0]))
+
+    keep = set()
+    for _index, node in ranked:
+        line = []
+        key = node["key"]
+        while key is not None and key not in keep:
+            line.append(key)
+            key = parent[key]
+        if len(keep) + len(line) > budget:
+            # Not "break": a shorter line may still fit, and the ranking has
+            # already put the nodes worth having first.
+            continue
+        keep.update(line)
+
+    def rebuild(node):
+        return {**node, "kids": [rebuild(kid) for kid in node["kids"]
+                                 if kid["key"] in keep]}
+
+    return relayout([rebuild(by_key[root["key"]])
+                     for root in roots if root["key"] in keep])
+
+
 def download_group(index, rows):
     """Every download of one step, under one node.
 
@@ -2109,18 +2201,28 @@ class StateSlot(Gtk.Stack):
         self.add_named(self.spinner, "spinner")
         self.add_named(self.ring, "ring")
         self.add_named(self.icon, "icon")
+        self.ringed = False
 
     def show(self, row):
         state = row.get("state")
         if state in (None, RUNNING):
             # A download says how far along it is; a build only says that it
             # is going, so that is all the spinner claims.
+            #
+            # Once it has said it, though, it keeps saying it. A size can go
+            # missing from a redraw — nix reports a transfer before it knows
+            # the length, and a card standing for several sums over whatever
+            # of them it can see — and a slot that took that for "no size
+            # after all" crossfaded back to the spinner and then forward
+            # again, a quarter second each way, on a download still running.
             if row.get("expected"):
+                self.ringed = True
                 self.ring.set_fraction(row["done"] / row["expected"])
                 self.set_visible_child_name("ring")
-            else:
+            elif not self.ringed:
                 self.set_visible_child_name("spinner")
             return
+        self.ringed = False
         self.set_visible_child_name("icon")
         self.icon.set_from_icon_name(STATE_ICON[state])
         for name in ("dim-label", "success", "error"):
@@ -2369,28 +2471,51 @@ class PlanGraph(Gtk.Widget):
 
     # -- the model ------------------------------------------------------------
     def update(self, plan):
-        self.rows = {row["key"]: row for row in walk_plan(plan)}
-        shape = tuple(self.rows)
-        if shape != self.shape:
-            self.shape = shape
-            self.load(plan)
-        self.refresh()
+        """Take the plan as it stands now.
 
-    def load(self, plan):
-        for card in self.cards.values():
-            card.unparent()
-        self.cards, self.tree, self.groups = {}, {}, {}
-        self.parent, self.level, self.places = {}, {}, {}
-        self.folded, self.open, self.fades = set(), set(), {}
-        self.density, self.geometry_cache = "full", ()
+        The shape is worked out every time, because it is a walk over a few
+        dozen dicts and costs nothing. The cards are not: they are widgets,
+        and building one is four orders of magnitude dearer than indexing a
+        row, so only the ones that came or went are touched.
+
+        Those two used to happen together — any change to the key set threw
+        every card away and built them all again, four times a second for as
+        long as downloads were starting and finishing. What it left behind
+        was worse than slow: `groups` was built during that rebuild while
+        `rows` was replaced on every redraw, so between rebuilds a packed
+        card read chains whose members `rows` no longer had. `chain()` drops
+        what it cannot find, which quietly shrank the set `merge()` saw, and
+        a card with a build running in it fell back to waiting. Indexing
+        every time is what keeps the two in step.
+        """
+        self.rows = {row["key"]: row for row in walk_plan(plan)}
+        self.tree, self.groups, self.parent, self.level = {}, {}, {}, {}
         self.roots = [row["key"] for row in plan]
         for row in plan:
             self.index(row, None)
+        # Folds and whatever a click has pinned open are the view's own, and
+        # outlive a redraw — but only for nodes the plan still has.
+        self.folded &= set(self.tree)
+        self.open &= set(self.tree)
+
+        shape = tuple((key, tuple(kids)) for key, kids in self.tree.items())
+        if shape != self.shape:
+            self.shape = shape
+            self.reconcile()
+            self.layout()
+        self.refresh()
+
+    def reconcile(self):
+        """Cards for what the plan gained, and the end of the ones it lost."""
+        for key in [key for key in self.cards if key not in self.tree]:
+            self.cards.pop(key).unparent()
+            self.fades.pop(key, None)
         for key in self.tree:
-            card = self.card(key)
-            card.set_parent(self)
-            self.cards[key] = card
-        self.layout()
+            if key not in self.cards:
+                card = self.card(key)
+                card.set_parent(self)
+                self.cards[key] = card
+        self.geometry_cache = ()
 
     def index(self, row, parent):
         """Walk the plan into the shape this view draws it in.
@@ -2459,7 +2584,12 @@ class PlanGraph(Gtk.Widget):
         inputs — unit-dbus-broker.service is what the line is for, and the
         restart trigger under it is how that one is made.
         """
-        rows = [self.rows[key] for key in chain if key in self.rows]
+        # Every key in here came out of the same plan `rows` was built from,
+        # this redraw. It used to be filtered against `rows` for the ones
+        # that were not, because `groups` outlived the plan it was indexed
+        # from — and a chain quietly losing its running member is how a card
+        # went back to saying it was waiting.
+        rows = [self.rows[key] for key in chain]
         return {"key": chain[0], "name": rows[0]["name"],
                 "state": self.merge([row["state"] for row in rows]),
                 "done": sum(row.get("done") or 0 for row in rows),
@@ -2884,6 +3014,7 @@ class PlanGraph(Gtk.Widget):
     # -- per redraw -----------------------------------------------------------
     def refresh(self):
         self.plan_folds()
+        states = []
         for key, card in self.cards.items():
             row = self.read(key)
             slot, detail, bar, reveal = self.dress(key, card)
@@ -2897,11 +3028,15 @@ class PlanGraph(Gtk.Widget):
             self.settle(card, row, detail, reveal)
             for state in (RUNNING, FAILED):
                 self.shade(card, state, row["state"] == state)
+            states.append(row["state"])
 
         # Only a state change can move the layout, and the page redraws four
         # times a second: asking for a new one on every redraw leaves the
-        # widget permanently mid-resize.
-        states = tuple(self.state_of(key) for key in self.cards)
+        # widget permanently mid-resize. Taken from the rows just read
+        # rather than asked for again: `state_of` walks a packed card's
+        # chains to answer, and doing that a second time per card per frame
+        # is the same work twice.
+        states = tuple(states)
         if states != self.states:
             self.states = states
             self.queue_resize()
@@ -4005,8 +4140,14 @@ class Window(Adw.ApplicationWindow):
     def draw_plan(self, plan):
         """Hand the tree to both views. The one not on screen is kept up to
         date too, so switching to it shows the build rather than the build
-        as it was when it was last looked at."""
-        self.graph.update(plan)
+        as it was when it was last looked at.
+
+        The list takes the whole plan — a GtkListView builds rows for what is
+        on screen and no more, so its cost does not depend on how long the
+        plan is. The graph takes a cut of it, because its cards are real
+        widgets it lays out itself.
+        """
+        self.graph.update(prune(plan, GRAPH_CARDS))
         self.list.update(plan)
         self.plan_views.set_visible(bool(plan))
         return plan
