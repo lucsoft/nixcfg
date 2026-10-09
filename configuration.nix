@@ -214,5 +214,14 @@ in
 
   nix.nixPath = [ "nixpkgs=${sources.nixpkgs}" ];
 
+  # Andromeda is packaged in lucsoft/andromeda-nix, whose CI pushes here.
+  # Without it the runtime is a 20 minute Rust build.
+  nix.settings = {
+    substituters = [ "https://andromeda-nix.cachix.org" ];
+    trusted-public-keys = [
+      "andromeda-nix.cachix.org-1:DEWHc3Ls1TK60gCMDnztXLcd5vE45As8QMP8Ro/cbaE="
+    ];
+  };
+
   system.stateVersion = "26.05"; # first installed version
 }
