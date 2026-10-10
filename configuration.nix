@@ -14,24 +14,56 @@ let
   steamos-manager-device = ./steamos-manager/device.toml;
 
   # mutter names a mode by its own refresh number — 3440x1440@144.001 — which
-  # nothing can predict for one the kernel builds off the command line, so look
-  # the id up by resolution and take the first, the fastest. Sunshine's unit
-  # forces PATH empty, hence the absolute paths.
-  set-monitor = pkgs.writeShellScript "set-monitor" ''
+  # nothing can predict for a mode that comes out of an EDID we generated here,
+  # so both halves read the ids back out of mutter at run time.
+  #
+  #   only <connector> <resolution> <scale>   that connector, by itself
+  #   rest <connector>                        every other one, as mutter prefers
+  #
+  # `rest` is the undo, and it asks mutter rather than being told, so no monitor
+  # this machine happens to own is named anywhere below. Sunshine's unit forces
+  # PATH empty, hence the absolute paths.
+  monitors = pkgs.writeShellScript "monitors" ''
     set -eu
-    connector=$1 resolution=$2 scale=$3
     gmc=${pkgs.gnome-monitor-config}/bin/gnome-monitor-config
+    awk=${pkgs.gawk}/bin/awk
 
-    mode=$("$gmc" list | ${pkgs.gawk}/bin/awk -v c="$connector" -v r="$resolution" '
-      /^Monitor \[/ { here = ($3 == c) }
-      here && $1 ~ "^" r "@" && match($0, /\[id: [^]]*\]/) {
-        print substr($0, RSTART + 6, RLENGTH - 8)
-        exit
-      }
-    ')
+    case "$1" in
+    only)
+      mode=$("$gmc" list | "$awk" -v c="$2" -v r="$3" '
+        /^Monitor \[/ { here = ($3 == c) }
+        here && $1 ~ "^" r "@" && match($0, /\[id: [^]]*\]/) {
+          print substr($0, RSTART + 6, RLENGTH - 8)
+          exit
+        }
+      ')
+      [ -n "$mode" ] || { echo "monitors: no $3 mode on $2" >&2; exit 1; }
+      exec "$gmc" set -L -M "$2" -m "$mode" -s "$4" -p
+      ;;
 
-    [ -n "$mode" ] || { echo "no $resolution mode on $connector" >&2; exit 1; }
-    exec "$gmc" set -L -M "$connector" -m "$mode" -s "$scale" -p
+    rest)
+      # one tab-separated row per monitor: connector, preferred mode, the width
+      # that mode covers once its preferred scale is applied, and that scale
+      args=() x=0 primary=-p
+      while IFS=$'\t' read -r connector mode width scale; do
+        args+=(-L -x "$x" -M "$connector" -m "$mode" -s "$scale" $primary)
+        x=$(( x + width ))
+        primary=
+      done < <("$gmc" list | "$awk" -v skip="$2" '
+        /^Monitor \[/ { connector = $3; taken = (connector == skip) }
+        !taken && /PREFERRED/ && match($0, /\[id: [^]]*\]/) {
+          mode = substr($0, RSTART + 6, RLENGTH - 8)
+          scale = match($0, /scale = [0-9.]+/) ? substr($0, RSTART + 8, RLENGTH - 8) : 1
+          split($1, size, /[x@]/)
+          printf "%s\t%s\t%d\t%s\n", connector, mode, int(size[1] / scale + 0.5), scale
+          taken = 1
+        }
+      ')
+
+      [ ''${#args[@]} -gt 0 ] || { echo "monitors: nothing left but $2" >&2; exit 1; }
+      exec "$gmc" set "''${args[@]}"
+      ;;
+    esac
   '';
 in
 
@@ -61,11 +93,6 @@ in
     # amdgpu's default mask plus PP_OVERDRIVE_MASK — pp_od_clk_voltage, and so
     # the manual GPU clock, does not exist without it
     "amdgpu.ppfeaturemask=0xfff7ffff"
-    # A monitor that is not there, so Moonlight can stream the MacBook Pro
-    # 14"'s own 3024x1964: `e` forces the empty connector on, and with no EDID
-    # to read the probe takes this mode as the connector's. The panel on DP-2
-    # offers nothing near it, and mutter only hands out what a panel reports.
-    "video=HDMI-A-1:3024x1964@60e"
   ];
 
   zramSwap = {
@@ -221,6 +248,27 @@ in
   services.dbus.packages = [ steamos-manager ];
   environment.systemPackages = [ steamos-manager ];
 
+  # A monitor that is not there, so Moonlight can stream the MacBook Pro 14"'s
+  # own 3024x1964: the panel on DP-2 offers nothing near it, and mutter only
+  # ever hands out what a panel reports. `e` forces the empty connector on past
+  # amdgpu's own checks, and the EDID below is the mode list it then reads.
+  # Reduced blanking because there is no sink to negotiate with and 386 MHz of
+  # pixel clock is a far easier sell than plain CVT's 508 — `cvt -r 3024 1964
+  # 60` prints this line. 120 Hz would want 794 MHz, which is past HDMI TMDS
+  # and would need an EDID advertising FRL, so this display is 60 Hz.
+  # edid-generator refuses a modeline whose aspect it cannot name, and 3024:1964
+  # is none of the four it knows, so say 16:10 — the field only feeds the
+  # standard-timing descriptors, not the detailed timing that matters. dpi is
+  # the 14" panel's real 254, which is what makes mutter offer scale 2 at all.
+  hardware.display.edid.modelines."MBP14_60" =
+    "385.75  3024 3072 3104 3184  1964 1967 1977 2020 "
+    + "+hsync -vsync ratio=16:10 dpi=254";
+
+  hardware.display.outputs."HDMI-A-1" = {
+    edid = "MBP14_60.bin";
+    mode = "e";
+  };
+
   services.sunshine = {
     enable = true;
     openFirewall = true;
@@ -244,8 +292,8 @@ in
           image-path = "desktop.png";
           prep-cmd = [
             {
-              do = "${set-monitor} HDMI-A-1 3024x1964 2";
-              undo = "${set-monitor} DP-2 3440x1440 1";
+              do = "${monitors} only HDMI-A-1 3024x1964 2";
+              undo = "${monitors} rest HDMI-A-1";
             }
           ];
         }
