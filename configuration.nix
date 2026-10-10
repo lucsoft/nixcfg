@@ -12,6 +12,27 @@ let
 
   # --device-config, because upstream's DMI table is handhelds only
   steamos-manager-device = ./steamos-manager/device.toml;
+
+  # mutter names a mode by its own refresh number — 3440x1440@144.001 — which
+  # nothing can predict for one the kernel builds off the command line, so look
+  # the id up by resolution and take the first, the fastest. Sunshine's unit
+  # forces PATH empty, hence the absolute paths.
+  set-monitor = pkgs.writeShellScript "set-monitor" ''
+    set -eu
+    connector=$1 resolution=$2 scale=$3
+    gmc=${pkgs.gnome-monitor-config}/bin/gnome-monitor-config
+
+    mode=$("$gmc" list | ${pkgs.gawk}/bin/awk -v c="$connector" -v r="$resolution" '
+      /^Monitor \[/ { here = ($3 == c) }
+      here && $1 ~ "^" r "@" && match($0, /\[id: [^]]*\]/) {
+        print substr($0, RSTART + 6, RLENGTH - 8)
+        exit
+      }
+    ')
+
+    [ -n "$mode" ] || { echo "no $resolution mode on $connector" >&2; exit 1; }
+    exec "$gmc" set -L -M "$connector" -m "$mode" -s "$scale" -p
+  '';
 in
 
 {
@@ -40,6 +61,11 @@ in
     # amdgpu's default mask plus PP_OVERDRIVE_MASK — pp_od_clk_voltage, and so
     # the manual GPU clock, does not exist without it
     "amdgpu.ppfeaturemask=0xfff7ffff"
+    # A monitor that is not there, so Moonlight can stream the MacBook Pro
+    # 14"'s own 3024x1964: `e` forces the empty connector on, and with no EDID
+    # to read the probe takes this mode as the connector's. The panel on DP-2
+    # offers nothing near it, and mutter only hands out what a panel reports.
+    "video=HDMI-A-1:3024x1964@60e"
   ];
 
   zramSwap = {
@@ -199,6 +225,43 @@ in
     enable = true;
     openFirewall = true;
     capSysAdmin = true;
+
+    # Naming the apps here takes them away from the web UI, which only ever
+    # held Sunshine's own defaults — the first and last entries are those.
+    applications = {
+      env.PATH = "/run/current-system/sw/bin:$(HOME)/.local/bin";
+      apps = [
+        {
+          name = "Desktop";
+          image-path = "desktop.png";
+        }
+        {
+          # 3024x1964 is the 14" panel and scale 2 the 1512x982 macOS draws it
+          # at, so the stream lands pixel for pixel. Only HDMI-A-1 is named, so
+          # the real monitor goes dark until `undo` brings it back — and stays
+          # dark if Sunshine dies mid-stream, where ssh is the way back.
+          name = "MacBook Desktop";
+          image-path = "desktop.png";
+          prep-cmd = [
+            {
+              do = "${set-monitor} HDMI-A-1 3024x1964 2";
+              undo = "${set-monitor} DP-2 3440x1440 1";
+            }
+          ];
+        }
+        {
+          name = "Steam Big Picture";
+          image-path = "steam.png";
+          detached = [ "setsid steam steam://open/bigpicture" ];
+          prep-cmd = [
+            {
+              do = "";
+              undo = "setsid steam steam://close/bigpicture";
+            }
+          ];
+        }
+      ];
+    };
   };
 
   environment.etc."claude-code/managed-settings.json".text = builtins.toJSON {
