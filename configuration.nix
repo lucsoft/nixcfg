@@ -30,13 +30,18 @@ let
 
     case "$1" in
     only)
-      mode=$("$gmc" list | "$awk" -v c="$2" -v r="$3" '
-        /^Monitor \[/ { here = ($3 == c) }
-        here && $1 ~ "^" r "@" && match($0, /\[id: [^]]*\]/) {
-          print substr($0, RSTART + 6, RLENGTH - 8)
-          exit
-        }
-      ')
+      # the connector may be seconds old, and mutter learns of it over udev
+      for _ in {1..50}; do
+        mode=$("$gmc" list | "$awk" -v c="$2" -v r="$3" '
+          /^Monitor \[/ { here = ($3 == c) }
+          here && $1 ~ "^" r "@" && match($0, /\[id: [^]]*\]/) {
+            print substr($0, RSTART + 6, RLENGTH - 8)
+            exit
+          }
+        ')
+        [ -z "$mode" ] || break
+        ${pkgs.coreutils}/bin/sleep 0.1
+      done
       [ -n "$mode" ] || { echo "monitors: no $3 mode on $2" >&2; exit 1; }
       exec "$gmc" set -L -M "$2" -m "$mode" -s "$4" -p
       ;;
@@ -64,6 +69,38 @@ let
       exec "$gmc" set "''${args[@]}"
       ;;
     esac
+  '';
+
+  # The same forcing the kernel command line can do, done at run time instead.
+  # A connector forced at boot is there for every session the machine ever
+  # starts, the greeter's included — and the greeter will put the login prompt
+  # on a screen that does not exist, which locks the machine. debugfs does the
+  # forcing on demand, so the ghost is only up while a stream wants it.
+  ghost-monitor = pkgs.writeShellScript "ghost-monitor" ''
+    set -eu
+    edid=${config.hardware.display.edid.packages}/lib/firmware/edid/MBP14_60.bin
+
+    # the dri minor is whatever it is, and the connector directory has been
+    # spelled both ways across kernels
+    dir=
+    for candidate in /sys/kernel/debug/dri/*/HDMI-A-1 /sys/kernel/debug/dri/*/card*-HDMI-A-1; do
+      if [ -e "$candidate/force" ]; then dir=$candidate; break; fi
+    done
+    [ -n "$dir" ] || { echo "ghost-monitor: no debugfs entry for HDMI-A-1" >&2; exit 1; }
+
+    case "$1" in
+    up)
+      ${pkgs.coreutils}/bin/cat "$edid" > "$dir/edid_override"
+      echo on > "$dir/force"
+      ;;
+    down)
+      # the kernel compares this against exactly five bytes, so no newline
+      printf reset > "$dir/edid_override"
+      echo unspecified > "$dir/force"
+      ;;
+    esac
+
+    echo 1 > "$dir/trigger_hotplug"
   '';
 in
 
@@ -248,14 +285,14 @@ in
   services.dbus.packages = [ steamos-manager ];
   environment.systemPackages = [ steamos-manager ];
 
-  # A monitor that is not there, so Moonlight can stream the MacBook Pro 14"'s
-  # own 3024x1964: the panel on DP-2 offers nothing near it, and mutter only
-  # ever hands out what a panel reports. `e` forces the empty connector on past
-  # amdgpu's own checks, and the EDID below is the mode list it then reads.
-  # Reduced blanking because there is no sink to negotiate with and 386 MHz of
-  # pixel clock is a far easier sell than plain CVT's 508 — `cvt -r 3024 1964
-  # 60` prints this line. 120 Hz would want 794 MHz, which is past HDMI TMDS
-  # and would need an EDID advertising FRL, so this display is 60 Hz.
+  # The mode list of a monitor that is not there, so Moonlight can stream the
+  # MacBook Pro 14"'s own 3024x1964: the panel on DP-2 offers nothing near it,
+  # and mutter only ever hands out what a panel reports. Nothing here reaches
+  # a connector by itself — `ghost-monitor` hands this file to debugfs when a
+  # stream starts. Reduced blanking because there is no sink to negotiate with
+  # and 386 MHz of pixel clock is a far easier sell than plain CVT's 508;
+  # `cvt -r 3024 1964 60` prints this line. 120 Hz would want 794 MHz, which
+  # is past HDMI TMDS and needs an EDID advertising FRL, so this one is 60 Hz.
   # edid-generator refuses a modeline whose aspect it cannot name, and 3024:1964
   # is none of the four it knows, so say 16:10 — the field only feeds the
   # standard-timing descriptors, not the detailed timing that matters. dpi is
@@ -264,10 +301,25 @@ in
     "385.75  3024 3072 3104 3184  1964 1967 1977 2020 "
     + "+hsync -vsync ratio=16:10 dpi=254";
 
-  hardware.display.outputs."HDMI-A-1" = {
-    edid = "MBP14_60.bin";
-    mode = "e";
+  systemd.services.ghost-monitor = {
+    description = "A monitor that is not there, for as long as a stream wants it";
+    serviceConfig = {
+      Type = "oneshot";
+      RemainAfterExit = true;
+      ExecStart = "${ghost-monitor} up";
+      ExecStop = "${ghost-monitor} down";
+    };
   };
+
+  # Sunshine's prep-cmd runs as whoever is logged in, and debugfs is root's
+  security.polkit.extraConfig = ''
+    polkit.addRule(function (action, subject) {
+      if (action.id == "org.freedesktop.systemd1.manage-units"
+          && action.lookup("unit") == "ghost-monitor.service"
+          && subject.isInGroup("wheel"))
+        return polkit.Result.YES;
+    });
+  '';
 
   services.sunshine = {
     enable = true;
@@ -290,7 +342,13 @@ in
           # dark if Sunshine dies mid-stream, where ssh is the way back.
           name = "MacBook Desktop";
           image-path = "desktop.png";
+          # Sunshine runs the undos in reverse, so the ghost is raised before
+          # the session moves onto it and dropped after it has moved back off.
           prep-cmd = [
+            {
+              do = "${config.systemd.package}/bin/systemctl start ghost-monitor.service";
+              undo = "${config.systemd.package}/bin/systemctl stop ghost-monitor.service";
+            }
             {
               do = "${monitors} only HDMI-A-1 3024x1964 2";
               undo = "${monitors} rest HDMI-A-1";
