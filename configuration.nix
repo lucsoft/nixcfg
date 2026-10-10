@@ -94,9 +94,11 @@ let
       echo on > "$dir/force"
       ;;
     down)
-      # the kernel compares this against exactly five bytes, so no newline
+      # `reset` is compared against exactly five bytes and `force` reads into a
+      # char[12] that must hold a terminator, so neither write may carry the
+      # newline echo would add — `unspecified` is eleven characters exactly
       printf reset > "$dir/edid_override"
-      echo unspecified > "$dir/force"
+      printf unspecified > "$dir/force"
       ;;
     esac
 
@@ -344,14 +346,17 @@ in
           image-path = "desktop.png";
           # Sunshine runs the undos in reverse, so the ghost is raised before
           # the session moves onto it and dropped after it has moved back off.
+          # The two halves name the same connector differently: debugfs knows
+          # the kernel's HDMI-A-1, while mutter drops the connector type's
+          # suffix and calls it HDMI-1, which is the name its D-Bus API takes.
           prep-cmd = [
             {
               do = "${config.systemd.package}/bin/systemctl start ghost-monitor.service";
               undo = "${config.systemd.package}/bin/systemctl stop ghost-monitor.service";
             }
             {
-              do = "${monitors} only HDMI-A-1 3024x1964 2";
-              undo = "${monitors} rest HDMI-A-1";
+              do = "${monitors} only HDMI-1 3024x1964 2";
+              undo = "${monitors} rest HDMI-1";
             }
           ];
         }
