@@ -195,12 +195,26 @@ node and sets the buffer, the viewport and the projection by hand:
     graphene_matrix_scale (&projection, 2.0 / width, -2.0 / height, 1.f);
 
 So `ShaderBgEffect` derives from `Clutter.Effect` and implements one vfunc,
-`paint_node`, building two nested nodes:
+`paint_node`. The shader is drawn into the buffer there and then, rather than
+left to a nested `ClutterLayerNode` the way the first version did it:
 
-    LayerNode(buffer, present)   draws its children into the buffer, then
-      rectangle 0..actor         draws the buffer over the whole actor
-      PipelineNode(shader)
-        rectangle 0..buffer      fills the buffer, at the buffer's size
+    if (dirty)                   draw the shader into the offscreen, now
+      cogl_framebuffer_draw_rectangle (fb, shader, 0, 0, bw, bh)
+    PipelineNode(present)        then one quad over the actor
+      rectangle 0..actor
+
+Two things fall out of owning the draw. It can be bracketed, which is what
+makes the timer query above possible at all; and it only has to happen when a
+tick has actually moved a uniform, so the stage repainting for reasons of its
+own — a notification, a cursor, damage from a window above — costs one
+textured quad instead of a whole frame of the shader.
+
+The buffer is sized from **the monitor's resolution, not the actor's**. The
+shader composes for `iResolution` and the actor box only ever stretches the
+result, so a workspace preview being animated from full size down to a
+thumbnail moves one rectangle. Sizing it from the actor instead meant dropping
+a 19 MB texture and redrawing the shader on every frame of that animation,
+which is what the flicker on opening the overview was.
 
 The shader runs once per buffer pixel and the buffer is stretched afterwards,
 with linear filtering. It stays an **effect on the background actor**, so
@@ -217,6 +231,58 @@ body's `cogl_tex_coord0_in.t` into `cogl_tex_coord0_in.iTime`. Everything of
 ours therefore lives in `_sb_fragment()`, declared ahead of the shader source
 where no macro of the shader's can reach it, and the body is one call.
 
+### What is native, and why
+
+Two halves. `extension.js` keeps everything that is not per-pixel — the
+settings, the daily rotation, the ticker, and the GLSL prelude, which is text
+and is far easier to iterate on in a file the Shell re-reads than in one that
+needs a rebuild. `lib/src/` is the effect: the pipeline, the buffer, the paint
+path and the uniforms, built as a GObject-Introspection library the extension
+imports as `gi://ShaderBg`. The same shape `blur-my-shell` uses for
+`gi://Blur`, and packaged the same way — `meson.build` names `libmutter-18`
+literally, so a mutter bump fails to configure rather than building something
+the Shell would refuse to load.
+
+Rewriting the hot path in C bought nothing by itself, and it is worth being
+clear about that: GJS was never in it. Per frame the JavaScript side runs one
+timeout callback, four uniform writes and a `queue_repaint` — microseconds,
+against a shader that is millions of fragments. What is native is native for
+things GJS cannot reach at all:
+
+| | why it needs C |
+|---|---|
+| `GL_TIME_ELAPSED` query | Cogl exposes no timer query, and GJS has no GL binding |
+| `ClutterStage::presented` | carries a `ClutterFrameInfo`, a public C struct with no GI boxed type, so the signal is `introspectable="0"` |
+
+The query is resolved through `eglGetProcAddress`, preferring the
+`EXT_disjoint_timer_query` spelling because the session runs on the GLES
+driver, and falling back to the unsuffixed names. Mutter 50 dropped epoxy and
+links `libGL`/`libGLESv2`/`libEGL` itself, so there is no loader to borrow.
+A disjoint event discards the sample rather than reporting a wrong one.
+
+Bracketing has one trap worth writing down: Cogl batches draws into a journal,
+so a query opened and closed around `cogl_framebuffer_draw_rectangle` times an
+empty bracket. `cogl_framebuffer_flush` on both sides is what puts the draw
+inside it — `flush`, not `finish`, because the result is wanted without
+stalling the CPU on it. Results are collected a frame or two later out of a
+four-slot ring, so nothing ever waits.
+
+### Tracing the whole path
+
+`trace`, off by default, puts a line a second in the journal with the median
+of four spans:
+
+    shaderbg: oceanic.frag at 0.5x, 97 frames — tick→draw 1.21 ms,
+              cpu 0.04 ms, gpu 5.83 ms, draw→screen 7.42 ms
+
+`tick→draw` is the repaint request waiting to be painted, `cpu` is this side
+issuing the draw, `gpu` is the shader pass itself, and `draw→screen` is that
+frame reaching the display. Medians and not a line a frame, because at a cap
+of 100 the latter is a hundred lines a second.
+
+It is off by default because it is not free: a timed pass flushes the journal
+twice, and that is a real cost to pay for a number nobody is reading.
+
 ### Deciding which shaders get downscaled
 
 Not by watching the frame rate. A shader that reaches the cap has only said
@@ -224,22 +290,29 @@ Not by watching the frame rate. A shader that reaches the cap has only said
 may have taken 1 ms or 30 ms. Raising the resolution to find out and lowering
 it again when it does not hold is an oscillation, not a measurement.
 
-So the frame *time* is measured, once per shader, with the cap lifted for two
-seconds, and the scale follows in one step:
+Nor by the wall clock, which was the first answer here and was wrong in a way
+that took a while to see. The gap between two paints cannot fall below one
+refresh interval, so on a 144 Hz screen it read 6.9 ms for *every* shader that
+fitted into a frame: the same figure for `drift`, which has no loop at all, as
+for `tiny-clouds`, which does 800 dependent texture fetches a pixel and holds
+the card at 99 %. A budget handed two numbers it cannot tell apart does
+nothing, which is exactly what a `frame-budget` of 10 % appeared to do.
 
-- **Always at full resolution**, whatever it is currently drawn at. A
-  downscaled shader is usually limited by the display rather than by itself,
-  and a frame time pinned to the refresh rate says nothing — a shader put on
-  a quarter could then never be shown to have earned its way back up.
-- **The gap between the effect's own paints**, not the stage's. Mutter stops
-  painting the background entirely once a window covers it, and counting
-  stage frames would read a culled background as a slow shader.
-- **Gaps over 400 ms are dropped** as the background not being on screen at
-  all. That cutoff is the one thing here that is a judgement rather than a
-  derivation: a shader genuinely slower than 2.5 fps is past helping and
-  belongs at the smallest step anyway.
-- **The median** of what is left, so one frame that waited on something else
-  does not drag the verdict.
+So what the verdict is made from is **the GPU's own time for one pass of the
+shader**, out of a `GL_TIME_ELAPSED` query bracketing the draw. That is the
+whole reason the effect is a native library and not JavaScript: Cogl exposes
+no timer query — mutter 50 still carries `COGL_FEATURE_ID_TIMESTAMP_QUERY` in
+its headers with no function to go with it — and GJS has no GL binding to fall
+back on.
+
+- **Always at full resolution**, whatever it is currently drawn at, so that a
+  shader put on a quarter can be shown to have earned its way back up and the
+  prediction below stays a plain multiplication.
+- **The cap is not touched.** A query times the work, not the pace, so there
+  is nothing to be had from asking for frames faster than the setting says.
+  Measuring is now invisible instead of two seconds of the fans spinning up.
+- **The median** over a two-second window, so one pass that landed behind
+  something else on the card does not drag the verdict.
 - The largest of 1.0, 0.5, 0.25 whose predicted time fits the budget, and
   because cost is fragment count the prediction is the measured time times
   the square of the step.
@@ -248,12 +321,12 @@ seconds, and the scale follows in one step:
   cap and 50 %, a shader that just fits spends 8.3 ms of every 16.7 ms
   drawing. Lowering it is how to ask for an idler card and accept a softer
   background.
-- **A measurement at the refresh interval is not a reading**, and the shader
-  behind it keeps full resolution however small the budget is. The shader
-  cannot paint faster than the display refreshes, so everything cheap piles up
-  against that floor indistinguishably — judging it against a budget below the
-  floor would downscale the whole set for failing a test nothing can pass.
-  Only shaders slow enough to be measured are judged at all.
+- **Nothing is exempt from the budget.** The wall-clock version had to let
+  every shader at the refresh interval off, because a budget below that
+  interval was a test nothing could pass; that exemption was the bug. A GPU
+  time has no floor under it — 0.4 ms is 0.4 ms.
+- A driver with no timer query leaves every shader at full resolution and says
+  so in the journal, rather than reaching a verdict from something else.
 
 Nothing is ever derived from the outcome of a previous change, which is what
 keeps it from swinging. The verdict is kept per shader *and* per screen

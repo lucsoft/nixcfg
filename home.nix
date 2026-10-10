@@ -19,6 +19,9 @@ let
     src = sources.gnome-rounded-blur;
   };
 
+  # Its own effect is native too, and extension.js asks for `gi://ShaderBg`.
+  shaderbg = pkgs.callPackage ./shaderbg { };
+
   helium = pkgs.callPackage "${sources.helium}/helium.nix" { };
 
   # Makes a switch visible to the session that is already running, instead of
@@ -146,18 +149,21 @@ in
       # A fragment shader as the desktop background, one per day out of
       # shaderbg/sources.nix. Local rather than from e.g.o because the only
       # GLSL wallpaper extension there stops at Shell 49.
-      { package = pkgs.callPackage ./shaderbg { }; }
+      { package = shaderbg; }
 
       { package = pkgs.gnomeExtensions.user-stylesheet-font; }
     ];
   };
 
-  # How the Shell is told where Blur-1.0.typelib is. gnome-shell is a systemd
-  # user unit, so environment.d reaches it, and its wrapper prepends its own
-  # typelib path rather than replacing this one. The extension imports the
-  # library when it is enabled, so this only takes effect after a logout.
-  systemd.user.sessionVariables.GI_TYPELIB_PATH =
-    "${rounded-blur}/lib/girepository-1.0";
+  # How the Shell is told where Blur-1.0.typelib and ShaderBg-1.0.typelib are.
+  # gnome-shell is a systemd user unit, so environment.d reaches it, and its
+  # wrapper prepends its own typelib path rather than replacing this one. Both
+  # extensions import their library when they are enabled, so this only takes
+  # effect after a logout.
+  systemd.user.sessionVariables.GI_TYPELIB_PATH = lib.concatStringsSep ":" [
+    "${rounded-blur}/lib/girepository-1.0"
+    "${shaderbg.girLib}/lib/girepository-1.0"
+  ];
 
   # The stylesheet the extension above reads.
   xdg.configFile."gnome-shell/gnome-shell.css".source = ./gnome-shell.css;

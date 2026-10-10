@@ -243,6 +243,17 @@ export default class ShaderBgPreferences extends ExtensionPreferences {
             Gio.SettingsBindFlags.GET);
         group.add(budget);
 
+        // Off by default, and worth leaving off: a timed pass flushes Cogl's
+        // journal twice so that the query brackets the draw and nothing else.
+        const trace = new Adw.SwitchRow({
+            title: 'Log frame timings',
+            subtitle: 'Write a line a second to the journal with what each ' +
+                'frame spent waiting, on the processor, on the card, and ' +
+                'reaching the screen',
+        });
+        settings.bind('trace', trace, 'active', Gio.SettingsBindFlags.DEFAULT);
+        group.add(trace);
+
         return group;
     }
 

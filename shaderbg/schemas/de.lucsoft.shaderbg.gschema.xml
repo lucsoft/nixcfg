@@ -58,6 +58,19 @@
       </description>
     </key>
 
+    <key name="trace" type="b">
+      <default>false</default>
+      <summary>Log what each frame costs</summary>
+      <description>
+        Write a line a second to the journal giving, for the shader on the
+        primary monitor, how long a frame waited to be drawn, how much of it
+        was spent on the processor, how much the graphics card spent on the
+        shader itself, and how long it then took to reach the screen. For
+        working out where time goes; off by default, because the timing it
+        needs costs a little of its own.
+      </description>
+    </key>
+
     <key name="pause-fullscreen" type="b">
       <default>true</default>
       <summary>Pause while a window is fullscreen</summary>

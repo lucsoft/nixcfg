@@ -1,9 +1,11 @@
-import Clutter from 'gi://Clutter';
 import Cogl from 'gi://Cogl';
 import GLib from 'gi://GLib';
-import GObject from 'gi://GObject';
-import Graphene from 'gi://Graphene';
 import Meta from 'gi://Meta';
+
+// The effect, in C. home.nix puts the typelib on GI_TYPELIB_PATH; the Shell
+// picks that up from environment.d, so a fresh install of the library only
+// takes effect after a logout.
+import ShaderBg from 'gi://ShaderBg';
 
 import * as Background from 'resource:///org/gnome/shell/ui/background.js';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
@@ -156,12 +158,6 @@ vec4 _sb_fragment()
 }
 `;
 
-// All the work is in _sb_fragment, declared above the shader source where the
-// shader's own macros cannot rewrite it.
-const BODY = `
-    cogl_color_out = _sb_fragment();
-`;
-
 
 const EFFECT_NAME = 'shaderbg';
 
@@ -170,230 +166,43 @@ const EFFECT_NAME = 'shaderbg';
 // 0.6 and 0.65 is not worth a reallocation.
 const SCALE_STEPS = [1.0, 0.5, 0.25];
 
-// How much of a measured frame time may be the display's own pace rather than
-// the shader's. A frame is never observed arriving faster than the monitor
-// refreshes, so a time down there is the floor of the measurement and not a
-// reading of the shader at all.
-const MEASURE_FLOOR_MARGIN = 1.15;
-
+// The timing no longer touches the frame cap. A GL timer query reports the
+// work a pass of the shader was, not the pace it was asked for, so the window
+// is simply a stretch of ordinary frames with tracing switched on.
 const MEASURE_DELAY = 8;        // seconds to let the session settle first
-const MEASURE_WINDOW_MS = 2000; // how long the cap stays lifted
+const MEASURE_WINDOW_MS = 2000; // how long the shader is timed for
 const MEASURE_RETRY = 60;       // seconds, when the desktop was not visible
 const MEASURE_MIN_SAMPLES = 3;  // fewer than this and the window says nothing
 
-// A gap longer than this is the background not being drawn — the overview
-// took over, or a window covered it and Mutter culled it away. It is not a
-// slow frame, and averaging it in would read a hidden background as an
-// impossibly expensive shader. The cutoff is 2.5 frames a second; a shader
-// genuinely slower than that is past helping and belongs at the smallest
-// step whatever the rest of the numbers say.
-const MEASURE_STALL = 400000;   // microseconds
+// How often the trace prints a line, in seconds. Medians over the interval,
+// because at a cap of 100 one line a frame is a hundred lines a second.
+const TRACE_REPORT = 1;
 
-// A ClutterEffect, deliberately, and not a ClutterShaderEffect.
+// The effect itself is native, and lives in lib/src/shaderbg-effect.c. What
+// is left on this side is everything that is not per-pixel: the settings, the
+// rotation, the ticker, and the prelude above — a few microseconds of work a
+// frame, where the shader is millions of fragments.
 //
-// ClutterShaderEffect derives from ClutterOffscreenEffect, and that class
-// decides the size of its own buffer: clutter_offscreen_effect_pre_paint ties
-// the target size to the paint volume, the viewport to the target size, and
-// the modelview scale to the ratio between them. Viewport and modelview cancel
-// out, so the pixel density is nailed to the stage's and there is no way in
-// from outside — three attempts at rendering smaller produced three different
-// wrong pictures, all out of that one coupling.
+// It was moved for a number the frame budget could not otherwise have. The
+// budget needs to know what one pass of the shader costs, and the only honest
+// source for that is a GL timer query bracketing the draw. Cogl exposes none:
+// mutter 50 still carries COGL_FEATURE_ID_TIMESTAMP_QUERY in its headers but
+// nothing to call, and GJS has no GL binding to fall back on. Measuring the
+// wall-clock gap between paints instead — which is what this file used to do —
+// cannot read below one refresh interval, so every shader that fitted into a
+// frame measured as exactly one frame whether it had used 1 % of it or 99 %.
+// On a 144 Hz screen that was 6.9 ms for `drift`, which has no loop at all,
+// and 7.0 ms for `tiny-clouds`, which does 800 dependent texture fetches per
+// pixel and holds the card at 99 %. The budget was being handed two numbers
+// it could not tell apart.
 //
-// A plain ClutterEffect derives nothing from anything. It is handed a paint
-// node and may build whatever it likes under it, so the buffer size, the
-// viewport and the projection are all ours to pick. That is exactly what
-// gnome-shell's own ShellBlurEffect does to render its blur at a third of the
-// resolution, and this is modelled on it (src/shell-blur-effect.c).
-//
-// It also stays an *effect on the background actor*, so MetaBackgroundActor
-// keeps its own content and stays cullable. That matters more than the
-// downscaling does: Mutter dropping the background once a window covers it is
-// worth 54 W against 17 W here, which is larger than any saving below.
-const ShaderBgEffect = GObject.registerClass(
-class ShaderBgEffect extends Clutter.Effect {
-    constructor(source, scale, noise) {
-        super({});
-
-        this._scale = scale;
-        this._locations = new Map();
-
-        this._texture = null;
-        this._framebuffer = null;
-        this._bufferWidth = 0;
-        this._bufferHeight = 0;
-
-        const context = global.stage.context.get_backend().get_cogl_context();
-
-        // What the shader draws with. The hook runs after Cogl's own fragment
-        // code and overwrites cogl_color_out, which is why the declarations
-        // may safely #define names Cogl's generated code does not use.
-        this._pipeline = Cogl.Pipeline.new(context);
-        this._pipeline.add_snippet(Cogl.Snippet.new(
-            Cogl.SnippetHook.FRAGMENT, DECLARATIONS + '\n' + source, BODY));
-
-        // Layers 0..3 are iChannel0..3. They are set even for shaders that
-        // read none of them: layer 0 existing is what makes Cogl emit
-        // cogl_tex_coord0_in, which the body needs for its coordinates.
-        for (let i = 0; i < 4; i++) {
-            this._pipeline.set_layer_texture(i, noise);
-            this._pipeline.set_layer_wrap_mode(i, Cogl.PipelineWrapMode.REPEAT);
-        }
-
-        // What puts the result back on screen. Linear filtering is what turns
-        // a half-resolution buffer into a soft picture rather than a blocky
-        // one; for the kind of shader that gets downscaled — clouds, fluids,
-        // raymarched fog — the difference is close to invisible.
-        this._present = Cogl.Pipeline.new(context);
-        this._present.set_layer_filters(0,
-            Cogl.PipelineFilter.LINEAR, Cogl.PipelineFilter.LINEAR);
-        this._present.set_layer_wrap_mode(0, Cogl.PipelineWrapMode.CLAMP_TO_EDGE);
-
-        this.setFloat('iChannelSize', noise.get_width());
-    }
-
-    // The fraction of the actor's size the shader is actually rendered at.
-    // Changing it throws the buffer away; the next paint builds the new one.
-    get renderScale() {
-        return this._scale;
-    }
-
-    set renderScale(scale) {
-        if (scale === this._scale)
-            return;
-
-        this._scale = scale;
-        this._dropBuffer();
-        this.queue_repaint();
-    }
-
-    // Cogl addresses uniforms by location rather than by name, and the lookup
-    // is a string hash into a per-context table — worth doing once per name
-    // rather than once per frame. Unlike ClutterShaderEffect there is no
-    // GValue in the way, so the integral-number trap that needed a 1e-6 fudge
-    // before does not exist here.
-    setFloat(name, value) {
-        let location = this._locations.get(name);
-        if (location === undefined) {
-            location = this._pipeline.get_uniform_location(name);
-            this._locations.set(name, location);
-        }
-
-        this._pipeline.set_uniform_1f(location, value);
-    }
-
-    // Timing the shader means timing the gap between *its* paints, not the
-    // stage's. The stage paints for all sorts of reasons, and Mutter stops
-    // painting the background altogether once a window covers it — counting
-    // stage frames would read a culled background as a slow shader.
-    startSampling() {
-        this._samples = [];
-        this._lastPaint = 0;
-    }
-
-    stopSampling() {
-        const samples = this._samples ?? [];
-        this._samples = null;
-        return samples;
-    }
-
-    _dropBuffer() {
-        this._texture = null;
-        this._framebuffer = null;
-        this._bufferWidth = 0;
-        this._bufferHeight = 0;
-    }
-
-    _ensureBuffer(width, height) {
-        const w = Math.max(1, Math.floor(width * this._scale));
-        const h = Math.max(1, Math.floor(height * this._scale));
-
-        if (this._framebuffer && this._bufferWidth === w && this._bufferHeight === h)
-            return true;
-
-        this._dropBuffer();
-
-        const context = global.stage.context.get_backend().get_cogl_context();
-        const texture = Cogl.Texture2D.new_with_size(context, w, h);
-        if (!texture)
-            return false;
-
-        const framebuffer = Cogl.Offscreen.new_with_texture(texture);
-        if (!framebuffer)
-            return false;
-
-        // The buffer's own coordinate space: 0..w across, 0..h down. Picking
-        // this is the whole point of deriving from ClutterEffect — it is the
-        // step ClutterOffscreenEffect does for itself, and wrongly for us.
-        const projection = new Graphene.Matrix();
-        projection.init_translate(
-            new Graphene.Point3D({ x: -w / 2, y: -h / 2, z: 0 }));
-        projection.scale(2 / w, -2 / h, 1);
-        framebuffer.set_projection_matrix(projection);
-
-        this._present.set_layer_texture(0, texture);
-
-        this._texture = texture;
-        this._framebuffer = framebuffer;
-        this._bufferWidth = w;
-        this._bufferHeight = h;
-        return true;
-    }
-
-    // Two nested nodes, and the nesting is what does the scaling:
-    //
-    //   LayerNode(buffer, present)   draws its children into the buffer, then
-    //     rectangle 0..actor         draws the buffer over the whole actor
-    //     PipelineNode(shader)
-    //       rectangle 0..buffer      fills the buffer, at the buffer's size
-    //
-    // The shader therefore runs once per buffer pixel, and the buffer is
-    // stretched to the actor afterwards. No chain-up: the actor's own content
-    // is the wallpaper file underneath, and the shader replaces it.
-    vfunc_paint_node(node, _paintContext, _paintFlags) {
-        const actor = this.get_actor();
-        if (!actor)
-            return;
-
-        const box = actor.get_allocation_box();
-        const width = box.get_width();
-        const height = box.get_height();
-        if (width < 1 || height < 1)
-            return;
-
-        if (!this._ensureBuffer(width, height))
-            return;
-
-        if (this._samples) {
-            const now = GLib.get_monotonic_time();
-            if (this._lastPaint)
-                this._samples.push(now - this._lastPaint);
-            this._lastPaint = now;
-        }
-
-        const layer = Clutter.LayerNode.new_to_framebuffer(
-            this._framebuffer, this._present);
-        node.add_child(layer);
-        layer.add_rectangle(new Clutter.ActorBox({
-            x1: 0, y1: 0, x2: width, y2: height,
-        }));
-
-        const shader = Clutter.PipelineNode.new(this._pipeline);
-        layer.add_child(shader);
-        shader.add_rectangle(new Clutter.ActorBox({
-            x1: 0, y1: 0, x2: this._bufferWidth, y2: this._bufferHeight,
-        }));
-    }
-
-    // Taken off an actor, the buffer is so much dead video memory — a
-    // 3440x1440 RGBA texture is 19 MB, and there is one per monitor and per
-    // workspace preview.
-    vfunc_set_actor(actor) {
-        if (!actor)
-            this._dropBuffer();
-
-        super.vfunc_set_actor(actor);
-    }
-});
+// Two things came with it. ClutterStage::presented carries a ClutterFrameInfo,
+// a plain public struct with no GI boxed type, so the signal is marked
+// introspectable=0 and GJS cannot connect to it — in C it is a field read, and
+// it is what closes the path from the tick to the picture being on screen.
+// And the shader is now drawn into its buffer only when a tick has moved a
+// uniform, so a stage repaint for reasons of its own costs one textured quad
+// instead of a whole frame of the shader.
 
 // Shadertoy's most-used input by a wide margin is a 256x256 RGBA noise image,
 // and nine of the channel uses in this set want exactly that. It is generated
@@ -435,7 +244,10 @@ export default class ShaderBgExtension extends Extension {
         this._scale = 1;
         this._measureId = 0;
         this._measuring = null;
-        this._capOverride = 0;
+        this._tracedEffect = null;
+        this._traceId = 0;
+        this._traceReportId = 0;
+        this._samples = null;
 
         // pause-fullscreen is read inside the tick, but the timer's interval is
         // the cap, so changing that one has to rebuild it. The cap is also the
@@ -449,6 +261,7 @@ export default class ShaderBgExtension extends Extension {
             this._settings.connect('changed::frame-budget',
                 () => this._forgetMeasurements()),
             this._settings.connect('changed::scales', () => this._rescale()),
+            this._settings.connect('changed::trace', () => this._updateTracing()),
         ];
 
         this._settingsIds.push(...[
@@ -512,6 +325,7 @@ export default class ShaderBgExtension extends Extension {
         this._displayId = this._sessionId = 0;
 
         this._cancelMeasurement();
+        this._stopTraceReport();
         this._stopTicker();
 
         if (this._midnightId)
@@ -608,17 +422,6 @@ export default class ShaderBgExtension extends Extension {
         return `${entry.file}@${w}x${h}`;
     }
 
-    // The fastest a frame can possibly be observed. peek_stage_views is the
-    // only path to it from an extension — neither the stage nor an actor hands
-    // out its frame clock, but a stage view carries the rate itself.
-    _refreshRate() {
-        let best = 0;
-        for (const view of global.stage.peek_stage_views?.() ?? [])
-            best = Math.max(best, view.get_refresh_rate());
-
-        return best > 0 ? best : 60;
-    }
-
     _forgetMeasurements() {
         this._settings.set_value('scales', new GLib.Variant('a{sd}', {}));
     }
@@ -637,7 +440,7 @@ export default class ShaderBgExtension extends Extension {
         for (const actor of this._actors.keys()) {
             const effect = actor.get_effect(EFFECT_NAME);
             if (effect)
-                effect.renderScale = scale;
+                effect.set_render_scale(scale);
         }
     }
 
@@ -649,13 +452,20 @@ export default class ShaderBgExtension extends Extension {
     // and lowering it again when it does not hold is exactly the oscillation
     // this has to avoid.
     //
-    // So the frame *time* is measured instead, with the cap briefly lifted,
-    // and the scale follows from it in one step. Because the cost of a
-    // fragment shader is its fragment count, the time at any other scale is
-    // the measured time times the square of the ratio — the prediction holds
-    // for every step, not just the one it was taken at. A shader that was put
-    // on a quarter and later measured again comes straight back up to full if
-    // it can. Nothing is ever derived from the outcome of a previous change,
+    // Nor by the wall clock. Timing the gap between two paints was the first
+    // answer and it was wrong in a way that took a while to see: the gap
+    // cannot fall below one refresh interval, so it reported 6.9 ms for every
+    // shader that fitted into a frame — the same figure for `drift`, which has
+    // no loop, as for `tiny-clouds`, which saturates the card. That is why the
+    // budget appeared to do nothing.
+    //
+    // So the GPU's own time for one pass is what the verdict is made from, out
+    // of a timer query in the native effect. Because the cost of a fragment
+    // shader is its fragment count, the time at any other scale is the
+    // measured time times the square of the ratio — the prediction holds for
+    // every step, not just the one it was taken at. A shader that was put on a
+    // quarter and later measured again comes straight back up to full if it
+    // can. Nothing is ever derived from the outcome of a previous change,
     // which is what keeps it from swinging.
     //
     // Measured: Oceanic at 3440x1440 takes 57 ms a frame, and 32 ms at half
@@ -693,13 +503,119 @@ export default class ShaderBgExtension extends Extension {
             GLib.source_remove(this._measureId);
         this._measureId = 0;
 
+        this._stopTracing();
+
         if (this._measuring) {
-            this._measuring.stopSampling();
             this._measuring = null;
-            this._capOverride = 0;
             this._applyScale(this._scaleBeforeMeasuring);
-            this._restartTicker();
         }
+    }
+
+    // Tracing is what makes the effect emit its frame signal, and it is not
+    // free: a timed pass flushes Cogl's journal twice, so that the query
+    // brackets this draw and nothing else. It is switched on for the
+    // measurement window and for the trace setting, and off the rest of the
+    // time.
+    _startTracing(effect, onFrame) {
+        this._stopTracing();
+
+        this._tracedEffect = effect;
+        this._traceId = effect.connect('frame', onFrame);
+        effect.set_tracing(true);
+    }
+
+    _stopTracing() {
+        if (!this._tracedEffect)
+            return;
+
+        this._tracedEffect.set_tracing(false);
+        this._tracedEffect.disconnect(this._traceId);
+        this._tracedEffect = null;
+        this._traceId = 0;
+    }
+
+    // ---- the end-to-end path ------------------------------------------------
+    //
+    // Four spans, from the timer deciding a frame is due to the picture being
+    // on the screen:
+    //
+    //   tick→draw   the repaint request waiting for the actor to be painted
+    //   cpu         issuing the draw, which is all this side still does
+    //   gpu         the shader pass itself, out of a GL timer query
+    //   draw→screen that frame reaching the display
+    //
+    // The last of those is the reason the effect is native and not a few
+    // hundred lines of JavaScript. ClutterStage::presented carries a
+    // ClutterFrameInfo — a public struct in C, with the presentation time in
+    // it, and no GI boxed type — so the signal is marked introspectable=0 and
+    // GJS cannot connect to it at all.
+    //
+    // Reported as a median a second, not a line a frame: at a cap of 100 the
+    // latter is a hundred lines a second and the journal is not the place for
+    // it.
+    _updateTracing() {
+        // The measurement owns the effect's tracing while it runs, and puts it
+        // back the way it found it afterwards.
+        if (this._measuring)
+            return;
+
+        this._stopTraceReport();
+
+        if (!this._settings.get_boolean('trace')) {
+            this._stopTracing();
+            return;
+        }
+
+        const actor = [...this._actors.keys()].find(
+            a => a.mapped && a.monitor === Main.layoutManager.primaryIndex);
+        const effect = actor?.get_effect(EFFECT_NAME);
+        if (!effect)
+            return;
+
+        if (!effect.has_gpu_timer())
+            console.log('shaderbg: no GPU timer query on this driver, ' +
+                'the gpu span will read as a dash');
+
+        const spans = { latency: [], cpu: [], gpu: [], present: [] };
+
+        this._startTracing(effect,
+            (_e, _serial, latency, cpu, gpu, present) => {
+                if (latency >= 0) spans.latency.push(latency);
+                if (cpu >= 0) spans.cpu.push(cpu);
+                if (gpu >= 0) spans.gpu.push(gpu);
+                if (present >= 0) spans.present.push(present);
+            });
+
+        this._traceReportId = GLib.timeout_add_seconds(
+            GLib.PRIORITY_DEFAULT, TRACE_REPORT, () => {
+                const median = xs => {
+                    if (xs.length === 0)
+                        return '—';
+                    xs.sort((a, b) => a - b);
+                    return `${xs[Math.floor(xs.length / 2)].toFixed(2)} ms`;
+                };
+
+                const frames = Math.max(spans.latency.length, spans.gpu.length);
+                if (frames > 0) {
+                    console.log(`shaderbg: ${this._entry?.file} at ` +
+                        `${this._scale}x, ${frames} frames — ` +
+                        `tick→draw ${median(spans.latency)}, ` +
+                        `cpu ${median(spans.cpu)}, ` +
+                        `gpu ${median(spans.gpu)}, ` +
+                        `draw→screen ${median(spans.present)}`);
+                }
+
+                for (const key of Object.keys(spans))
+                    spans[key].length = 0;
+
+                return GLib.SOURCE_CONTINUE;
+            });
+    }
+
+    _stopTraceReport() {
+        if (this._traceReportId)
+            GLib.source_remove(this._traceReportId);
+        this._traceReportId = 0;
     }
 
     _measure() {
@@ -713,24 +629,33 @@ export default class ShaderBgExtension extends Extension {
             return;
         }
 
+        // No timer query on this driver, so there is no number to hold against
+        // the budget. Full resolution is the honest answer rather than a
+        // verdict reached from something else.
+        if (!effect.has_gpu_timer()) {
+            console.log('shaderbg: no GPU timer query on this driver, ' +
+                'leaving every shader at full resolution');
+            return;
+        }
+
         // Always at full resolution, whatever it is currently rendering at.
-        // A downscaled shader is almost always fast enough to be limited by
-        // the display rather than by itself, and a frame time pinned to the
-        // refresh rate says nothing about how much work it really is — so a
-        // shader that had been put on a quarter could never be shown to have
-        // earned its way back up. Measuring at 1.0 every time also makes the
-        // prediction below a plain multiplication instead of a ratio.
+        // That makes the prediction below a plain multiplication instead of a
+        // ratio, and lets a shader that had been put on a quarter earn its way
+        // back up.
         this._scaleBeforeMeasuring = this._scale;
         this._applyScale(1.0);
 
         this._measuring = effect;
-        effect.startSampling();
+        this._samples = [];
+        this._startTracing(effect, (_e, _serial, _latency, _build, gpuMs) => {
+            if (gpuMs >= 0)
+                this._samples.push(gpuMs);
+        });
 
-        // Off the leash for the length of the window: the frame time is only
-        // visible when the shader, and not the timer, is what sets the pace.
-        this._capOverride = 1000;
-        this._restartTicker();
-
+        // The cap is left exactly where it is. The query times the pass and
+        // not the pace, so there is nothing to be had from asking for frames
+        // faster than the setting says — which also makes a measurement
+        // invisible, instead of two seconds of the fans spinning up.
         this._measureId = GLib.timeout_add(
             GLib.PRIORITY_DEFAULT, MEASURE_WINDOW_MS, () => {
                 this._measureId = 0;
@@ -749,56 +674,47 @@ export default class ShaderBgExtension extends Extension {
     }
 
     _finishMeasurement() {
-        const effect = this._measuring;
         this._measuring = null;
-        this._capOverride = 0;
+        this._stopTracing();
 
-        const samples = effect.stopSampling()
-            .filter(gap => gap <= MEASURE_STALL);
-        this._restartTicker();
+        const samples = this._samples ?? [];
+        this._samples = null;
 
-        // Nothing left after the stalls were dropped: the background was not
-        // on screen for any useful part of the window. Come back later rather
-        // than read that as a verdict.
+        // The background was not drawn for any useful part of the window: the
+        // overview took over, or a window covered it and Mutter culled it
+        // away. Come back later rather than read that as a verdict.
         if (samples.length < MEASURE_MIN_SAMPLES) {
             this._applyScale(this._scaleBeforeMeasuring);
             this._retryMeasurement();
             return;
         }
 
-        // The median, not the mean: a compositor frame that waited on
-        // something else is an outlier, and there is no reason to let one
-        // drag the verdict.
+        // The median, not the mean: one pass that landed behind something else
+        // on the card is an outlier, and there is no reason to let it drag the
+        // verdict.
         samples.sort((a, b) => a - b);
-        const frameTime = samples[Math.floor(samples.length / 2)] / 1e6;
+        const passTime = samples[Math.floor(samples.length / 2)] / 1000;
 
         // How much of each frame the shader may take. The rest is what the
         // compositor has left for the windows, and where the line goes is the
         // setting: at 10 % the card spends a tenth of its time on the
         // background, at 100 % the budget is the whole frame.
+        //
+        // Nothing is exempt from this any more. The old wall-clock timing
+        // could not read below one refresh interval, so a budget under that
+        // interval was a test no shader could pass and every shader had to be
+        // let off it — which is exactly why a budget of 10 % used to leave the
+        // card at 100 %. A GPU time has no such floor: 0.4 ms is 0.4 ms.
         const cap = Math.max(1, this._settings.get_int('fps-cap'));
         const budget = this._settings.get_int('frame-budget') / 100 / cap;
-
-        // The shader never gets to paint faster than the display refreshes, so
-        // a frame time at the refresh interval is the floor of the measurement
-        // and not a reading of the shader. A shader down there has not been
-        // shown to cost anything and keeps full resolution whatever the budget
-        // asks for — the budget only judges shaders slow enough to be seen at
-        // all. Without that, a budget under the refresh interval would
-        // downscale the whole set for failing a test nothing can pass.
-        const floor = 1 / this._refreshRate();
 
         // Measured at 1.0, so the prediction for a step is the square of that
         // step: a shader costs what its fragments cost.
         let chosen = SCALE_STEPS[SCALE_STEPS.length - 1];
-        if (frameTime <= floor * MEASURE_FLOOR_MARGIN) {
-            chosen = 1;
-        } else {
-            for (const step of SCALE_STEPS) {
-                if (frameTime * step ** 2 <= budget) {
-                    chosen = step;
-                    break;
-                }
+        for (const step of SCALE_STEPS) {
+            if (passTime * step ** 2 <= budget) {
+                chosen = step;
+                break;
             }
         }
 
@@ -807,10 +723,14 @@ export default class ShaderBgExtension extends Extension {
         this._settings.set_value('scales', new GLib.Variant('a{sd}', measured));
 
         console.log(`shaderbg: ${this._entry.file} takes ` +
-            `${(frameTime * 1000).toFixed(1)} ms a frame at full resolution ` +
-            `(budget ${(budget * 1000).toFixed(1)} ms), rendering at ${chosen}x`);
+            `${(passTime * 1000).toFixed(2)} ms of GPU at full resolution ` +
+            `(budget ${(budget * 1000).toFixed(2)} ms), rendering at ${chosen}x`);
 
         this._applyScale(chosen);
+
+        // The measurement had tracing to itself; hand it back if the setting
+        // wants it.
+        this._updateTracing();
     }
 
     _readShader(file) {
@@ -831,8 +751,13 @@ export default class ShaderBgExtension extends Extension {
         if (!this._source || this._actors.has(actor))
             return;
 
-        const effect = new ShaderBgEffect(
-            this._source, this._scale, this._noiseTexture());
+        // The prelude is glued on here rather than in C: it is text, it is where
+        // every Shadertoy-to-Cogl workaround lives, and it is far easier to
+        // iterate on in a file the Shell re-reads than in one that needs a
+        // rebuild. C adds only the snippet body that calls into it.
+        const effect = ShaderBg.Effect.new(
+            DECLARATIONS + '\n' + this._source, this._noiseTexture());
+        effect.set_render_scale(this._scale);
         actor.add_effect_with_name(EFFECT_NAME, effect);
 
         // Give the geometry before the actor is ever painted. The first paint
@@ -892,6 +817,7 @@ export default class ShaderBgExtension extends Extension {
         this._updatePaused();
         this._restartTicker();
         this._scheduleMeasurement();
+        this._updateTracing();
     }
 
     // ---- driving the clock ------------------------------------------------
@@ -920,8 +846,7 @@ export default class ShaderBgExtension extends Extension {
         // requests land between vblanks, so the achieved rate quantises to
         // the refresh rate and comes out under the cap. For a wallpaper that
         // is much the better trade.
-        const fps = this._capOverride ||
-            Math.max(1, this._settings.get_int('fps-cap'));
+        const fps = Math.max(1, this._settings.get_int('fps-cap'));
         this._tickId = GLib.timeout_add(
             GLib.PRIORITY_DEFAULT, Math.round(1000 / fps), () => {
                 this._tick();
@@ -967,9 +892,10 @@ export default class ShaderBgExtension extends Extension {
 
             this._setGeometry(actor, effect);
 
-            effect.setFloat('iTime', this._time);
-            effect.setFloat('iTimeDelta', delta * speed);
-            effect.setFloat('iFrameF', this._frame);
+            effect.mark_tick(now);
+            effect.set_uniform('iTime', this._time);
+            effect.set_uniform('iTimeDelta', delta * speed);
+            effect.set_uniform('iFrameF', this._frame);
             effect.queue_repaint();
         }
     }
@@ -989,13 +915,20 @@ export default class ShaderBgExtension extends Extension {
     // for, which is the monitor's and has nothing to do with how large the
     // actor happens to be drawn. Where the actor is no longer matters — see
     // the note on cogl_tex_coord_in in the prelude.
+    //
+    // How large it is does not matter either, and that is what keeps the
+    // overview smooth. The buffer is sized from this resolution, so a
+    // workspace preview being animated from full size down to a thumbnail
+    // moves only the rectangle the finished texture is stretched over.
+    // Sizing it from the actor instead meant throwing away a 19 MB texture
+    // and redrawing the shader on every frame of that animation, which is
+    // what the flicker on opening the overview was.
     _setGeometry(actor, effect) {
         const monitor = Main.layoutManager.monitors[actor.monitor];
         if (!monitor)
             return;
 
-        effect.setFloat('iResX', monitor.width);
-        effect.setFloat('iResY', monitor.height);
+        effect.set_resolution(monitor.width, monitor.height);
     }
 
     // Fullscreen is handled per actor in the tick, because it is a property of

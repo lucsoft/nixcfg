@@ -115,6 +115,14 @@ answers `NotSupported: deprecated and does not work`. On Wayland there is no
 way to restart the Shell either, so it takes a logout. Say so instead of
 leaving it looking broken.
 
+The same goes for `shaderbg/lib`, the C half of shaderbg that the extension
+imports as `gi://ShaderBg`. It reaches the Shell through
+`systemd.user.sessionVariables.GI_TYPELIB_PATH` in `home.nix`, which
+environment.d only re-reads at login, so a rebuilt typelib needs a logout too.
+Its `meson.build` names `libmutter-18` literally, exactly as `rounded-blur`
+does, so a mutter bump fails to configure rather than building something the
+Shell would refuse to load.
+
 `--file` matters: without it `nixos-rebuild` falls back to
 `/etc/nixos/configuration.nix`, which is not this repo.
 

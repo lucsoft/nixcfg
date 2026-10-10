@@ -3,11 +3,17 @@
 { lib
 , stdenvNoCC
 , glib
+, callPackage
 }:
 
 let
   uuid = "shaderbg@lucsoft.de";
   sources = import ./sources.nix;
+
+  # The ClutterEffect, in C, reached from extension.js as `gi://ShaderBg`.
+  # Carried through as passthru so home.nix needs one callPackage and not two;
+  # it has to put girLib on GI_TYPELIB_PATH for the Shell to find it.
+  girLib = callPackage ./lib { };
 in
 
 stdenvNoCC.mkDerivation {
@@ -58,7 +64,10 @@ stdenvNoCC.mkDerivation {
   '';
 
   # programs.gnome-shell takes the UUID from here to write enabled-extensions.
-  passthru.extensionUuid = uuid;
+  passthru = {
+    extensionUuid = uuid;
+    inherit girLib;
+  };
 
   meta = {
     description = "Draws a Shadertoy fragment shader as the GNOME desktop background";
