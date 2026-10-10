@@ -170,9 +170,11 @@ const EFFECT_NAME = 'shaderbg';
 // 0.6 and 0.65 is not worth a reallocation.
 const SCALE_STEPS = [1.0, 0.5, 0.25];
 
-// A frame may take this fraction of the interval the cap allows. Half, so
-// that the compositor still has somewhere to put the windows.
-const MEASURE_BUDGET = 0.5;
+// How much of a measured frame time may be the display's own pace rather than
+// the shader's. A frame is never observed arriving faster than the monitor
+// refreshes, so a time down there is the floor of the measurement and not a
+// reading of the shader at all.
+const MEASURE_FLOOR_MARGIN = 1.15;
 
 const MEASURE_DELAY = 8;        // seconds to let the session settle first
 const MEASURE_WINDOW_MS = 2000; // how long the cap stays lifted
@@ -436,9 +438,17 @@ export default class ShaderBgExtension extends Extension {
         this._capOverride = 0;
 
         // pause-fullscreen is read inside the tick, but the timer's interval is
-        // the cap, so changing that one has to rebuild it.
+        // the cap, so changing that one has to rebuild it. The cap is also the
+        // interval the frame budget is a share of, so moving either of them
+        // throws away every verdict reached against the budget they made.
         this._settingsIds = [
-            this._settings.connect('changed::fps-cap', () => this._restartTicker()),
+            this._settings.connect('changed::fps-cap', () => {
+                this._restartTicker();
+                this._forgetMeasurements();
+            }),
+            this._settings.connect('changed::frame-budget',
+                () => this._forgetMeasurements()),
+            this._settings.connect('changed::scales', () => this._rescale()),
         ];
 
         this._settingsIds.push(...[
@@ -609,6 +619,19 @@ export default class ShaderBgExtension extends Extension {
         return best > 0 ? best : 60;
     }
 
+    _forgetMeasurements() {
+        this._settings.set_value('scales', new GLib.Variant('a{sd}', {}));
+    }
+
+    // Timings can be dropped from outside — the preferences window's "time
+    // every shader again", or a budget change above. Picking that up here is
+    // what makes it take effect now rather than at the next login: back to
+    // full resolution, and timed afresh.
+    _rescale() {
+        this._applyScale(this._scaleOf(this._entry));
+        this._scheduleMeasurement();
+    }
+
     _applyScale(scale) {
         this._scale = scale;
         for (const actor of this._actors.keys()) {
@@ -749,24 +772,33 @@ export default class ShaderBgExtension extends Extension {
         samples.sort((a, b) => a - b);
         const frameTime = samples[Math.floor(samples.length / 2)] / 1e6;
 
-        // The shader never gets to paint faster than the display refreshes,
-        // so a frame time at the refresh interval is the floor of what can be
-        // observed and not a reading of the shader at all. Asking for
-        // anything below it would downscale every shader on a monitor fast
-        // enough to make the question moot — at 144 Hz and a cap of 120 the
-        // budget alone would be 4.2 ms against a floor of 6.9 ms, and
-        // everything would fail a test nothing can pass.
+        // How much of each frame the shader may take. The rest is what the
+        // compositor has left for the windows, and where the line goes is the
+        // setting: at 10 % the card spends a tenth of its time on the
+        // background, at 100 % the budget is the whole frame.
         const cap = Math.max(1, this._settings.get_int('fps-cap'));
+        const budget = this._settings.get_int('frame-budget') / 100 / cap;
+
+        // The shader never gets to paint faster than the display refreshes, so
+        // a frame time at the refresh interval is the floor of the measurement
+        // and not a reading of the shader. A shader down there has not been
+        // shown to cost anything and keeps full resolution whatever the budget
+        // asks for — the budget only judges shaders slow enough to be seen at
+        // all. Without that, a budget under the refresh interval would
+        // downscale the whole set for failing a test nothing can pass.
         const floor = 1 / this._refreshRate();
-        const budget = Math.max(MEASURE_BUDGET / cap, floor * 1.15);
 
         // Measured at 1.0, so the prediction for a step is the square of that
         // step: a shader costs what its fragments cost.
         let chosen = SCALE_STEPS[SCALE_STEPS.length - 1];
-        for (const step of SCALE_STEPS) {
-            if (frameTime * step ** 2 <= budget) {
-                chosen = step;
-                break;
+        if (frameTime <= floor * MEASURE_FLOOR_MARGIN) {
+            chosen = 1;
+        } else {
+            for (const step of SCALE_STEPS) {
+                if (frameTime * step ** 2 <= budget) {
+                    chosen = step;
+                    break;
+                }
             }
         }
 

@@ -226,6 +226,23 @@ export default class ShaderBgPreferences extends ExtensionPreferences {
         downscale.add_suffix(forget);
         group.add(downscale);
 
+        // The number the timing is judged against. Not a frame rate: the cap
+        // above says how often the background is drawn, this says how much of
+        // each of those frames the card may spend drawing it.
+        const budget = new Adw.SpinRow({
+            title: 'Frame budget',
+            subtitle: 'Percent of each frame a shader may take before it is ' +
+                'drawn smaller; lower leaves the card idle more of the time',
+            adjustment: new Gtk.Adjustment({
+                lower: 5, upper: 100, step_increment: 5, page_increment: 10,
+            }),
+        });
+        settings.bind('frame-budget', budget, 'value',
+            Gio.SettingsBindFlags.DEFAULT);
+        settings.bind('auto-downscale', budget, 'sensitive',
+            Gio.SettingsBindFlags.GET);
+        group.add(budget);
+
         return group;
     }
 

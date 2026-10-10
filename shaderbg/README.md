@@ -243,16 +243,24 @@ seconds, and the scale follows in one step:
 - The largest of 1.0, 0.5, 0.25 whose predicted time fits the budget, and
   because cost is fragment count the prediction is the measured time times
   the square of the step.
-- The budget is half the cap's interval, **but never below the refresh
-  interval**. The shader cannot paint faster than the display refreshes, so
-  asking for less than that is asking for something nothing can deliver — at
-  144 Hz and a cap of 120 the budget alone would be 4.2 ms against a floor of
-  6.9 ms, and every shader would be downscaled for failing an impossible test.
+- The budget is a share of the cap's interval — `frame-budget`, a percentage,
+  half by default. That is also what the card's load settles at: at a 60 fps
+  cap and 50 %, a shader that just fits spends 8.3 ms of every 16.7 ms
+  drawing. Lowering it is how to ask for an idler card and accept a softer
+  background.
+- **A measurement at the refresh interval is not a reading**, and the shader
+  behind it keeps full resolution however small the budget is. The shader
+  cannot paint faster than the display refreshes, so everything cheap piles up
+  against that floor indistinguishably — judging it against a budget below the
+  floor would downscale the whole set for failing a test nothing can pass.
+  Only shaders slow enough to be measured are judged at all.
 
 Nothing is ever derived from the outcome of a previous change, which is what
 keeps it from swinging. The verdict is kept per shader *and* per screen
 resolution, so plugging in another monitor means a fresh measurement rather
-than a stale one.
+than a stale one. Moving the cap or the budget throws every verdict away,
+because each one was reached against the old numbers; the shader on screen is
+timed again eight seconds later.
 
 The square law understates the cheap end — oceanic takes 57 ms at full
 resolution and 32 ms at half, against 14 ms predicted, because part of each

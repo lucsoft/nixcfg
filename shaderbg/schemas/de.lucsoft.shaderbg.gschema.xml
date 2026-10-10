@@ -35,6 +35,19 @@
       </description>
     </key>
 
+    <key name="frame-budget" type="i">
+      <default>50</default>
+      <range min="5" max="100"/>
+      <summary>Share of a frame a shader may take</summary>
+      <description>
+        How much of the time between two frames the background is allowed to
+        spend drawing, as a percentage. The rest is what the compositor has
+        left for everything else. Lower values keep the graphics card idle
+        more of the time, at the cost of drawing more shaders at a lower
+        resolution. Only has an effect while shaders are timed.
+      </description>
+    </key>
+
     <key name="scales" type="a{sd}">
       <default>{}</default>
       <summary>The resolution each shader was found to manage</summary>
