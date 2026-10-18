@@ -219,6 +219,11 @@ in
 
   services.printing.enable = true;
 
+  # The board's RGB is an "ASRock LED Controller" on USB (26CE:01A2), which
+  # OpenRGB's Polychrome USB driver knows. The module's udev rules are the
+  # point — the hidraw node is root-only otherwise.
+  services.hardware.openrgb.enable = true;
+
   services.pulseaudio.enable = false;
   security.rtkit.enable = true;
   services.pipewire = {
