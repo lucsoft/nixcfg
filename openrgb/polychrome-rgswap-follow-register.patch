@@ -1,0 +1,76 @@
+Make the Polychrome USB colour order follow the RGSwap register.
+
+The ASRock Polychrome USB controller can swap the red and green bytes of
+every colour it is given, per zone, through the RGSwap register. The
+driver reads the power-on value of that register at init and stores it in
+device_info.rgswap, then uses it to decide the byte order it packs.
+
+That is correct until the mode changes. Entering Direct calls
+SetRGSwap(false), which writes an all-zero register -- upstream does this
+because rewriting the register makes the headers flash. Leaving Direct
+calls SetRGSwap(true), which writes the stored value back. Neither
+updates device_info.rgswap, so in Direct the driver keeps compensating in
+software for a swap it has just switched off in hardware, and red and
+green come out exchanged.
+
+Measured here on a B650I Lightning WiFi (26CE:01A2), by talking to
+/dev/hidraw0 directly: the board reports RGSwap 0x0c, so both addressable
+headers swap. Writing 0x00 to the register and then sending R=0xff to a
+header lights it green; writing 0x0c back and sending the same byte
+lights it red.
+
+So remember what was last written and pack against that, rather than
+against a value the device no longer holds. This is the reported
+behaviour in OpenRGB issue #2894.
+
+Not sent upstream yet: the fix is right but untestable where it matters
+most, because per-LED streaming produces nothing at all on this board --
+see the openrgb entry in configuration.nix.
+
+--- a/Controllers/ASRockPolychromeUSBController/ASRockPolychromeUSBController.h
++++ b/Controllers/ASRockPolychromeUSBController/ASRockPolychromeUSBController.h
+@@ -142,6 +142,7 @@
+     hid_device*                         dev;
+     std::vector<PolychromeDeviceInfo>   device_info;
+     std::string                         location;
++    bool                                rgswaplive[8] = { 0 };
+ 
+     void WriteRGSwap
+         (
+--- a/Controllers/ASRockPolychromeUSBController/ASRockPolychromeUSBController.cpp
++++ b/Controllers/ASRockPolychromeUSBController/ASRockPolychromeUSBController.cpp
+@@ -237,7 +237,7 @@
+     usb_buf[0x03] = device_info.zone_type;
+ 	usb_buf[0x04] = mode;
+ 
+-    if(device_info.rgswap)
++    if(rgswaplive[device_info.zone_type])
+     {
+         usb_buf[0x05] = RGBGetRValue(rgb);
+         usb_buf[0x06] = RGBGetGValue(rgb);
+@@ -273,7 +273,7 @@
+ 
+         for(std::size_t led_idx = 0; led_idx < zones[zone_idx].leds_count; led_idx++)
+         {
+-            if(device_info.rgswap)
++            if(rgswaplive[device_info.zone_type])
+             {
+                 combined_leds_rgb.push_back(RGBGetRValue(zones[zone_idx].colors[led_idx]));
+                 combined_leds_rgb.push_back(RGBGetGValue(zones[zone_idx].colors[led_idx]));
+@@ -382,6 +382,16 @@
+     )
+ {
+     unsigned char rgconfig[1] = {static_cast<unsigned char>((((unsigned char)chnl8 << 7) | ((unsigned char)pcb << 6) | ((unsigned char)io << 5) | ((unsigned char)pch << 4) | ((unsigned char)ahdr1 << 3) | ((unsigned char)ahdr0 << 2) | ((unsigned char)hdr1 << 1) | (unsigned char)hdr0))};
++
++    /*-----------------------------------------------------------------*\
++    | Remember what the device was actually told, so that the colour    |
++    | order below follows the register instead of the power-on value    |
++    \*-----------------------------------------------------------------*/
++    rgswaplive[0] = hdr0;  rgswaplive[1] = hdr1;
++    rgswaplive[2] = ahdr0; rgswaplive[3] = ahdr1;
++    rgswaplive[4] = pch;   rgswaplive[5] = io;
++    rgswaplive[6] = pcb;   rgswaplive[7] = chnl8;
++
+     WriteHeader(POLYCHROME_USB_RGSWAP_CFG, rgconfig, 1);
+ }
+ 

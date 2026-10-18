@@ -224,6 +224,16 @@ in
   # point — the hidraw node is root-only otherwise.
   services.hardware.openrgb.enable = true;
 
+  # Patched so the colour order follows the RGSwap register; see the patch
+  # header. Only the firmware effects and Static are worth using here:
+  # Direct's per-LED chunk stream is acknowledged packet by packet and still
+  # never reaches the LEDs, which is OpenRGB issue #4837 against this same
+  # 26CE:01A2. Measured by driving /dev/hidraw0 directly — modes 0x0F, 0xE2
+  # and 0xE3 all stay dark, 0x0F additionally flickers single LEDs.
+  services.hardware.openrgb.package = pkgs.openrgb.overrideAttrs (o: {
+    patches = (o.patches or [ ]) ++ [ ./openrgb/polychrome-rgswap-follow-register.patch ];
+  });
+
   services.pulseaudio.enable = false;
   security.rtkit.enable = true;
   services.pipewire = {
