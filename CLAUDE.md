@@ -98,12 +98,20 @@ Always evaluate first — never commit a change that has not been built:
     nixos-rebuild dry-build --file ~/nixcfg   # system side
     home-manager build && rm -rf result       # user side
 
-Then apply. The user side needs no sudo, so an agent session runs it itself —
-build first, switch second, no need to ask. The system side does need sudo,
-which an agent session does not have, so that one stays the user's job.
+Then apply. Neither half waits for the user. The user side needs no sudo at
+all; the system side goes through `pkexec`, which polkit answers with a
+password dialog on the machine's own screen — so build first, apply second,
+no need to ask.
 
-    home-manager switch                         # user side, no sudo — go ahead
-    sudo nixos-rebuild switch --file ~/nixcfg   # system side — ask the user
+    home-manager switch                                # user side, no sudo
+    pkexec /run/current-system/sw/bin/nixos-rebuild \
+        switch --file /home/lucsoft/nixcfg             # system side
+
+Both paths are spelled out because `pkexec` wants an absolute path to the
+binary and sanitises the environment — `HOME` becomes root's, so `~/nixcfg`
+would point somewhere else. Claude Code's auto mode blocks the call unless
+`.claude/settings.local.json` allows it — and `.claude/` is gitignored, so
+that rule is not part of this repo and has to be granted per machine.
 
 Work happens directly on `main`, and committing and pushing there is part of
 finishing a change rather than something to ask about each time.
