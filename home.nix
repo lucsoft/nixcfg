@@ -24,6 +24,14 @@ let
 
   helium = pkgs.callPackage "${sources.helium}/helium.nix" { };
 
+  # No channel carries this. The open nixpkgs PR is one self-contained file,
+  # so the pin is that branch and callPackage reaches into it — building the
+  # package against the nixpkgs above, not the master the fork sits on. The
+  # pin is frozen because that branch rebases onto master, and every rebase
+  # would otherwise read as a pending update. Both go once the PR lands.
+  claude-desktop = pkgs.callPackage
+    "${sources.claude-desktop}/pkgs/by-name/cl/claude-desktop/package.nix" { };
+
   # Makes a switch visible to the session that is already running, instead of
   # at the next login.
   #
@@ -101,6 +109,7 @@ in
     signal-desktop
     gnome-secrets
     helium
+    claude-desktop
     resources
 
     # unstable until bottles v67 is stable

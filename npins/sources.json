@@ -1,5 +1,19 @@
 {
   "pins": {
+    "claude-desktop": {
+      "type": "Git",
+      "repository": {
+        "type": "GitHub",
+        "owner": "minegameYTB",
+        "repo": "nixpkgs"
+      },
+      "branch": "add/claude-desktop",
+      "submodules": false,
+      "revision": "7bcfaba46092f932ecb07cc968020939ad0d3d9e",
+      "url": "https://github.com/minegameYTB/nixpkgs/archive/7bcfaba46092f932ecb07cc968020939ad0d3d9e.tar.gz",
+      "hash": "sha256-l7mdr9CZXyNMtBJiPFq9hCVkxHzZnImhyo+fYvx5FjI=",
+      "frozen": true
+    },
     "gnome-rounded-blur": {
       "type": "GitRelease",
       "repository": {

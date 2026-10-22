@@ -77,6 +77,17 @@ No channels, no flakes. Multiple pins live in `npins/sources.json`:
   TDP or GPU clock control there. Pinned to the release tag.
   `steamos-manager/default.nix` builds it; `steamos-manager/device.toml`
   describes this board, because upstream's own device table is handhelds only.
+- **`claude-desktop`** — `minegameYTB/nixpkgs`, the branch behind the open
+  nixpkgs PR #537215, which is the only packaging of Anthropic's official
+  Linux build that handles Cowork. Nothing imports that fork as a nixpkgs;
+  `home.nix` just `callPackage`s the one file the PR adds,
+  `pkgs/by-name/cl/claude-desktop/package.nix`, so the app builds against
+  the nixpkgs pinned above. Added `--frozen`, because the branch rebases
+  onto master and `npins update` would otherwise report a move whenever it
+  does — bump it with `npins update claude-desktop` when the PR itself
+  moves. The `.deb` version and hash are literals inside `package.nix`, so
+  that is also what updates the app. Drop the pin and take `claude-desktop`
+  from nixpkgs once the PR lands.
 
 `nix.nixPath` in `configuration.nix` aims `<nixpkgs>` at the same pin, because
 that path is what standalone Home Manager builds against.
