@@ -71,6 +71,18 @@ let
     esac
   '';
 
+  # The connector the ghost is forced onto: a port of the dGPU that no cable
+  # reaches, because forcing one takes it away from whatever is really plugged
+  # in. The card's only HDMI is HDMI-A-1 and a real monitor hangs there now, so
+  # this is a DisplayPort instead — forcing one works the same, even though DP
+  # normally trains a link against a sink: the override EDID supplies the modes
+  # and the atomic commit lands without a sink ever answering. DP-1 is the
+  # other free one, should this port ever get a cable. Both halves below can
+  # spell it the same way, which the HDMI name did not allow: mutter drops the
+  # connector type's -A suffix and calls the kernel's HDMI-A-1 HDMI-1, while
+  # for DisplayPort the two names already agree.
+  ghost-connector = "DP-3";
+
   # The same forcing the kernel command line can do, done at run time instead.
   # A connector forced at boot is there for every session the machine ever
   # starts, the greeter's included — and the greeter will put the login prompt
@@ -83,10 +95,11 @@ let
     # the dri minor is whatever it is, and the connector directory has been
     # spelled both ways across kernels
     dir=
-    for candidate in /sys/kernel/debug/dri/*/HDMI-A-1 /sys/kernel/debug/dri/*/card*-HDMI-A-1; do
+    for candidate in /sys/kernel/debug/dri/*/${ghost-connector} \
+                     /sys/kernel/debug/dri/*/card*-${ghost-connector}; do
       if [ -e "$candidate/force" ]; then dir=$candidate; break; fi
     done
-    [ -n "$dir" ] || { echo "ghost-monitor: no debugfs entry for HDMI-A-1" >&2; exit 1; }
+    [ -n "$dir" ] || { echo "ghost-monitor: no debugfs entry for ${ghost-connector}" >&2; exit 1; }
 
     case "$1" in
     up)
@@ -303,7 +316,7 @@ in
   environment.systemPackages = [ steamos-manager ];
 
   # The mode list of a monitor that is not there, so Moonlight can stream the
-  # MacBook Pro 14"'s own 3024x1964: the panel on DP-2 offers nothing near it,
+  # MacBook Pro 14"'s own 3024x1964: no panel here offers anything near it,
   # and mutter only ever hands out what a panel reports. Nothing here reaches
   # a connector by itself — `ghost-monitor` hands this file to debugfs when a
   # stream starts. Reduced blanking because there is no sink to negotiate with
@@ -354,24 +367,21 @@ in
         }
         {
           # 3024x1964 is the 14" panel and scale 2 the 1512x982 macOS draws it
-          # at, so the stream lands pixel for pixel. Only HDMI-A-1 is named, so
-          # the real monitor goes dark until `undo` brings it back — and stays
-          # dark if Sunshine dies mid-stream, where ssh is the way back.
+          # at, so the stream lands pixel for pixel. Only the ghost is named,
+          # so the real monitors go dark until `undo` brings them back — and
+          # stay dark if Sunshine dies mid-stream, where ssh is the way back.
           name = "MacBook Desktop";
           image-path = "desktop.png";
           # Sunshine runs the undos in reverse, so the ghost is raised before
           # the session moves onto it and dropped after it has moved back off.
-          # The two halves name the same connector differently: debugfs knows
-          # the kernel's HDMI-A-1, while mutter drops the connector type's
-          # suffix and calls it HDMI-1, which is the name its D-Bus API takes.
           prep-cmd = [
             {
               do = "${config.systemd.package}/bin/systemctl start ghost-monitor.service";
               undo = "${config.systemd.package}/bin/systemctl stop ghost-monitor.service";
             }
             {
-              do = "${monitors} only HDMI-1 3024x1964 2";
-              undo = "${monitors} rest HDMI-1";
+              do = "${monitors} only ${ghost-connector} 3024x1964 2";
+              undo = "${monitors} rest ${ghost-connector}";
             }
           ];
         }
