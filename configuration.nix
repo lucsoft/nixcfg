@@ -202,6 +202,21 @@ in
   services.displayManager.gdm.enable = true;
   services.desktopManager.gnome.enable = true;
 
+  # mutter chooses its primary render GPU by boot_vga, and this board's BIOS
+  # gives that flag to the Raphael iGPU, which has no cable on it at all. So
+  # the session composited on the iGPU and handed the frames to the 7800 XT
+  # only to scan them out: the iGPU pinned at 100% while the card that owns
+  # the monitor idled. Everything downstream inherits that choice -- Xwayland,
+  # Steam and gamescope's nested backend all follow the compositor's main
+  # dmabuf device -- which is why Gaming Mode ran there too. This tag is
+  # mutter's own override for it. Matched on the PCI id, because the card
+  # number is whatever the kernel probed first.
+  services.udev.extraRules = ''
+    SUBSYSTEM=="drm", ENV{DEVTYPE}=="drm_minor", KERNEL=="card[0-9]*", \
+      ATTRS{vendor}=="0x1002", ATTRS{device}=="0x747e", \
+      TAG+="mutter-device-preferred-primary"
+  '';
+
   services.xserver.xkb.layout = "de";
   services.xserver.xkb.variant = "mac";
   console.keyMap = "mac-de-latin1";
