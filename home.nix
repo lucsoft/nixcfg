@@ -297,14 +297,19 @@ in
   # at whatever refresh rate the monitor under it reports.
   # --force-grab-cursor locks the pointer, which Steam is special-cased out of.
   # -f opens that window fullscreen, and the patch is what carries the size
-  # through: the Deck UI and the game both run at the monitor's 3440x1440,
-  # rather than a 1920x1080 buffer stretched over it. The keyboard is not
-  # grabbed, so Super still reaches the Shell and the window is no trap.
+  # through: the Deck UI and the game both run at the full size of whichever
+  # monitor the window lands on, rather than a 1920x1080 buffer stretched over
+  # it. The keyboard is not grabbed, so Super still reaches the Shell.
+  # --prefer-vk-device does not follow from the mutter tag in
+  # configuration.nix: gamescope ignores the device the compositor renders on
+  # and takes the first Vulkan one it enumerates, which here is the iGPU. The
+  # session moving to the dGPU left Gaming Mode behind on RAPHAEL_MENDOCINO.
+  # 1002:747e is the Navi 32.
   xdg.desktopEntries.steam-gamingmode = {
     name = "Steam Gaming Mode";
     genericName = "Steam Deck UI";
     comment = "Steam's gamepad UI, in a fullscreen gamescope window";
-    exec = "env GAMESCOPE_IGNORE_STEAM_MODE_CONTROL=1 gamescope -W 1920 -H 1080 -f --xwayland-count 2 --force-grab-cursor -e --mangoapp -- steam -steamos3 -steamdeck -gamepadui";
+    exec = "env GAMESCOPE_IGNORE_STEAM_MODE_CONTROL=1 gamescope -W 1920 -H 1080 -f --prefer-vk-device 1002:747e --xwayland-count 2 --force-grab-cursor -e --mangoapp -- steam -steamos3 -steamdeck -gamepadui";
     icon = "steam";
     terminal = false;
     categories = [ "Game" ];
