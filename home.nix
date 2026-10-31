@@ -296,11 +296,15 @@ in
   # one Steam draws on and the one games run on, follow the window from there,
   # at whatever refresh rate the monitor under it reports.
   # --force-grab-cursor locks the pointer, which Steam is special-cased out of.
+  # -f opens that window fullscreen, and the patch is what carries the size
+  # through: the Deck UI and the game both run at the monitor's 3440x1440,
+  # rather than a 1920x1080 buffer stretched over it. The keyboard is not
+  # grabbed, so Super still reaches the Shell and the window is no trap.
   xdg.desktopEntries.steam-gamingmode = {
     name = "Steam Gaming Mode";
     genericName = "Steam Deck UI";
-    comment = "Steam's gamepad UI, in a resizable gamescope window";
-    exec = "env GAMESCOPE_IGNORE_STEAM_MODE_CONTROL=1 gamescope -W 1920 -H 1080 --xwayland-count 2 --force-grab-cursor -e --mangoapp -- steam -steamos3 -steamdeck -gamepadui";
+    comment = "Steam's gamepad UI, in a fullscreen gamescope window";
+    exec = "env GAMESCOPE_IGNORE_STEAM_MODE_CONTROL=1 gamescope -W 1920 -H 1080 -f --xwayland-count 2 --force-grab-cursor -e --mangoapp -- steam -steamos3 -steamdeck -gamepadui";
     icon = "steam";
     terminal = false;
     categories = [ "Game" ];
