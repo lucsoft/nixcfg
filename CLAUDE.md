@@ -124,6 +124,15 @@ would point somewhere else. Claude Code's auto mode blocks the call unless
 `.claude/settings.local.json` allows it — and `.claude/` is gitignored, so
 that rule is not part of this repo and has to be granted per machine.
 
+Inside Claude Desktop `pkexec` fails with "must be setuid root": everything
+the app spawns runs with `NoNewPrivs`, so the kernel ignores setuid. Ask
+systemd over D-Bus instead — polkit still sees the caller's session and
+shows the same password dialog:
+
+    systemd-run --wait --pipe --collect --quiet \
+        -p Environment=PATH=/run/current-system/sw/bin \
+        /run/current-system/sw/bin/nixos-rebuild switch --file /home/lucsoft/nixcfg
+
 Work happens directly on `main`, and committing and pushing there is part of
 finishing a change rather than something to ask about each time.
 
