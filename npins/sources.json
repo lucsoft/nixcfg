@@ -39,9 +39,9 @@
       },
       "branch": "main",
       "submodules": false,
-      "revision": "3c84ccd3a45af5e954cd53ff278bd59595fa3983",
-      "url": "https://github.com/oxcl/nix-flake-helium-browser/archive/3c84ccd3a45af5e954cd53ff278bd59595fa3983.tar.gz",
-      "hash": "sha256-1kUc/KEp7HXRPEcmf0Lmkrl4Ymj5Kn3rNCzYw9I0oPY="
+      "revision": "1230f02322b369aae7c0c560ccfc4235ca76546a",
+      "url": "https://github.com/oxcl/nix-flake-helium-browser/archive/1230f02322b369aae7c0c560ccfc4235ca76546a.tar.gz",
+      "hash": "sha256-jO7WGLnwlfyQOvnEki8Rlb2vt74XaPkB47kpcObZd7I="
     },
     "home-manager": {
       "type": "Git",
@@ -52,21 +52,21 @@
       },
       "branch": "release-26.05",
       "submodules": false,
-      "revision": "ab3823b4b24c0c3ca984c1f3ee577fd6d667424c",
-      "url": "https://github.com/nix-community/home-manager/archive/ab3823b4b24c0c3ca984c1f3ee577fd6d667424c.tar.gz",
-      "hash": "sha256-AM1HmBeDnB2B3dSiXuCYeu7Me+lHNpz/P39lVxGJBuQ="
+      "revision": "5643e73425b85ac359ba2aaf83deae8ce1cd7968",
+      "url": "https://github.com/nix-community/home-manager/archive/5643e73425b85ac359ba2aaf83deae8ce1cd7968.tar.gz",
+      "hash": "sha256-Qkh6uNyMsic61gfyOO8VXnC+HEBdti6Xe2kKiMf66O0="
     },
     "nixpkgs": {
       "type": "Channel",
       "name": "nixos-26.05",
-      "url": "https://releases.nixos.org/nixos/26.05/nixos-26.05.11985.26f4107e47e3/nixexprs.tar.xz",
-      "hash": "sha256-Xbsbp5m0RdCNpPFtWb7FGquw42pDJEMPtlrHownUBc8="
+      "url": "https://releases.nixos.org/nixos/26.05/nixos-26.05.14630.f68407657ad2/nixexprs.tar.xz",
+      "hash": "sha256-brwp4mLw1LUBC4FDrBluV5II+2lJRLl+qnpNd1wjPoo="
     },
     "nixpkgs-unstable": {
       "type": "Channel",
       "name": "nixos-unstable",
-      "url": "https://releases.nixos.org/nixos/unstable/nixos-26.11pre1093333.fe13242281a6/nixexprs.tar.xz",
-      "hash": "sha256-LPFRbrCWWyNsdQLO3SX1B/5UMkFK0hfe7bZR6lENvpc="
+      "url": "https://releases.nixos.org/nixos/unstable/nixos-26.11pre1122823.04906337b6d5/nixexprs.tar.xz",
+      "hash": "sha256-vJoAj1xon3Mhfc8FZ5uBrPyZee9Eqa05gG/taXv6iZ8="
     },
     "steamos-manager": {
       "type": "GitRelease",
