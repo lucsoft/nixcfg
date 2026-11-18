@@ -1,0 +1,2 @@
+option('plugin_path', type: 'string', value: '',
+  description: 'GStreamer plugin directories to scan, colon-separated')

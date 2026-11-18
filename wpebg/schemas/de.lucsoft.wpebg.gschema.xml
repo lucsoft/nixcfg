@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<schemalist>
+  <schema id="de.lucsoft.wpebg" path="/de/lucsoft/wpebg/">
+
+    <key name="item" type="s">
+      <default>''</default>
+      <summary>Wallpaper Engine item to show</summary>
+      <description>
+        The directory of a Wallpaper Engine item, the one holding its
+        project.json. Empty shows the ordinary background.
+      </description>
+    </key>
+
+    <key name="pause-fullscreen" type="b">
+      <default>true</default>
+      <summary>Pause while a window is fullscreen</summary>
+      <description>
+        Stop drawing the video on a screen a fullscreen window covers, and
+        stop decoding it once every screen is covered.
+      </description>
+    </key>
+
+  </schema>
+</schemalist>

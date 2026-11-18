@@ -22,6 +22,9 @@ let
   # Its own effect is native too, and extension.js asks for `gi://ShaderBg`.
   shaderbg = pkgs.callPackage ./shaderbg { };
 
+  # Wallpaper Engine video wallpapers, decoded in the Shell; `gi://WpeBg`.
+  wpebg = pkgs.callPackage ./wpebg { };
+
   helium = pkgs.callPackage "${sources.helium}/helium.nix" { };
 
   # No channel carries this. The open nixpkgs PR is one self-contained file,
@@ -160,18 +163,24 @@ in
       # GLSL wallpaper extension there stops at Shell 49.
       { package = shaderbg; }
 
+      # A Wallpaper Engine video from the Steam Workshop. Its effect goes in
+      # front of shaderbg's and steps aside while no item is chosen, so the
+      # shader is what shows then.
+      { package = wpebg; }
+
       { package = pkgs.gnomeExtensions.user-stylesheet-font; }
     ];
   };
 
-  # How the Shell is told where Blur-1.0.typelib and ShaderBg-1.0.typelib are.
+  # How the Shell is told where the Blur, ShaderBg and WpeBg typelibs are.
   # gnome-shell is a systemd user unit, so environment.d reaches it, and its
-  # wrapper prepends its own typelib path rather than replacing this one. Both
-  # extensions import their library when they are enabled, so this only takes
-  # effect after a logout.
+  # wrapper prepends its own typelib path rather than replacing this one. All
+  # three extensions import their library when they are enabled, so this only
+  # takes effect after a logout.
   systemd.user.sessionVariables.GI_TYPELIB_PATH = lib.concatStringsSep ":" [
     "${rounded-blur}/lib/girepository-1.0"
     "${shaderbg.girLib}/lib/girepository-1.0"
+    "${wpebg.girLib}/lib/girepository-1.0"
   ];
 
   # The stylesheet the extension above reads.

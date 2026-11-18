@@ -1,0 +1,9 @@
+{
+  "uuid": "wpebg@lucsoft.de",
+  "name": "wpebg",
+  "description": "Plays a Wallpaper Engine video wallpaper from the Steam Workshop as the desktop background.",
+  "shell-version": ["50"],
+  "settings-schema": "de.lucsoft.wpebg",
+  "url": "https://github.com/lucsoft/nixcfg",
+  "version-name": "0.1.0"
+}
