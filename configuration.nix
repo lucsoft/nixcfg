@@ -129,19 +129,11 @@ in
   boot.loader.efi.canTouchEfiVariables = true;
   boot.kernelPackages = pkgs.linuxPackages_latest;
 
-  boot.plymouth = {
-    enable = true;
-    themePackages = [ (pkgs.callPackage ./plymouth { }) ];
-    theme = "nixos";
-    logo = "${pkgs.nixos-icons}/share/icons/hicolor/256x256/apps/nix-snowflake.png";
-  };
-
   boot.consoleLogLevel = 3;
   boot.kernelParams = [
     "quiet"
     "udev.log_level=3"
     "rd.udev.log_level=3"
-    "vt.global_cursor_default=0"   # no blinking cursor over the splash
     # amdgpu's default mask plus PP_OVERDRIVE_MASK — pp_od_clk_voltage, and so
     # the manual GPU clock, does not exist without it
     "amdgpu.ppfeaturemask=0xfff7ffff"

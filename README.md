@@ -28,7 +28,6 @@ repo configures graphics — there is no proprietary driver to pull in.
 | `configuration.nix` | the machine: boot, GNOME, pipewire, Steam, user account |
 | `hardware-configuration.nix` | generated hardware scan (filesystems, kernel modules) |
 | `power.nix` | suspend/resume workarounds — transitional, see the file |
-| `plymouth/` | the boot splash theme — logo, progress bar, unit names |
 | `shaderbg/` | GNOME Shell extension — a GLSL shader as the desktop background |
 | `rounded-blur/` | packaging for the `gi://Blur` library blur-my-shell wants |
 | `steamos-manager/` | packaging for Valve's power daemon, plus this board's device file |
