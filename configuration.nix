@@ -137,6 +137,10 @@ in
     # amdgpu's default mask plus PP_OVERDRIVE_MASK — pp_od_clk_voltage, and so
     # the manual GPU clock, does not exist without it
     "amdgpu.ppfeaturemask=0xfff7ffff"
+    # DC_DISABLE_SUBVP_FAMS: since linux 7.3 the DCN 3.2 card shows grey
+    # blocks and lines, worst with a single display active — which is when
+    # SubVP/FAMS memory clock switching kicks in
+    "amdgpu.dcdebugmask=0x20000"
   ];
 
   zramSwap = {
