@@ -30,6 +30,7 @@ repo configures graphics — there is no proprietary driver to pull in.
 | `power.nix` | suspend/resume workarounds — transitional, see the file |
 | `shaderbg/` | GNOME Shell extension — a GLSL shader as the desktop background |
 | `wpebg/` | GNOME Shell extension — a Wallpaper Engine video as the desktop background |
+| `epic-games-launcher/` | Epic Games Launcher, taken from an open nixpkgs PR until it lands |
 | `rounded-blur/` | packaging for the `gi://Blur` library blur-my-shell wants |
 | `steamos-manager/` | packaging for Valve's power daemon, plus this board's device file |
 | `gamescope/` | one patch: let the window set both Xwayland modes, not Steam |

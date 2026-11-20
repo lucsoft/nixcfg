@@ -35,6 +35,8 @@ let
   claude-desktop = pkgs.callPackage
     "${sources.claude-desktop}/pkgs/by-name/cl/claude-desktop/package.nix" { };
 
+  epic-games-launcher = pkgs.callPackage ./epic-games-launcher { };
+
   # Makes a switch visible to the session that is already running, instead of
   # at the next login.
   #
@@ -113,6 +115,7 @@ in
     gnome-secrets
     helium
     claude-desktop
+    epic-games-launcher
     resources
 
     # unstable until bottles v67 is stable
