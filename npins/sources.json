@@ -39,9 +39,9 @@
       },
       "branch": "main",
       "submodules": false,
-      "revision": "1230f02322b369aae7c0c560ccfc4235ca76546a",
-      "url": "https://github.com/oxcl/nix-flake-helium-browser/archive/1230f02322b369aae7c0c560ccfc4235ca76546a.tar.gz",
-      "hash": "sha256-jO7WGLnwlfyQOvnEki8Rlb2vt74XaPkB47kpcObZd7I="
+      "revision": "6b7088a2caec0218ceddee38097800afb9f37b04",
+      "url": "https://github.com/oxcl/nix-flake-helium-browser/archive/6b7088a2caec0218ceddee38097800afb9f37b04.tar.gz",
+      "hash": "sha256-XlujG//pSVsAnqOtL5OsogghW2pASLXmmB169fuKc8o="
     },
     "home-manager": {
       "type": "Git",
@@ -59,14 +59,14 @@
     "nixpkgs": {
       "type": "Channel",
       "name": "nixos-26.05",
-      "url": "https://releases.nixos.org/nixos/26.05/nixos-26.05.14630.f68407657ad2/nixexprs.tar.xz",
-      "hash": "sha256-brwp4mLw1LUBC4FDrBluV5II+2lJRLl+qnpNd1wjPoo="
+      "url": "https://releases.nixos.org/nixos/26.05/nixos-26.05.14894.ab5c18fdedfc/nixexprs.tar.xz",
+      "hash": "sha256-xVwloUjz7paCDnvN5dkrasmAGV+O6uyRUPFHxv2w3VA="
     },
     "nixpkgs-unstable": {
       "type": "Channel",
       "name": "nixos-unstable",
-      "url": "https://releases.nixos.org/nixos/unstable/nixos-26.11pre1122823.04906337b6d5/nixexprs.tar.xz",
-      "hash": "sha256-vJoAj1xon3Mhfc8FZ5uBrPyZee9Eqa05gG/taXv6iZ8="
+      "url": "https://releases.nixos.org/nixos/unstable/nixos-26.11pre1124497.0bb8272318b4/nixexprs.tar.xz",
+      "hash": "sha256-kqy60mdSH4GQAv3kzSeefteaiCv9arf3P+auosZrpo0="
     },
     "steamos-manager": {
       "type": "GitRelease",
