@@ -37,6 +37,17 @@ let
 
   epic-games-launcher = pkgs.callPackage ./epic-games-launcher { };
 
+  mprisenceHost = builtins.toJSON {
+    name = "mprisence.web.bridge";
+    description = "mprisence - sends browser media to MPRIS";
+    type = "stdio";
+    path = "${pkgs.mprisence}/bin/mprisence";
+    allowed_origins = [
+      "chrome-extension://pnkkjbdopihogobhhjbgapbpfccinjjo/"
+      "chrome-extension://pphdmbejbipjlocngoefnmjoijcbdejf/"
+    ];
+  };
+
   # Makes a switch visible to the session that is already running, instead of
   # at the next login.
   #
@@ -253,16 +264,13 @@ in
     Install.WantedBy = [ "graphical-session.target" ];
   };
 
-  # The native messaging host, pointing Helium at the binary to speak to. It
-  # goes in the profile directory, which for Helium is its application ID and
-  # not the `chromium` that `mprisence web install` assumes — that command
-  # would also bake in the store path of whichever mprisence ran it, so it
-  # would go stale at the next update. Declared here it is rewritten on every
-  # switch. The second origin is the extension's unlisted build, carried
-  # along because upstream ships both IDs.
   # ilo ships for Linux only as a Flatpak from its own repo. The flatpakref
   # is the same file in every release, so the hash holds across updates; the
   # app itself follows the repo's master branch and moves on each switch.
+  #
+  # The mprisence bridge runs inside ilo's sandbox, as the browser's child:
+  # it needs the store to exec from, and to own the MPRIS name it publishes
+  # the tab under.
   services.flatpak = {
     enable = true;
     update.onActivation = true;
@@ -271,19 +279,23 @@ in
       flatpakref = "https://github.com/MartinPTielemans/ilo/releases/latest/download/ilo.flatpakref";
       sha256 = "4310a4e3d43e0e528aff4f14330fce8e15a1c12a4421dbaba0e268dd31dd8599";
     }];
+    overrides."app.ilo.browser" = {
+      Context.filesystems = [ "/nix/store:ro" ];
+      "Session Bus Policy"."org.mpris.MediaPlayer2.mprisence_web.*" = "own";
+    };
   };
 
+  # The native messaging host, pointing the browsers at the binary to speak
+  # to. It goes in each profile directory — Helium's application ID, ilo's
+  # `ilo` under its Flatpak config — not the `chromium` that `mprisence web
+  # install` assumes; that command would also bake in the store path of
+  # whichever mprisence ran it, so it would go stale at the next update.
+  # Declared here it is rewritten on every switch. The second origin is the
+  # extension's unlisted build, carried along because upstream ships both IDs.
   home.file.".config/net.imput.helium/NativeMessagingHosts/mprisence.web.bridge.json".text =
-    builtins.toJSON {
-      name = "mprisence.web.bridge";
-      description = "mprisence - sends browser media to MPRIS";
-      type = "stdio";
-      path = "${pkgs.mprisence}/bin/mprisence";
-      allowed_origins = [
-        "chrome-extension://pnkkjbdopihogobhhjbgapbpfccinjjo/"
-        "chrome-extension://pphdmbejbipjlocngoefnmjoijcbdejf/"
-      ];
-    };
+    mprisenceHost;
+  home.file.".var/app/app.ilo.browser/config/ilo/NativeMessagingHosts/mprisence.web.bridge.json".text =
+    mprisenceHost;
 
   # Widevine, which the DRM-protected tracks on SoundCloud ask for. Helium
   # ships the CDM as a component instead of bundling it, so dropping the

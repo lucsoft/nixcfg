@@ -1181,8 +1181,12 @@ STEP_LINES = 200
 # and one indented store path per line. That listing is the build plan, and
 # it is the only place the plan exists — the activity stream announces each
 # build as it starts and never says what is still to come.
-PLAN_HEADING = re.compile(r"^(?:this|these \d+) derivations? will be built:")
-PLAN_ENTRY = re.compile(r"^\s+(/nix/store/\S+\.drv)$")
+#
+# The same listing names what will be fetched rather than built, and --dry-run
+# prints both with a capital letter. Case-blind so one pattern reads either.
+PLAN_HEADING = re.compile(r"^(?:this|these \d+) derivations? will be built:", re.I)
+FETCH_HEADING = re.compile(r"^(?:this|these \d+) paths? will be fetched", re.I)
+FETCH_ENTRY = re.compile(r"^\s+(/nix/store/\S+)$")
 
 # What a node in the build tree can be. Planned is what the listing above
 # hands over; the rest the activity stream moves it through.
@@ -1234,6 +1238,57 @@ def rebuild_steps(repo):
             "--log-format", "internal-json",
         ]),
     ]
+
+
+def dry_run(drv):
+    """What realising one derivation would build and fetch, as two lists."""
+    done = subprocess.run(["nix-store", "--realise", "--dry-run", drv],
+                          capture_output=True, text=True,
+                          timeout=DRY_RUN_TIMEOUT)
+    done.check_returncode()
+    builds, fetches, into = [], [], None
+    for line in done.stderr.splitlines():
+        if PLAN_HEADING.match(line):
+            into = builds
+        elif FETCH_HEADING.match(line):
+            into = fetches
+        elif into is not None and FETCH_ENTRY.match(line):
+            into.append(line.strip())
+        else:
+            into = None
+    return builds, fetches
+
+
+def rebuild_forecast(lockfile, repo):
+    """Both halves of a rebuild, planned before either of them starts.
+
+    nix lists what it will build and fetch once per invocation, so the home
+    step's plan used to exist only once home-manager was running — for the
+    whole system half the page could not say what was still to come. Asking
+    up front costs one instantiation of the pair, the same one
+    download_estimate makes.
+
+    What the system half produces is gone by the time home runs, so it is
+    taken out of the home half rather than counted twice.
+
+    Returns [(builds, fetches)] in the order of rebuild_steps.
+    """
+    nixpkgs, home_manager = store_paths(lockfile)
+    system, home = subprocess.run(
+        [
+            "nix-instantiate", "-A", "system", "-A", "home",
+            "--argstr", "nixpkgs", str(nixpkgs),
+            "--argstr", "homeManager", str(home_manager),
+            "--argstr", "repo", str(repo),
+            str(sizes_expression()),
+        ],
+        check=True, capture_output=True, text=True,
+    ).stdout.split()
+    first = dry_run(system)
+    ahead = set(first[0]) | set(first[1])
+    second = tuple([path for path in paths if path not in ahead]
+                   for paths in dry_run(home))
+    return [first, second]
 
 
 def package_name(store_path):
@@ -1330,6 +1385,10 @@ class RebuildStream:
         # most of what the page has to show; and every count on the page is
         # a sum over them, which an eviction would quietly walk backwards.
         self.fetched = collections.OrderedDict()  # store path -> finished row
+        # Downloads nix has announced and not started, in the order it
+        # listed them. Without these a download only exists once it begins,
+        # and the page cannot say how many are still to come.
+        self.coming = collections.OrderedDict()   # store path -> name
         self.problems = list(problems)  # what nix called an error or a warning
         self.raw = collections.deque(maxlen=RAW_LINES)
         self.pending = []     # raw lines the view has not been handed yet
@@ -1343,8 +1402,9 @@ class RebuildStream:
         self.by_drv = {}      # drv -> the Activity now building it
         self.edges = {}       # drv -> the drvs in the plan it waits for
         self.roots = []
-        self.reading_plan = False
+        self.reading_plan = None      # what the listing is filling, if any
         self.grapher = None
+        self.graphed = 0              # how much of the plan the edges cover
 
     # -- fed from the reader thread -------------------------------------------
     def feed(self, line):
@@ -1390,7 +1450,7 @@ class RebuildStream:
             activity.drv = drv
             # The listing is normally closed by the next message, but the
             # first build starting is just as good a sign that it is over.
-            self.reading_plan = False
+            self.reading_plan = None
             self.resolve_graph()
             self.remember(event.get("text") or f"building {drv}")
         elif kind == ACT_COPY_PATH and len(fields) > 1:
@@ -1473,16 +1533,32 @@ class RebuildStream:
         closes it.
         """
         if PLAN_HEADING.match(text):
-            self.reading_plan = True
+            self.reading_plan = BUILD
+            return
+        if FETCH_HEADING.match(text):
+            self.reading_plan = DOWNLOAD
             return
         if not self.reading_plan:
             return
-        entry = PLAN_ENTRY.match(text)
-        if entry:
+        entry = FETCH_ENTRY.match(text)
+        if entry and self.reading_plan == BUILD:
             self.planned.setdefault(entry.group(1), PLANNED)
             return
-        self.reading_plan = False
+        if entry:
+            self.coming.setdefault(entry.group(1), package_name(entry.group(1)))
+            return
+        self.reading_plan = None
         self.resolve_graph()
+
+    def seed(self, builds, fetches):
+        """Take a plan worked out before this step's nix said its own."""
+        with self.lock:
+            for drv in builds:
+                self.planned.setdefault(drv, PLANNED)
+            for path in fetches:
+                self.coming.setdefault(path, package_name(path))
+            self.dirty = True
+            self.resolve_graph()
 
     def resolve_graph(self):
         """Work out the edges, off the thread that is reading the stream.
@@ -1491,9 +1567,13 @@ class RebuildStream:
         dozen a configuration change plans, but nix is writing into a pipe
         while this runs, and a reader that stops reading stops the build.
         """
-        if self.grapher or not self.planned:
+        # Again whenever the plan has grown: a forecast seeds it, and nix's
+        # own listing can add to that once the step is running.
+        if (self.grapher and self.grapher.is_alive()
+                or len(self.planned) == self.graphed):
             return
         planned = list(self.planned)
+        self.graphed = len(planned)
 
         def work():
             edges, roots = build_forest(planned)
@@ -1641,6 +1721,11 @@ class RebuildStream:
         rows = [dict(row) for path, row in self.fetched.items()
                 if path not in live]
         rows += sorted(live.values(), key=lambda row: row["started"])
+        rows += [{"key": (DOWNLOAD, path), "kind": DOWNLOAD, "name": name,
+                  "state": PLANNED, "detail": "", "done": 0, "expected": 0,
+                  "started": 0, "waiting": 0, "log": [], "kids": []}
+                 for path, name in self.coming.items()
+                 if path not in live and path not in self.fetched]
         return rows
 
     # -- read from the main loop ----------------------------------------------
@@ -1657,6 +1742,12 @@ class RebuildStream:
                     "problems": list(self.problems),
                     "fraction": self.fraction(), "summary": self.summary(),
                     "raw": pending}
+
+    def preview(self):
+        """The plan of a step that has not started, for drawing beside the
+        one that has. Unlike snapshot it is read every time it is asked."""
+        with self.lock:
+            return {"plan": self.plan(), "downloads": self.downloads()}
 
     def archive(self, label):
         """This step as something that can be read back later.
@@ -2064,17 +2155,18 @@ def download_group(index, rows):
     branch rather than being scattered through a plan they are not part of.
     """
     arriving = [row for row in rows if row["state"] == RUNNING]
+    outstanding = [row for row in rows if row["state"] != DONE]
     done = sum(row["done"] for row in rows)
     expected = sum(row["expected"] for row in rows)
     return {
         "key": ("downloads", index),
         "kind": DOWNLOAD,
         "name": f"{len(rows)} download{'' if len(rows) == 1 else 's'}",
-        "state": RUNNING if arriving else DONE,
-        "waiting": len(arriving),
+        "state": (RUNNING if arriving else PLANNED if outstanding else DONE),
+        "waiting": len(outstanding),
         # How many, beside how much: bytes alone cannot say that ninety of
         # ninety-six are in, and the count is the half that finishes.
-        "detail": f"{len(rows) - len(arriving)} of {len(rows)}",
+        "detail": f"{len(rows) - len(outstanding)} of {len(rows)}",
         "done": done,
         "expected": expected,
         "fraction": (done / expected) if expected else None,
@@ -3264,6 +3356,10 @@ class Window(Adw.ApplicationWindow):
         self.steps = []
         self.step_index = 0
         self.stream = None
+        # Streams for steps that have not started, seeded from the forecast
+        # so their plan is on the page before their process exists.
+        self.upcoming = {}
+        self.runs = 0
         self.ticker = 0
         # Problems outlive the process that reported them: both rebuild steps
         # report into one list, and a failed step leaves it on screen.
@@ -4092,7 +4188,36 @@ class Window(Adw.ApplicationWindow):
         self.output_button.set_visible(True)
         self.ticker = GLib.timeout_add(self.TICK, self.tick)
         self.sync_apply_history()
+        self.upcoming = {}
+        self.runs += 1
+        self.foresee(self.runs)
         self.run_step(0)
+
+    def foresee(self, run):
+        """Plan every step in the background while the first one runs.
+        A forecast that fails costs the preview and nothing else: each step
+        still lists its own plan once it starts."""
+        def work():
+            try:
+                return rebuild_forecast(self.lockfile, self.repo)
+            except (OSError, subprocess.SubprocessError, ValueError):
+                return None
+
+        def done(forecast):
+            if (not isinstance(forecast, list) or run != self.runs
+                    or not self.ticker):
+                return
+            for index, (builds, fetches) in enumerate(forecast):
+                if index < self.step_index:
+                    continue
+                if index == self.step_index and self.stream:
+                    self.stream.seed(builds, fetches)
+                else:
+                    stream = RebuildStream()
+                    stream.seed(builds, fetches)
+                    self.upcoming[index] = stream
+
+        self.run_async(work, done)
 
     def run_step(self, index):
         if index >= len(self.steps):
@@ -4107,7 +4232,8 @@ class Window(Adw.ApplicationWindow):
         # Two processes, two sets of counters — but one list of problems, so
         # that a warning from the system step is still on screen when the
         # home step is the one running.
-        self.stream = RebuildStream(self.carried)
+        self.stream = self.upcoming.pop(index, None) or RebuildStream()
+        self.stream.problems = list(self.carried)
         self.stream.feed(f"$ {' '.join(command)}")
 
         try:
@@ -4195,7 +4321,11 @@ class Window(Adw.ApplicationWindow):
                     "tail": snapshot["tail"], "started": self.step_started,
                 })
             else:
-                steps.append({"label": label, "plan": [], "summary": "",
+                ahead = self.upcoming.get(index)
+                preview = ahead.preview() if ahead else {}
+                steps.append({"label": label, "summary": "",
+                              "plan": preview.get("plan", []),
+                              "downloads": preview.get("downloads", []),
                               "fraction": None})
         return steps
 
