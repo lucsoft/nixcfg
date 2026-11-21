@@ -1,5 +1,5 @@
 diff --git a/bottles/backend/managers/installer.py b/bottles/backend/managers/installer.py
-index 619a5be..4f92363 100644
+index 619a5be..08a807f 100644
 --- a/bottles/backend/managers/installer.py
 +++ b/bottles/backend/managers/installer.py
 @@ -29,8 +29,10 @@ import pycurl
@@ -88,7 +88,15 @@ index 619a5be..4f92363 100644
  
      def install(
          self,
-@@ -762,14 +785,30 @@ class InstallerManager:
+@@ -681,6 +704,7 @@ class InstallerManager:
+         progress_fn: Optional[Callable[[Optional[float]], None]] = None,
+         activity_fn: Optional[Callable[[Optional[str]], None]] = None,
+         log_fn: Optional[Callable[[str], None]] = None,
++        inputs: Optional[dict] = None,
+     ):
+         manifest = self.get_installer(installer[0])
+         if not isinstance(manifest, dict):
+@@ -762,14 +786,31 @@ class InstallerManager:
          # execute steps
          if steps:
              logging.info("Executing installer steps")
@@ -107,6 +115,7 @@ index 619a5be..4f92363 100644
 +                    _config,
 +                    manifest["Lutris"],
 +                    self.__local_resources,
++                    inputs=inputs,
 +                    progress_fn=progress_fn if is_final else None,
 +                    activity_fn=activity_fn if is_final else None,
 +                    log_fn=log_fn if is_final else None,
@@ -129,10 +138,10 @@ index 619a5be..4f92363 100644
                  return Result(
 diff --git a/bottles/backend/managers/lutris.py b/bottles/backend/managers/lutris.py
 new file mode 100644
-index 0000000..687252e
+index 0000000..5084bf3
 --- /dev/null
 +++ b/bottles/backend/managers/lutris.py
-@@ -0,0 +1,474 @@
+@@ -0,0 +1,480 @@
 +# lutris.py
 +#
 +# This program is free software: you can redistribute it and/or modify
@@ -172,6 +181,7 @@ index 0000000..687252e
 +from bottles.backend.models.result import Result
 +from bottles.backend.utils.lutris import (
 +    PREFIX_VAR,
++    menu_spec,
 +    expand,
 +    winetricks_dependencies,
 +)
@@ -200,6 +210,7 @@ index 0000000..687252e
 +        config: BottleConfig,
 +        lutris: dict,
 +        local_resources: dict,
++        inputs: Optional[dict] = None,
 +        progress_fn: Optional[Callable[[Optional[float]], None]] = None,
 +        activity_fn: Optional[Callable[[Optional[str]], None]] = None,
 +        log_fn: Optional[Callable[[str], None]] = None,
@@ -208,6 +219,7 @@ index 0000000..687252e
 +        self.config = config
 +        self.lutris = lutris
 +        self.local_resources = local_resources
++        self.inputs = inputs or {}
 +        self.progress_fn = progress_fn
 +        self.activity_fn = activity_fn
 +        self.log_fn = log_fn
@@ -275,7 +287,10 @@ index 0000000..687252e
 +                self.__apply_config()
 +            elif kind == "command":
 +                name, params = next(iter(step["command"].items()))
-+                getattr(self, f"_cmd_{name}")(params)
++                if name == "input_menu":
++                    self._cmd_input_menu(params, step.get("input", ""))
++                else:
++                    getattr(self, f"_cmd_{name}")(params)
 +            else:
 +                raise LutrisStepError(f"Unknown Lutris step: {kind}")
 +        except LutrisStepError as e:
@@ -479,12 +494,12 @@ index 0000000..687252e
 +        with open(path, "w", encoding="utf-8") as f:
 +            json.dump(data, f, indent=2)
 +
-+    def _cmd_input_menu(self, params):
-+        options = params["options"]
-+        choice = params.get("preselect")
++    def _cmd_input_menu(self, params, key: str):
++        choice = self.inputs.get(key)
 +        if choice is None:
-+            first = options[0]
-+            choice = next(iter(first)) if isinstance(first, dict) else first
++            # No dialog asked, e.g. a scripted install: take the default.
++            choice = menu_spec(params, key)["default"]
++        self.log(f"Using '{choice}' for {key}")
 +        self.variables["INPUT"] = str(choice)
 +        if params.get("id"):
 +            self.variables[f"INPUT_{params['id']}"] = str(choice)
@@ -621,10 +636,10 @@ index 6581b6e..9623362 100644
    'versioning.py',
 diff --git a/bottles/backend/utils/lutris.py b/bottles/backend/utils/lutris.py
 new file mode 100644
-index 0000000..7115936
+index 0000000..8ab0604
 --- /dev/null
 +++ b/bottles/backend/utils/lutris.py
-@@ -0,0 +1,423 @@
+@@ -0,0 +1,447 @@
 +# lutris.py
 +#
 +# This program is free software: you can redistribute it and/or modify
@@ -879,19 +894,35 @@ index 0000000..7115936
 +            return False
 +
 +    if name == "input_menu":
-+        params = params or {}
-+        options = params.get("options") or []
-+        if not options:
++        if not menu_options((params or {}).get("options")):
 +            errors.append("An input_menu step has no options.")
 +            return False
-+        choice = params.get("preselect")
-+        if choice is None:
-+            first = options[0]
-+            choice = next(iter(first)) if isinstance(first, dict) else first
-+        warnings.append(
-+            f"Choosing '{choice}' for \"{params.get('description', 'a menu')}\"."
-+        )
 +    return True
++
++
++def menu_options(raw) -> list[list[str]]:
++    """The [value, label] pairs of an input_menu."""
++    options = []
++    for option in raw or []:
++        if isinstance(option, dict) and len(option) == 1:
++            value, label = next(iter(option.items()))
++            options.append([str(value), str(label)])
++        elif isinstance(option, (str, int, float)):
++            options.append([str(option), str(option)])
++    return options
++
++
++def menu_spec(params: dict, key: str) -> dict:
++    """An input_menu as the installer dialog shows it."""
++    options = menu_options(params.get("options"))
++    values = [value for value, _ in options]
++    preselect = str(params.get("preselect", values[0]))
++    return {
++        "key": key,
++        "description": str(params.get("description") or "Choose an option"),
++        "options": options,
++        "default": preselect if preselect in values else values[0],
++    }
 +
 +
 +def _game_dir(prefix_expr: str, slug: str) -> str:
@@ -970,11 +1001,18 @@ index 0000000..7115936
 +    files = _parse_files(script.get("files"), errors)
 +
 +    steps: list[dict] = []
++    inputs: list[dict] = []
 +    if files:
 +        steps.append({"action": "lutris", "kind": "files"})
 +    for command in script.get("installer") or []:
-+        if _check_command(command, errors, warnings):
-+            steps.append({"action": "lutris", "kind": "command", "command": command})
++        if not _check_command(command, errors, warnings):
++            continue
++        step = {"action": "lutris", "kind": "command", "command": command}
++        if "input_menu" in command:
++            params = command["input_menu"] or {}
++            step["input"] = str(params.get("id") or f"input{len(inputs)}")
++            inputs.append(menu_spec(params, step["input"]))
++        steps.append(step)
 +
 +    executable = _executable(game, prefix_expr, gamedir, name, errors)
 +
@@ -1018,6 +1056,7 @@ index 0000000..7115936
 +        "Executable": executable,
 +        "Steps": steps,
 +        "LocalResources": [f.label for f in files if f.url is None],
++        "LutrisInputs": inputs,
 +        "Lutris": {
 +            "slug": slug,
 +            "prefix": prefix_expr,
@@ -1076,6 +1115,22 @@ index 26de77f..00499fc 100644
      $GtkModelButton btn_help {
        tooltip-text: _("Read Documentation");
        text: _("Documentation");
+diff --git a/bottles/frontend/ui/dialog-installer.blp b/bottles/frontend/ui/dialog-installer.blp
+index 280c21e..d6ae8e4 100644
+--- a/bottles/frontend/ui/dialog-installer.blp
++++ b/bottles/frontend/ui/dialog-installer.blp
+@@ -56,6 +56,11 @@ template $InstallerDialog: Adw.Window {
+         name: "page_resources";
+ 
+         child: Adw.PreferencesPage {
++          Adw.PreferencesGroup group_inputs {
++            title: _("Options");
++            visible: false;
++          }
++
+           Adw.PreferencesGroup group_resources {
+             description: _("This installer requires some local resources which cannot be provided otherwise.");
+           }
 diff --git a/bottles/frontend/views/bottle_installers.py b/bottles/frontend/views/bottle_installers.py
 index 94c719f..81291ed 100644
 --- a/bottles/frontend/views/bottle_installers.py
@@ -1173,12 +1228,85 @@ index 94c719f..81291ed 100644
 +                + _("Do you want to proceed with the installation?")
 +            )
 +        installer_dialog.present()
+diff --git a/bottles/frontend/windows/installer.py b/bottles/frontend/windows/installer.py
+index 8a6d516..45085a7 100644
+--- a/bottles/frontend/windows/installer.py
++++ b/bottles/frontend/windows/installer.py
+@@ -116,6 +116,7 @@ class InstallerDialog(Adw.Window):
+     details_revealer = Gtk.Template.Child()
+     details_view = Gtk.Template.Child()
+     group_resources = Gtk.Template.Child()
++    group_inputs = Gtk.Template.Child()
+     install_status_page = Gtk.Template.Child()
+     img_icon = Gtk.Template.Child()
+     img_icon_install = Gtk.Template.Child()
+@@ -133,6 +134,10 @@ class InstallerDialog(Adw.Window):
+         self.installer = installer
+         self.__sections = []
+         self.__steps = 0
++        # Per dialog; the class attributes would be shared between dialogs.
++        self.__local_resources = []
++        self.__final_resources = {}
++        self.__inputs = {}
+         self.__current_step = 0
+         self.__log_lines = []
+         self.__elapsed_source = None
+@@ -194,17 +199,40 @@ class InstallerDialog(Adw.Window):
+         self.__local_resources = self.manager.installer_manager.has_local_resources(
+             self.installer
+         )
+-        if len(self.__local_resources) == 0:
++        inputs = manifest.get("LutrisInputs") or []
++        if len(self.__local_resources) == 0 and not inputs:
+             self.__install()
+             return
+ 
++        for spec in inputs:
++            self.group_inputs.add(self.__input_row(spec))
++        self.group_inputs.set_visible(bool(inputs))
++
+         for resource in self.__local_resources:
+             _entry = LocalResourceEntry(self, resource)
+             GLib.idle_add(self.group_resources.add, _entry)
++        self.group_resources.set_visible(bool(self.__local_resources))
+ 
+         self.btn_proceed.set_visible(True)
++        self.btn_proceed.set_sensitive(not self.__local_resources)
+         self.stack.set_visible_child_name("page_resources")
+ 
++    def __input_row(self, spec: dict) -> Adw.ComboRow:
++        """A dropdown for one choice the installer asks for."""
++        values = [value for value, _label in spec["options"]]
++        row = Adw.ComboRow(
++            title=spec["description"],
++            model=Gtk.StringList.new([label for _value, label in spec["options"]]),
++        )
++        row.set_selected(values.index(spec["default"]))
++        self.__inputs[spec["key"]] = spec["default"]
++
++        def changed(combo, _param):
++            self.__inputs[spec["key"]] = values[combo.get_selected()]
++
++        row.connect("notify::selected", changed)
++        return row
++
+     def __install(self, *_args):
+         self.set_deletable(False)
+         self.stack.set_visible_child_name("page_install")
+@@ -238,6 +266,7 @@ class InstallerDialog(Adw.Window):
+             progress_fn=self.update_progress,
+             activity_fn=self.update_activity,
+             log_fn=self.add_log,
++            inputs=self.__inputs,
+         )
+ 
+     def __installed(self):
 diff --git a/bottles/tests/backend/utils/test_lutris.py b/bottles/tests/backend/utils/test_lutris.py
 new file mode 100644
-index 0000000..58c3b03
+index 0000000..534e01b
 --- /dev/null
 +++ b/bottles/tests/backend/utils/test_lutris.py
-@@ -0,0 +1,160 @@
+@@ -0,0 +1,191 @@
 +import pytest
 +
 +from bottles.backend.utils import lutris
@@ -1339,3 +1467,34 @@ index 0000000..58c3b03
 +        "disc1: Select the disc",
 +        "disc2: Select the disc",
 +    ]
++
++
++def test_input_menus_become_dialog_inputs():
++    text = """
++game: {exe: drive_c/a.exe}
++installer:
++  - input_menu:
++      id: lang
++      description: Language
++      options: [{en: English}, {de: Deutsch}]
++      preselect: de
++  - input_menu:
++      options: [low, high]
++"""
++    converted = lutris.convert(lutris.load(text))
++    assert converted.manifest["LutrisInputs"] == [
++        {
++            "key": "lang",
++            "description": "Language",
++            "options": [["en", "English"], ["de", "Deutsch"]],
++            "default": "de",
++        },
++        {
++            "key": "input1",
++            "description": "Choose an option",
++            "options": [["low", "low"], ["high", "high"]],
++            "default": "low",
++        },
++    ]
++    assert [s.get("input") for s in converted.manifest["Steps"]] == ["lang", "input1"]
++    assert converted.warnings == []
