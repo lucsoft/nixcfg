@@ -39,6 +39,10 @@ let
 
   ardia = pkgs.callPackage ./ardia { };
 
+  widevineHint = builtins.toJSON {
+    Path = "${pkgs.widevine-cdm}/share/google/chrome/WidevineCdm";
+  };
+
   mprisenceHost = builtins.toJSON {
     name = "mprisence.web.bridge";
     description = "mprisence - sends browser media to MPRIS";
@@ -294,13 +298,16 @@ in
   };
 
   # The native messaging host, pointing the browsers at the binary to speak
-  # to. It goes in each profile directory — Helium's application ID, ilo's
-  # `ilo` under its Flatpak config — not the `chromium` that `mprisence web
-  # install` assumes; that command would also bake in the store path of
-  # whichever mprisence ran it, so it would go stale at the next update.
+  # to. It goes in each profile directory — Helium's application ID, Ardia's
+  # name, ilo's `ilo` under its Flatpak config — not the `chromium` that
+  # `mprisence web install` assumes; that command would also bake in the
+  # store path of whichever mprisence ran it, so it would go stale at the
+  # next update.
   # Declared here it is rewritten on every switch. The second origin is the
   # extension's unlisted build, carried along because upstream ships both IDs.
   home.file.".config/net.imput.helium/NativeMessagingHosts/mprisence.web.bridge.json".text =
+    mprisenceHost;
+  home.file.".config/ardia/NativeMessagingHosts/mprisence.web.bridge.json".text =
     mprisenceHost;
   home.file.".var/app/app.ilo.browser/config/ilo/NativeMessagingHosts/mprisence.web.bridge.json".text =
     mprisenceHost;
@@ -311,10 +318,11 @@ in
   # browser does read at startup is the hint file its component updater would
   # have written, naming the directory the CDM sits in. That updater never
   # runs here, so the file is ours to write.
+  # Ardia is built on Helium's patches and reads the same hint.
   home.file.".config/net.imput.helium/WidevineCdm/latest-component-updated-widevine-cdm".text =
-    builtins.toJSON {
-      Path = "${pkgs.widevine-cdm}/share/google/chrome/WidevineCdm";
-    };
+    widevineHint;
+  home.file.".config/ardia/WidevineCdm/latest-component-updated-widevine-cdm".text =
+    widevineHint;
 
 
   programs.git = {
@@ -366,11 +374,11 @@ in
   xdg.mimeApps = {
     enable = true;
     defaultApplications = {
-      "text/html" = "app.ilo.browser.desktop";
-      "x-scheme-handler/http" = "app.ilo.browser.desktop";
-      "x-scheme-handler/https" = "app.ilo.browser.desktop";
-      "x-scheme-handler/about" = "app.ilo.browser.desktop";
-      "x-scheme-handler/unknown" = "app.ilo.browser.desktop";
+      "text/html" = "ardia.desktop";
+      "x-scheme-handler/http" = "ardia.desktop";
+      "x-scheme-handler/https" = "ardia.desktop";
+      "x-scheme-handler/about" = "ardia.desktop";
+      "x-scheme-handler/unknown" = "ardia.desktop";
       "x-scheme-handler/claude-cli" = "claude-code-url-handler.desktop";
     };
   };
