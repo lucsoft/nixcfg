@@ -278,6 +278,11 @@ in
       appId = "app.ilo.browser";
       flatpakref = "https://github.com/MartinPTielemans/ilo/releases/latest/download/ilo.flatpakref";
       sha256 = "4310a4e3d43e0e528aff4f14330fce8e15a1c12a4421dbaba0e268dd31dd8599";
+    } {
+      # Compass, on trial next to ilo: the canary branch of its own OCI remote.
+      appId = "io.github.Compass_Browser.Compass";
+      flatpakref = "https://raw.githubusercontent.com/Compass-Browser/Compass/flatpak/compass-canary.flatpakref";
+      sha256 = "955cd861818cceaa02a77e66845281befcfb1911e6b16f61b655ccebe4343934";
     }];
     overrides."app.ilo.browser" = {
       Context.filesystems = [ "/nix/store:ro" ];
