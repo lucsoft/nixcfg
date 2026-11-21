@@ -241,6 +241,9 @@ in
     </fontconfig>
   '';
 
+  # The apps themselves are declared in home.nix, through nix-flatpak.
+  services.flatpak.enable = true;
+
   services.printing.enable = true;
 
   services.pulseaudio.enable = false;

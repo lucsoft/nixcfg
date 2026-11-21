@@ -97,6 +97,8 @@ let
 in
 
 {
+  imports = [ "${sources.nix-flatpak}/modules/home-manager.nix" ];
+
   home.username = "lucsoft";
   home.homeDirectory = "/home/lucsoft";
 
@@ -258,6 +260,19 @@ in
   # would go stale at the next update. Declared here it is rewritten on every
   # switch. The second origin is the extension's unlisted build, carried
   # along because upstream ships both IDs.
+  # ilo ships for Linux only as a Flatpak from its own repo. The flatpakref
+  # is the same file in every release, so the hash holds across updates; the
+  # app itself follows the repo's master branch and moves on each switch.
+  services.flatpak = {
+    enable = true;
+    update.onActivation = true;
+    packages = [{
+      appId = "app.ilo.browser";
+      flatpakref = "https://github.com/MartinPTielemans/ilo/releases/latest/download/ilo.flatpakref";
+      sha256 = "4310a4e3d43e0e528aff4f14330fce8e15a1c12a4421dbaba0e268dd31dd8599";
+    }];
+  };
+
   home.file.".config/net.imput.helium/NativeMessagingHosts/mprisence.web.bridge.json".text =
     builtins.toJSON {
       name = "mprisence.web.bridge";
@@ -331,11 +346,11 @@ in
   xdg.mimeApps = {
     enable = true;
     defaultApplications = {
-      "text/html" = "helium.desktop";
-      "x-scheme-handler/http" = "helium.desktop";
-      "x-scheme-handler/https" = "helium.desktop";
-      "x-scheme-handler/about" = "helium.desktop";
-      "x-scheme-handler/unknown" = "helium.desktop";
+      "text/html" = "app.ilo.browser.desktop";
+      "x-scheme-handler/http" = "app.ilo.browser.desktop";
+      "x-scheme-handler/https" = "app.ilo.browser.desktop";
+      "x-scheme-handler/about" = "app.ilo.browser.desktop";
+      "x-scheme-handler/unknown" = "app.ilo.browser.desktop";
       "x-scheme-handler/claude-cli" = "claude-code-url-handler.desktop";
     };
   };

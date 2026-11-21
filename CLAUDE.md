@@ -88,6 +88,13 @@ No channels, no flakes. Multiple pins live in `npins/sources.json`:
   moves. The `.deb` version and hash are literals inside `package.nix`, so
   that is also what updates the app. Drop the pin and take `claude-desktop`
   from nixpkgs once the PR lands.
+- **`nix-flatpak`** — `gmodena/nix-flatpak`, a Home Manager module that
+  declares Flatpaks; `services.flatpak.enable` in `configuration.nix` is the
+  runtime underneath it. It is here for the ilo browser, which ships for
+  Linux only as a Flatpak from its own repo. The pin moves the module, not
+  the app: ilo follows that repo's `master` and updates on every
+  `home-manager switch` (`update.onActivation`), so its version is not
+  reproducible the way the other pins are.
 
 `nix.nixPath` in `configuration.nix` aims `<nixpkgs>` at the same pin, because
 that path is what standalone Home Manager builds against.
