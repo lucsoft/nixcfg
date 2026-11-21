@@ -213,6 +213,16 @@ in
       TAG+="mutter-device-preferred-primary"
   '';
 
+  # Seat-user access to ESP32 serial ports (Espressif USB-JTAG, WCH CH343)
+  # for esptool/ESPHome. A package rather than extraRules, because uaccess
+  # must be tagged before 73-seat-late and extraRules lands in 99-local.
+  services.udev.packages = [
+    (pkgs.writeTextDir "lib/udev/rules.d/70-esp-serial.rules" ''
+      SUBSYSTEM=="tty", ATTRS{idVendor}=="303a", TAG+="uaccess"
+      SUBSYSTEM=="tty", ATTRS{idVendor}=="1a86", ATTRS{idProduct}=="55d3", TAG+="uaccess"
+    '')
+  ];
+
   services.xserver.xkb.layout = "de";
   services.xserver.xkb.variant = "mac";
   console.keyMap = "mac-de-latin1";
