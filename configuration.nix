@@ -256,7 +256,7 @@ in
     isNormalUser = true;
     description = "lucsoft";
     # input/uinput for Sunshine
-    extraGroups = [ "networkmanager" "wheel" "input" "uinput" ];
+    extraGroups = [ "networkmanager" "wheel" "input" "uinput" "libvirtd" ];
     openssh.authorizedKeys.keys = [
       # ~/.ssh/id_ed25519.pub on this machine
       "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDQjtXFsbUxTkLB2H7sE+F6J2ZYbOmQORkk0Za0Gf7Uk mail@lucsoft.de"
@@ -273,6 +273,15 @@ in
 
   programs.gamemode.enable = true;
   programs.gamescope.enable = true;
+
+  # KVM for GNOME Boxes. The module puts qemu on PATH and links its OVMF
+  # descriptors where libvirt looks, which is what makes UEFI guests work.
+  virtualisation.libvirtd = {
+    enable = true;
+    qemu.package = pkgs.qemu_kvm;   # host architecture only
+    qemu.swtpm.enable = true;       # TPM for Windows 11 guests (system VMs)
+  };
+  virtualisation.spiceUSBRedirection.enable = true;
 
   # Patched so Steam cannot take the resolution back; see the patch header
   # and the Gaming Mode entry in home.nix, which sets the variable.
