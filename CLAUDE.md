@@ -157,21 +157,20 @@ Shell would refuse to load.
 To see what a pin actually changed, before switching:
 
     nixos-rebuild build --file ~/nixcfg
-    nix --extra-experimental-features nix-command \
-        store diff-closures /run/current-system ./result
-
-`nix-command` is not enabled on this machine, hence the flag.
+    nix store diff-closures /run/current-system ./result
 
 ## Worth knowing
 
-- **Missing CLI tools are one `nix-shell` away.** `gh`, `jq` and friends
+- **Missing CLI tools are one `nix run` away.** `gh`, `jq` and friends
   are not installed; run them ad hoc instead of working around them:
 
-      nix-shell -p gh jq --run 'gh api repos/owner/repo | jq .tag_name'
+      nix run nixpkgs#gh -- api repos/owner/repo
+      nix shell nixpkgs#gh nixpkgs#jq --command sh -c '…'
 
-  `nix run nixpkgs#…` does not work here, since flakes and `nix-command`
-  are off. `nix-shell -p` resolves `<nixpkgs>` to the same pin the
-  system is built from.
+  `nix-command` and `flakes` are on system-wide for exactly this, and
+  `configuration.nix` points the `nixpkgs` registry entry at the pin, so
+  this is the same nixpkgs the system is built from. The repo itself
+  still uses no flakes.
 
 - **NixOS 26.05 reaches end of life on 2026-12-31.** The pins, both
   `stateVersion` markers and the Bottles workaround are all tied to that

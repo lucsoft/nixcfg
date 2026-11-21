@@ -409,6 +409,14 @@ in
 
   nix.nixPath = [ "nixpkgs=${sources.nixpkgs}" ];
 
+  # For ad hoc `nix run` / `nix shell`; this repo itself stays flake-free.
+  # The registry entry points `nixpkgs#` at the pin instead of unstable.
+  nix.settings.experimental-features = [ "nix-command" "flakes" ];
+  nix.registry.nixpkgs.to = {
+    type = "path";
+    path = sources.nixpkgs;
+  };
+
   # Andromeda is packaged in lucsoft/andromeda-nix, whose CI pushes here.
   # Without it the runtime is a 20 minute Rust build.
   nix.settings = {
