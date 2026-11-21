@@ -1,0 +1,1341 @@
+diff --git a/bottles/backend/managers/installer.py b/bottles/backend/managers/installer.py
+index 619a5be..4f92363 100644
+--- a/bottles/backend/managers/installer.py
++++ b/bottles/backend/managers/installer.py
+@@ -29,8 +29,10 @@ import pycurl
+ from bottles.backend.globals import Paths
+ from bottles.backend.logger import Logger
+ from bottles.backend.managers.conf import ConfigManager
++from bottles.backend.managers.lutris import LutrisSession
+ from bottles.backend.models.config import BottleConfig
+ from bottles.backend.models.result import Result
++from bottles.backend.utils import yaml
+ from bottles.backend.utils.manager import ManagerUtils
+ from bottles.backend.utils.wine import WineUtils
+ from bottles.backend.wine.executor import WineExecutor
+@@ -52,10 +54,19 @@ class InstallerManager:
+         self.__component_manager = manager.component_manager
+         self.__local_resources = {}
+         self.__manifests = {}
++        # Manifests that do not come from the repository, e.g. imported
++        # Lutris installers. Keyed by installer name.
++        self.__local_manifests = {}
++
++    def register_local(self, installer_name: str, manifest: dict):
++        """Make a manifest from outside the repository installable."""
++        self.__local_manifests[installer_name] = manifest
+ 
+     @lru_cache
+     def get_review(self, installer_name, parse: bool = True) -> str:
+         """Return an installer review from the repository (as HTML)"""
++        if installer_name in self.__local_manifests:
++            return "This installer was imported from a local file."
+         review = self.__repo.get_review(installer_name)
+         if not review:
+             return "No review found for this installer."
+@@ -70,6 +81,9 @@ class InstallerManager:
+         Return an installer manifest from the repository. Use the plain
+         argument to get the manifest as plain text.
+         """
++        if installer_name in self.__local_manifests:
++            manifest = self.__local_manifests[installer_name]
++            return yaml.dump(manifest, sort_keys=False) if plain else manifest
+         key = (installer_name, plain)
+         if key not in self.__manifests:
+             manifest = self.__repo.get(installer_name, plain)
+@@ -99,6 +113,8 @@ class InstallerManager:
+ 
+     def get_icon_url(self, installer):
+         """Wrapper for the repo method."""
++        if installer in self.__local_manifests:
++            return None
+         return self.__repo.get_icon(installer)
+ 
+     @staticmethod
+@@ -215,12 +231,22 @@ class InstallerManager:
+         progress_fn: Optional[Callable[[Optional[float]], None]] = None,
+         activity_fn: Optional[Callable[[Optional[str]], None]] = None,
+         log_fn: Optional[Callable[[str], None]] = None,
++        lutris: Optional[LutrisSession] = None,
+     ):
+         """Perform a list of actions"""
+         for st in steps:
+             if step_fn:
+                 step_fn()
+ 
++            # Step type: lutris, see bottles.backend.managers.lutris
++            if st.get("action") == "lutris":
++                if lutris is None:
++                    return Result(False, message="Lutris step outside a Lutris installer.")
++                result = lutris.run(st)
++                if not result.ok:
++                    return result
++                continue
++
+             # Step type: run_script
+             if st.get("action") == "run_script":
+                 if activity_fn:
+@@ -665,11 +691,8 @@ class InstallerManager:
+             and s.get("url", "") == "local"
+         ]
+ 
+-        if len(exe_msi_steps) == 0:
+-            return []
+-
+         files = [s.get("file_name", "") for s in exe_msi_steps]
+-        return files
++        return files + list(manifest.get("LocalResources", []))
+ 
+     def install(
+         self,
+@@ -762,14 +785,30 @@ class InstallerManager:
+         # execute steps
+         if steps:
+             logging.info("Executing installer steps")
+-            result = self.__perform_steps(
+-                _config,
+-                steps,
+-                step_fn=step_fn if is_final else None,
+-                progress_fn=progress_fn if is_final else None,
+-                activity_fn=activity_fn if is_final else None,
+-                log_fn=log_fn if is_final else None,
+-            )
++            lutris = None
++            if manifest.get("Lutris"):
++                lutris = LutrisSession(
++                    self.__manager,
++                    _config,
++                    manifest["Lutris"],
++                    self.__local_resources,
++                    progress_fn=progress_fn if is_final else None,
++                    activity_fn=activity_fn if is_final else None,
++                    log_fn=log_fn if is_final else None,
++                )
++            try:
++                result = self.__perform_steps(
++                    _config,
++                    steps,
++                    step_fn=step_fn if is_final else None,
++                    progress_fn=progress_fn if is_final else None,
++                    activity_fn=activity_fn if is_final else None,
++                    log_fn=log_fn if is_final else None,
++                    lutris=lutris,
++                )
++            finally:
++                if lutris:
++                    lutris.cleanup()
+             if not result.ok:
+                 message = result.message or "Installer step failed."
+                 return Result(
+diff --git a/bottles/backend/managers/lutris.py b/bottles/backend/managers/lutris.py
+new file mode 100644
+index 0000000..687252e
+--- /dev/null
++++ b/bottles/backend/managers/lutris.py
+@@ -0,0 +1,474 @@
++# lutris.py
++#
++# This program is free software: you can redistribute it and/or modify
++# it under the terms of the GNU General Public License as published by
++# the Free Software Foundation, in version 3 of the License.
++#
++# This program is distributed in the hope that it will be useful,
++# but WITHOUT ANY WARRANTY; without even the implied warranty of
++# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++# GNU General Public License for more details.
++#
++# You should have received a copy of the GNU General Public License
++# along with this program.  If not, see <http://www.gnu.org/licenses/>.
++#
++"""
++Carry out the steps of a converted Lutris installer inside a bottle.
++See bottles.backend.utils.lutris for the conversion itself.
++"""
++
++import configparser
++import hashlib
++import json
++import os
++import shlex
++import shutil
++import stat
++import subprocess
++import tempfile
++import urllib.request
++from typing import Callable, Optional
++
++import patoolib  # type: ignore [import-untyped]
++
++from bottles.backend.globals import Paths
++from bottles.backend.logger import Logger
++from bottles.backend.models.config import BottleConfig
++from bottles.backend.models.result import Result
++from bottles.backend.utils.lutris import (
++    PREFIX_VAR,
++    expand,
++    winetricks_dependencies,
++)
++from bottles.backend.utils.manager import ManagerUtils
++from bottles.backend.wine.executor import WineExecutor
++from bottles.backend.wine.reg import Reg
++from bottles.backend.wine.winecommand import WineCommand
++from bottles.backend.wine.wineserver import WineServer
++
++logging = Logger()
++
++# Wine builtins a wineexec step may name instead of a file.
++WINE_BUILTINS = {"cmd", "control", "regedit", "reg", "wineboot", "winecfg", "msiexec"}
++
++
++class LutrisStepError(Exception):
++    pass
++
++
++class LutrisSession:
++    """State shared by the steps of one Lutris install."""
++
++    def __init__(
++        self,
++        manager,
++        config: BottleConfig,
++        lutris: dict,
++        local_resources: dict,
++        progress_fn: Optional[Callable[[Optional[float]], None]] = None,
++        activity_fn: Optional[Callable[[Optional[str]], None]] = None,
++        log_fn: Optional[Callable[[str], None]] = None,
++    ):
++        self.manager = manager
++        self.config = config
++        self.lutris = lutris
++        self.local_resources = local_resources
++        self.progress_fn = progress_fn
++        self.activity_fn = activity_fn
++        self.log_fn = log_fn
++
++        self.prefix = ManagerUtils.get_bottle_path(config)
++        os.makedirs(Paths.temp, exist_ok=True)
++        self.cache = tempfile.mkdtemp(prefix=f"lutris-{lutris['slug']}-", dir=Paths.temp)
++        self.files: dict[str, str] = {}
++        self.variables = {
++            PREFIX_VAR: self.prefix,
++            "CACHE": self.cache,
++            "HOME": os.path.expanduser("~"),
++            "USER": os.environ.get("USER", ""),
++        }
++        self.variables["GAMEDIR"] = expand(lutris["gamedir"], self.variables)
++        os.makedirs(self.variables["GAMEDIR"], exist_ok=True)
++
++    # region helpers
++
++    def log(self, line: str):
++        logging.info(line)
++        if self.log_fn:
++            self.log_fn(line)
++
++    def activity(self, text: Optional[str]):
++        if self.activity_fn:
++            self.activity_fn(text)
++
++    def resolve(self, value):
++        """Expand variables, after mapping the script's prefix onto the bottle."""
++        prefix = self.lutris.get("prefix")
++
++        def sub_prefix(v):
++            if isinstance(v, str) and prefix:
++                return v.replace(prefix, f"${PREFIX_VAR}")
++            if isinstance(v, list):
++                return [sub_prefix(x) for x in v]
++            if isinstance(v, dict):
++                return {k: sub_prefix(x) for k, x in v.items()}
++            return v
++
++        return expand(sub_prefix(value), self.variables)
++
++    def path(self, value) -> str:
++        """A file id from the files section, or a path."""
++        value = str(value)
++        if value in self.files:
++            return self.files[value]
++        path = self.resolve(value)
++        if not os.path.isabs(path):
++            path = os.path.join(self.variables["GAMEDIR"], path)
++        return path
++
++    def cleanup(self):
++        shutil.rmtree(self.cache, ignore_errors=True)
++
++    # endregion
++
++    def run(self, step: dict) -> Result:
++        try:
++            kind = step.get("kind")
++            if kind == "files":
++                self.__fetch_files()
++            elif kind == "config":
++                self.__apply_config()
++            elif kind == "command":
++                name, params = next(iter(step["command"].items()))
++                getattr(self, f"_cmd_{name}")(params)
++            else:
++                raise LutrisStepError(f"Unknown Lutris step: {kind}")
++        except LutrisStepError as e:
++            self.log(str(e))
++            return Result(False, message=str(e))
++        except (OSError, subprocess.SubprocessError, ValueError) as e:
++            message = f"Lutris step failed: {e}"
++            self.log(message)
++            return Result(False, message=message)
++        finally:
++            self.activity(None)
++        return Result(True)
++
++    # region files
++
++    def __fetch_files(self):
++        for f in self.lutris["files"]:
++            if f["url"] is None:
++                path = self.local_resources.get(f["label"])
++                if not path or not os.path.isfile(path):
++                    raise LutrisStepError(f"No file was chosen for '{f['label']}'.")
++            else:
++                path = os.path.join(self.cache, f["filename"])
++                self.__download(f["url"], path)
++            if f.get("checksum"):
++                self.__verify(path, f["checksum"])
++            self.files[f["id"]] = path
++            self.variables[f["id"]] = path
++
++    def __download(self, url: str, path: str):
++        self.activity(os.path.basename(path))
++        self.log(f"Downloading {url}")
++        request = urllib.request.Request(url, headers={"User-Agent": "Bottles"})
++        with urllib.request.urlopen(request, timeout=30) as response:
++            total = int(response.headers.get("Content-Length") or 0)
++            done = 0
++            with open(path, "wb") as out:
++                while chunk := response.read(1 << 20):
++                    out.write(chunk)
++                    done += len(chunk)
++                    if total and self.progress_fn:
++                        self.progress_fn(done / total)
++        if self.progress_fn:
++            self.progress_fn(None)
++
++    @staticmethod
++    def __verify(path: str, checksum: str):
++        algo, _, expected = str(checksum).partition(":")
++        if not expected:
++            algo, expected = "md5", algo
++        try:
++            digest = hashlib.new(algo.lower())
++        except ValueError:
++            raise LutrisStepError(f"Unknown checksum type: {algo}")
++        with open(path, "rb") as f:
++            while chunk := f.read(1 << 20):
++                digest.update(chunk)
++        if digest.hexdigest().lower() != expected.lower():
++            raise LutrisStepError(f"Checksum mismatch for {os.path.basename(path)}.")
++
++    # endregion
++
++    # region plain commands
++
++    def _cmd_extract(self, params):
++        params = params or {}
++        src = self.path(params.get("file") or params.get("src"))
++        dst = self.path(params.get("dst", "$GAMEDIR"))
++        fmt = params.get("format")
++        self.activity(os.path.basename(src))
++        self.log(f"Extracting {src} to {dst}")
++
++        os.makedirs(dst, exist_ok=True)
++        tmp = tempfile.mkdtemp(dir=self.cache)
++        if fmt in ("innoextract", "gog") or (
++            fmt is None and src.lower().endswith(".exe")
++        ):
++            if not shutil.which("innoextract"):
++                raise LutrisStepError("innoextract is needed for this installer.")
++            subprocess.run(
++                ["innoextract", "--silent", "--exclude-temp", "-d", tmp, src],
++                check=True,
++            )
++        else:
++            patoolib.extract_archive(src, outdir=tmp, verbosity=-1, interactive=False)
++
++        # Like Lutris, an archive holding a single folder is unwrapped.
++        root = tmp
++        entries = os.listdir(tmp)
++        if len(entries) == 1 and os.path.isdir(os.path.join(tmp, entries[0])):
++            if not params.get("nomerge"):
++                root = os.path.join(tmp, entries[0])
++        shutil.copytree(root, dst, dirs_exist_ok=True, symlinks=True)
++        shutil.rmtree(tmp, ignore_errors=True)
++
++    def _cmd_move(self, params):
++        src, dst = self.path(params["src"]), self.path(params["dst"])
++        self.log(f"Moving {src} to {dst}")
++        if os.path.isdir(dst) and os.path.isdir(src):
++            for entry in os.listdir(src):
++                target = os.path.join(dst, entry)
++                if os.path.isdir(target):
++                    shutil.copytree(os.path.join(src, entry), target, dirs_exist_ok=True)
++                    shutil.rmtree(os.path.join(src, entry))
++                else:
++                    shutil.move(os.path.join(src, entry), target)
++            return
++        os.makedirs(os.path.dirname(dst.rstrip("/")) or "/", exist_ok=True)
++        shutil.move(src, dst)
++
++    def _cmd_merge(self, params):
++        src, dst = self.path(params["src"]), self.path(params["dst"])
++        self.log(f"Copying {src} to {dst}")
++        if os.path.isdir(src):
++            shutil.copytree(src, dst, dirs_exist_ok=True, symlinks=True)
++        else:
++            os.makedirs(dst, exist_ok=True)
++            shutil.copy2(src, dst)
++
++    _cmd_copy = _cmd_merge
++
++    def _cmd_rename(self, params):
++        src, dst = self.path(params["src"]), self.path(params["dst"])
++        os.makedirs(os.path.dirname(dst) or "/", exist_ok=True)
++        os.rename(src, dst)
++
++    def _cmd_chmodx(self, params):
++        path = self.path(params)
++        mode = os.stat(path).st_mode
++        os.chmod(path, mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
++
++    def _cmd_execute(self, params):
++        params = params or {}
++        env = {**os.environ, **{str(k): str(v) for k, v in self.resolve(params.get("env") or {}).items()}}
++        env["WINEPREFIX"] = self.prefix
++        cwd = self.path(params["working_dir"]) if params.get("working_dir") else self.cache
++
++        if params.get("command"):
++            argv = ["bash", "-c", self.resolve(str(params["command"]))]
++            label = "shell command"
++        else:
++            program = self.path(params["file"])
++            argv = [program, *shlex.split(self.resolve(str(params.get("args", ""))))]
++            label = os.path.basename(program)
++
++        self.activity(label)
++        self.log(f"Running {' '.join(argv)}")
++        proc = subprocess.run(
++            argv, cwd=cwd, env=env, capture_output=True, text=True
++        )
++        for line in f"{proc.stdout}\n{proc.stderr}".splitlines():
++            if line and self.log_fn:
++                self.log_fn(line[:500])
++        expected = {int(c) for c in str(params.get("return_code", "0")).split(",")}
++        if proc.returncode not in expected:
++            raise LutrisStepError(f"{label} exited with status {proc.returncode}.")
++
++    def _cmd_write_file(self, params):
++        path = self.path(params["file"])
++        os.makedirs(os.path.dirname(path), exist_ok=True)
++        with open(path, "w", encoding="utf-8") as f:
++            f.write(self.resolve(str(params.get("content", ""))))
++
++    def _cmd_write_config(self, params):
++        path = self.path(params["file"])
++        parser = configparser.RawConfigParser(strict=False, interpolation=None)
++        parser.optionxform = str  # keep the key case the game expects
++        if os.path.isfile(path) and params.get("merge", True):
++            parser.read(path, encoding="utf-8")
++
++        data = self.resolve(params.get("data") or {})
++        if params.get("section"):
++            data = {params["section"]: {params["key"]: self.resolve(params.get("value", ""))}}
++        for section, values in data.items():
++            if not parser.has_section(section):
++                parser.add_section(section)
++            for key, value in (values or {}).items():
++                parser.set(section, key, str(value))
++
++        os.makedirs(os.path.dirname(path), exist_ok=True)
++        with open(path, "w", encoding="utf-8") as f:
++            parser.write(f, space_around_delimiters=False)
++
++    def _cmd_write_json(self, params):
++        path = self.path(params["file"])
++        data = self.resolve(params.get("data") or {})
++        if os.path.isfile(path) and params.get("merge", True):
++            with open(path, encoding="utf-8") as f:
++                current = json.load(f)
++
++            def merge(a, b):
++                for k, v in b.items():
++                    if isinstance(v, dict) and isinstance(a.get(k), dict):
++                        merge(a[k], v)
++                    else:
++                        a[k] = v
++                return a
++
++            data = merge(current, data)
++        os.makedirs(os.path.dirname(path), exist_ok=True)
++        with open(path, "w", encoding="utf-8") as f:
++            json.dump(data, f, indent=2)
++
++    def _cmd_input_menu(self, params):
++        options = params["options"]
++        choice = params.get("preselect")
++        if choice is None:
++            first = options[0]
++            choice = next(iter(first)) if isinstance(first, dict) else first
++        self.variables["INPUT"] = str(choice)
++        if params.get("id"):
++            self.variables[f"INPUT_{params['id']}"] = str(choice)
++
++    def _cmd_task(self, params):
++        getattr(self, f"_task_{params['name']}")(params)
++
++    # endregion
++
++    # region wine tasks
++
++    def _task_create_prefix(self, params):
++        # Bottles already created and booted the prefix.
++        pass
++
++    def _task_wineexec(self, params):
++        executable = str(params["executable"])
++        args = self.resolve(str(params.get("args", "")))
++        env = {str(k): str(v) for k, v in self.resolve(params.get("env") or {}).items()}
++        self.activity(os.path.basename(executable))
++        self.log(f"Running {executable} {args}".strip())
++
++        if executable.lower() in WINE_BUILTINS:
++            result = WineCommand(
++                self.config,
++                command=executable,
++                arguments=args,
++                communicate=True,
++                environment=env,
++            ).run()
++        else:
++            cwd = self.path(params["working_dir"]) if params.get("working_dir") else None
++            result = WineExecutor(
++                self.config,
++                exec_path=self.path(executable),
++                args=args,
++                environment=env,
++                cwd=cwd,
++            ).run()
++        if not result.ok:
++            raise LutrisStepError(result.message or f"{executable} failed.")
++
++    def _task_winetricks(self, params):
++        available = self.manager.supported_dependencies
++        for verb in str(params.get("app", "")).split():
++            deps = winetricks_dependencies(verb, available)
++            if deps is None:
++                self.__winetricks(verb)
++                continue
++            for dep in deps:
++                if dep in self.config.Installed_Dependencies:
++                    continue
++                self.activity(dep)
++                self.log(f"Installing dependency {dep} for winetricks {verb}")
++                res = self.manager.dependency_manager.install(
++                    self.config, [dep, available.get(dep)]
++                )
++                if not res.ok:
++                    raise LutrisStepError(res.message or f"Failed to install {dep}.")
++
++    def __winetricks(self, verb: str):
++        winetricks = shutil.which("winetricks")
++        if not winetricks:
++            raise LutrisStepError(
++                f"winetricks {verb} has no Bottles dependency, and winetricks "
++                "is not installed to run it directly."
++            )
++        runner = ManagerUtils.get_runner_path(self.config.Runner)
++        wine = next(
++            (
++                p
++                for p in (f"{runner}/bin/wine", f"{runner}/files/bin/wine")
++                if os.path.isfile(p)
++            ),
++            None,
++        )
++        env = {**os.environ, "WINEPREFIX": self.prefix}
++        if wine:
++            env["WINE"] = wine
++            env["WINESERVER"] = os.path.join(os.path.dirname(wine), "wineserver")
++        self.activity(f"winetricks {verb}")
++        self.log(f"Running winetricks {verb}")
++        proc = subprocess.run(
++            [winetricks, "--unattended", verb], env=env, capture_output=True, text=True
++        )
++        for line in f"{proc.stdout}\n{proc.stderr}".splitlines():
++            if line and self.log_fn:
++                self.log_fn(line[:500])
++        if proc.returncode:
++            raise LutrisStepError(f"winetricks {verb} exited with status {proc.returncode}.")
++
++    def _task_set_regedit(self, params):
++        Reg(self.config).add(
++            key=self.resolve(str(params["path"])),
++            value=self.resolve(str(params["key"])),
++            data=self.resolve(str(params.get("value", ""))),
++            value_type=params.get("type", "REG_SZ"),
++        )
++
++    def _task_delete_registry_key(self, params):
++        key = self.resolve(str(params["key"]))
++        Reg(self.config).launch(
++            f"delete '{key}' /f", communicate=True, minimal=True, action_name="delete"
++        )
++
++    def _task_winekill(self, params):
++        WineServer(self.config).stop()
++
++    # endregion
++
++    def __apply_config(self):
++        for key, value in self.lutris["overrides"].items():
++            self.manager.update_config(
++                config=self.config, key=key, value=value, scope="DLL_Overrides"
++            )
++        for key, value in self.lutris["env"].items():
++            self.manager.update_config(
++                config=self.config,
++                key=key,
++                value=self.resolve(value),
++                scope="Environment_Variables",
++            )
+diff --git a/bottles/backend/managers/meson.build b/bottles/backend/managers/meson.build
+index 6581b6e..9623362 100644
+--- a/bottles/backend/managers/meson.build
++++ b/bottles/backend/managers/meson.build
+@@ -7,6 +7,7 @@ bottles_sources = [
+   'component.py',
+   'dependency.py',
+   'installer.py',
++  'lutris.py',
+   'library.py',
+   'manager.py',
+   'versioning.py',
+diff --git a/bottles/backend/utils/lutris.py b/bottles/backend/utils/lutris.py
+new file mode 100644
+index 0000000..7115936
+--- /dev/null
++++ b/bottles/backend/utils/lutris.py
+@@ -0,0 +1,423 @@
++# lutris.py
++#
++# This program is free software: you can redistribute it and/or modify
++# it under the terms of the GNU General Public License as published by
++# the Free Software Foundation, in version 3 of the License.
++#
++# This program is distributed in the hope that it will be useful,
++# but WITHOUT ANY WARRANTY; without even the implied warranty of
++# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++# GNU General Public License for more details.
++#
++# You should have received a copy of the GNU General Public License
++# along with this program.  If not, see <http://www.gnu.org/licenses/>.
++#
++"""
++Turn a Lutris installer script into a Bottles installer manifest.
++
++Conversion is pure: it validates the script and builds a manifest whose
++steps are carried out by bottles.backend.managers.lutris at install time.
++Only the parts of the format that make sense inside a single Wine bottle
++are accepted; anything else is reported up front, before the user commits
++to an install.
++"""
++
++import os
++import re
++from dataclasses import dataclass, field
++from typing import Any
++
++from bottles.backend.utils import yaml
++
++# Placeholder the manifest uses for the bottle path until install time.
++PREFIX_VAR = "BOTTLE_PREFIX"
++
++# Runner names Lutris uses for Windows games.
++WINE_RUNNERS = {"wine", "winesteam", None}
++
++# Plain commands, i.e. the keys of an entry in the "installer" list.
++SUPPORTED_COMMANDS = {
++    "chmodx",
++    "copy",
++    "execute",
++    "extract",
++    "input_menu",
++    "merge",
++    "move",
++    "rename",
++    "task",
++    "write_config",
++    "write_file",
++    "write_json",
++}
++
++# Wine tasks, i.e. the "name" of a "task" command.
++SUPPORTED_TASKS = {
++    "create_prefix",
++    "delete_registry_key",
++    "set_regedit",
++    "wineexec",
++    "winekill",
++    "winetricks",
++}
++
++# Tasks that only matter interactively; skipped with a warning.
++SKIPPED_TASKS = {"winecfg", "joycpl"}
++
++# Winetricks verbs whose Bottles dependency has a different name.
++# Verbs that are not listed here are tried under their own name first.
++WINETRICKS_ALIASES: dict[str, list[str]] = {
++    "vcrun6": ["vcredist6"],
++    "vcrun6sp6": ["vcredist6sp6"],
++    "vcrun2005": ["vcredist2005"],
++    "vcrun2008": ["vcredist2008"],
++    "vcrun2010": ["vcredist2010"],
++    "vcrun2012": ["vcredist2012"],
++    "vcrun2013": ["vcredist2013"],
++    "vcrun2015": ["vcredist2015"],
++    "vcrun2017": ["vcredist2019"],
++    "vcrun2019": ["vcredist2019"],
++    "vcrun2022": ["vcredist2022"],
++    "corefonts": [
++        "andale32",
++        "arial32",
++        "arialb32",
++        "comic32",
++        "courie32",
++        "georgi32",
++        "impact32",
++        "times32",
++        "trebuc32",
++        "verdan32",
++        "webdin32",
++    ],
++    "tahoma": ["tahoma32"],
++    "cjkfonts": ["cjkfonts"],
++    "allfonts": ["allfonts"],
++    "xact_x64": ["xact_x64"],
++    "dotnet40_kb2468871": ["dotnet40"],
++}
++
++# Lutris spells DLL override modes out; Bottles uses wine's short form.
++OVERRIDE_MODES = {
++    "builtin": "b",
++    "native": "n",
++    "builtin,native": "b,n",
++    "native,builtin": "n,b",
++    "disabled": "d",
++    "": "d",
++}
++
++_VAR_RE = re.compile(r"\$(?:\{(\w+)\}|(\w+))")
++
++
++class LutrisScriptError(Exception):
++    """The script cannot be imported; the message lists every problem."""
++
++
++@dataclass
++class LutrisFile:
++    id: str
++    url: str | None = None  # None when the user has to pick the file
++    filename: str = ""
++    checksum: str | None = None
++    label: str = ""  # Shown next to the file picker for local files
++
++
++@dataclass
++class ConvertedScript:
++    key: str
++    entry: dict
++    manifest: dict
++    warnings: list[str] = field(default_factory=list)
++
++
++def expand(value: Any, variables: dict[str, str]) -> Any:
++    """
++    Replace $VAR and ${VAR} the way Lutris does. Unknown names are left
++    alone, so shell variables inside "execute" commands survive.
++    """
++    if isinstance(value, str):
++
++        def sub(match):
++            name = match.group(1) or match.group(2)
++            return variables.get(name, match.group(0))
++
++        return _VAR_RE.sub(sub, value)
++    if isinstance(value, list):
++        return [expand(v, variables) for v in value]
++    if isinstance(value, dict):
++        return {k: expand(v, variables) for k, v in value.items()}
++    return value
++
++
++def load(text: str) -> dict:
++    """
++    Accept a script in any of the shapes Lutris hands out: the full
++    installer (name, runner, script), the bare script, a lutris.net API
++    response, or an installer whose script is an embedded YAML string.
++    """
++    try:
++        data = yaml.load(text)
++    except yaml.YAMLError as e:
++        raise LutrisScriptError(f"Not valid YAML: {e}") from e
++
++    if not isinstance(data, dict):
++        raise LutrisScriptError("The file does not contain a Lutris installer.")
++
++    if isinstance(data.get("results"), list):
++        if not data["results"]:
++            raise LutrisScriptError("The API response lists no installer.")
++        data = data["results"][0]
++
++    if isinstance(data.get("content"), str) and "script" not in data:
++        try:
++            content = yaml.load(data["content"])
++        except yaml.YAMLError as e:
++            raise LutrisScriptError(f"Embedded script is not valid YAML: {e}") from e
++        data = {**data, "script": content}
++
++    if "script" not in data:
++        data = {"script": data}
++
++    if not isinstance(data["script"], dict):
++        raise LutrisScriptError("The installer has no script section.")
++    return data
++
++
++def _parse_files(raw: Any, errors: list[str]) -> list[LutrisFile]:
++    files = []
++    for item in raw or []:
++        if not isinstance(item, dict) or len(item) != 1:
++            errors.append(f"Malformed entry in files: {item!r}")
++            continue
++        file_id, spec = next(iter(item.items()))
++        file_id = str(file_id)
++
++        checksum = None
++        filename = ""
++        if isinstance(spec, dict):
++            url = str(spec.get("url", ""))
++            filename = str(spec.get("filename", ""))
++            checksum = spec.get("checksum")
++        else:
++            url = str(spec)
++
++        if url.startswith("N/A"):
++            label = url[4:].strip() if url.startswith("N/A:") else ""
++            files.append(LutrisFile(file_id, None, filename, checksum, label or file_id))
++            continue
++
++        if url.startswith("$STEAM") or url.startswith("$WINESTEAM"):
++            errors.append(f"File '{file_id}' comes from Steam, which is not supported.")
++            continue
++
++        if not re.match(r"^(https?|ftp)://", url):
++            errors.append(f"File '{file_id}' has an unsupported source: {url}")
++            continue
++
++        if not filename:
++            filename = os.path.basename(url.split("?", 1)[0]) or file_id
++        files.append(LutrisFile(file_id, url, filename, checksum))
++
++    # The file picker is keyed by label, so labels must be unique.
++    seen: dict[str, int] = {}
++    for f in files:
++        if f.url is None:
++            seen[f.label] = seen.get(f.label, 0) + 1
++    for f in files:
++        if f.url is None and seen[f.label] > 1:
++            f.label = f"{f.id}: {f.label}"
++    return files
++
++
++def _check_command(command: Any, errors: list[str], warnings: list[str]) -> bool:
++    """Validate one installer command; return whether it should run."""
++    if not isinstance(command, dict) or len(command) != 1:
++        errors.append(f"Malformed installer step: {command!r}")
++        return False
++
++    name, params = next(iter(command.items()))
++    if name not in SUPPORTED_COMMANDS:
++        errors.append(f"Installer step '{name}' is not supported.")
++        return False
++
++    if name == "task":
++        task = (params or {}).get("name")
++        if task in SKIPPED_TASKS:
++            warnings.append(f"Skipping interactive task '{task}'.")
++            return False
++        if task not in SUPPORTED_TASKS:
++            errors.append(f"Wine task '{task}' is not supported.")
++            return False
++
++    if name == "input_menu":
++        params = params or {}
++        options = params.get("options") or []
++        if not options:
++            errors.append("An input_menu step has no options.")
++            return False
++        choice = params.get("preselect")
++        if choice is None:
++            first = options[0]
++            choice = next(iter(first)) if isinstance(first, dict) else first
++        warnings.append(
++            f"Choosing '{choice}' for \"{params.get('description', 'a menu')}\"."
++        )
++    return True
++
++
++def _game_dir(prefix_expr: str, slug: str) -> str:
++    """
++    Where $GAMEDIR points inside the bottle. When the prefix is $GAMEDIR
++    itself, which is by far the common case, the two are the same place;
++    otherwise the game gets a folder of its own under drive_c.
++    """
++    if prefix_expr.strip() in ("$GAMEDIR", "${GAMEDIR}"):
++        return f"${PREFIX_VAR}"
++    return f"${PREFIX_VAR}/drive_c/Games/{slug}"
++
++
++def _executable(game: dict, prefix_expr: str, gamedir: str, name: str, errors):
++    exe = game.get("exe")
++    if not exe:
++        errors.append("The script has no game executable (game.exe).")
++        return None
++
++    exe = str(exe).replace("\\", "/")
++    if prefix_expr:
++        exe = exe.replace(prefix_expr, f"${PREFIX_VAR}")
++    if not exe.startswith("$") and not exe.startswith("/"):
++        # Lutris resolves a relative exe against the game directory.
++        exe = f"{gamedir}/{exe}"
++    exe = expand(exe, {"GAMEDIR": gamedir})
++
++    root = f"${PREFIX_VAR}/drive_c/"
++    if not exe.startswith(root):
++        errors.append(f"The game executable is outside the Wine prefix: {exe}")
++        return None
++
++    path = exe[len(root) :]
++    executable = {
++        "name": name,
++        "file": os.path.basename(path),
++        "path": path,
++    }
++    if game.get("args"):
++        executable["arguments"] = str(game["args"])
++    return executable
++
++
++def convert(data: dict, source: str = "") -> ConvertedScript:
++    """
++    Build a Bottles installer manifest from a loaded Lutris installer.
++    Raises LutrisScriptError listing every problem found.
++    """
++    script = data["script"]
++    errors: list[str] = []
++    warnings: list[str] = []
++
++    runner = data.get("runner")
++    if runner not in WINE_RUNNERS:
++        raise LutrisScriptError(
++            f"This installer uses the '{runner}' runner. Bottles can only "
++            "import installers for Wine."
++        )
++
++    name = str(data.get("name") or script.get("name") or "")
++    if not name:
++        name = os.path.splitext(os.path.basename(source))[0] or "Lutris game"
++    slug = str(
++        data.get("game_slug")
++        or data.get("slug")
++        or re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
++        or "game"
++    )
++
++    game = script.get("game") or {}
++    wine = script.get("wine") or {}
++    system = script.get("system") or {}
++    prefix_expr = str(game.get("prefix") or "$GAMEDIR").rstrip("/")
++    gamedir = _game_dir(prefix_expr, slug)
++
++    files = _parse_files(script.get("files"), errors)
++
++    steps: list[dict] = []
++    if files:
++        steps.append({"action": "lutris", "kind": "files"})
++    for command in script.get("installer") or []:
++        if _check_command(command, errors, warnings):
++            steps.append({"action": "lutris", "kind": "command", "command": command})
++
++    executable = _executable(game, prefix_expr, gamedir, name, errors)
++
++    if wine.get("version"):
++        warnings.append(
++            f"Wine version '{wine['version']}' is ignored; the bottle's runner is used."
++        )
++
++    overrides = {}
++    for dll, mode in (wine.get("overrides") or {}).items():
++        key = str(mode or "").replace(" ", "").lower()
++        if key not in OVERRIDE_MODES:
++            errors.append(f"Unknown DLL override mode for {dll}: {mode}")
++            continue
++        overrides[str(dll)] = OVERRIDE_MODES[key]
++
++    env = {str(k): str(v) for k, v in (system.get("env") or {}).items()}
++    if overrides or env:
++        steps.append({"action": "lutris", "kind": "config"})
++
++    if errors:
++        raise LutrisScriptError("\n".join(errors))
++
++    parameters = {}
++    for key in ("dxvk", "vkd3d"):
++        if key in wine:
++            parameters[key] = bool(wine[key])
++    if "dxvk_nvapi" in wine:
++        parameters["dxvk_nvapi"] = bool(wine["dxvk_nvapi"])
++    if wine.get("fsync"):
++        parameters["sync"] = "fsync"
++    elif wine.get("esync"):
++        parameters["sync"] = "esync"
++
++    arch = game.get("arch") or wine.get("arch") or "win64"
++
++    manifest: dict = {
++        "Name": name,
++        "Description": f"Imported from the Lutris installer {os.path.basename(source)}".strip(),
++        "Arch": arch,
++        "Executable": executable,
++        "Steps": steps,
++        "LocalResources": [f.label for f in files if f.url is None],
++        "Lutris": {
++            "slug": slug,
++            "prefix": prefix_expr,
++            "gamedir": gamedir,
++            "files": [f.__dict__ for f in files],
++            "env": env,
++            "overrides": overrides,
++        },
++    }
++    if parameters:
++        manifest["Parameters"] = parameters
++
++    entry = {
++        "Name": name,
++        "Description": manifest["Description"],
++        "Arch": arch,
++        "Grade": "Bronze",
++    }
++    return ConvertedScript(f"lutris:{slug}", entry, manifest, warnings)
++
++
++def winetricks_dependencies(verb: str, available) -> list[str] | None:
++    """
++    The Bottles dependencies standing in for a winetricks verb, or None
++    when there is no match and winetricks itself has to run it.
++    """
++    candidates = WINETRICKS_ALIASES.get(verb, [verb])
++    if all(c in available for c in candidates):
++        return candidates
++    return None
+diff --git a/bottles/backend/utils/meson.build b/bottles/backend/utils/meson.build
+index 0ec6e58..8c04ece 100644
+--- a/bottles/backend/utils/meson.build
++++ b/bottles/backend/utils/meson.build
+@@ -26,6 +26,7 @@ bottles_sources = [
+   'gsettings_stub.py',
+   'json.py',
+   'lsfgvk.py',
++  'lutris.py',
+   'singleton.py'
+ ]
+ 
+diff --git a/bottles/frontend/ui/details-installers.blp b/bottles/frontend/ui/details-installers.blp
+index 26de77f..00499fc 100644
+--- a/bottles/frontend/ui/details-installers.blp
++++ b/bottles/frontend/ui/details-installers.blp
+@@ -47,6 +47,11 @@ Popover pop_context {
+     margin-start: 6;
+     margin-end: 6;
+ 
++    $GtkModelButton btn_import_lutris {
++      tooltip-text: _("Install a program from a Lutris installer script");
++      text: _("Import Lutris Installer…");
++    }
++
+     $GtkModelButton btn_help {
+       tooltip-text: _("Read Documentation");
+       text: _("Documentation");
+diff --git a/bottles/frontend/views/bottle_installers.py b/bottles/frontend/views/bottle_installers.py
+index 94c719f..81291ed 100644
+--- a/bottles/frontend/views/bottle_installers.py
++++ b/bottles/frontend/views/bottle_installers.py
+@@ -16,14 +16,18 @@
+ #
+ 
+ import time
++from gettext import gettext as _
+ 
+-from gi.repository import Adw, GLib, Gtk
++from gi.repository import Adw, Gio, GLib, Gtk
+ 
+ from bottles.backend.models.config import BottleConfig
+ from bottles.backend.models.result import Result
++from bottles.backend.utils import lutris
+ from bottles.backend.utils.threading import RunAsync
+ from bottles.frontend.utils.common import open_doc_url
+ from bottles.frontend.widgets.installer import InstallerEntry
++from bottles.frontend.windows.generic import TextDialog
++from bottles.frontend.windows.installer import InstallerDialog
+ 
+ 
+ @Gtk.Template(resource_path="/com/usebottles/bottles/details-installers.ui")
+@@ -34,6 +38,7 @@ class InstallersView(Adw.Bin):
+     # region Widgets
+     list_installers = Gtk.Template.Child()
+     btn_help = Gtk.Template.Child()
++    btn_import_lutris = Gtk.Template.Child()
+     btn_toggle_search = Gtk.Template.Child()
+     entry_search = Gtk.Template.Child()
+     search_bar = Gtk.Template.Child()
+@@ -57,6 +62,7 @@ class InstallersView(Adw.Bin):
+ 
+         self.search_bar.set_key_capture_widget(self.window)
+         self.btn_help.connect("clicked", open_doc_url, "bottles/installers")
++        self.btn_import_lutris.connect("clicked", self.__choose_lutris_script)
+         self.entry_search.connect("changed", self.__search_installers)
+ 
+     def __search_installers(self, *_args):
+@@ -141,3 +147,56 @@ class InstallersView(Adw.Bin):
+             return Result(True)
+ 
+         RunAsync(process_installers, callback)
++
++    def __choose_lutris_script(self, *_args):
++        filters = Gio.ListStore.new(Gtk.FileFilter)
++        file_filter = Gtk.FileFilter()
++        file_filter.set_name(_("Lutris Installers"))
++        for pattern in ("*.yml", "*.yaml", "*.json", "*.lutris"):
++            file_filter.add_pattern(pattern)
++        filters.append(file_filter)
++
++        dialog = Gtk.FileDialog.new()
++        dialog.set_title(_("Select a Lutris Installer"))
++        dialog.set_modal(True)
++        dialog.set_filters(filters)
++        dialog.open(self.window, None, self.__lutris_script_chosen)
++
++    def __lutris_script_chosen(self, dialog, result):
++        try:
++            file = dialog.open_finish(result)
++        except GLib.Error:
++            return
++        if not file or not file.get_path():
++            return
++
++        path = file.get_path()
++        try:
++            with open(path, encoding="utf-8") as f:
++                converted = lutris.convert(lutris.load(f.read()), source=path)
++        except (OSError, UnicodeDecodeError, lutris.LutrisScriptError) as e:
++            TextDialog(
++                parent=self.window,
++                title=_("Cannot Import Lutris Installer"),
++                message=str(e),
++            ).present()
++            return
++
++        if converted.entry["Arch"] != self.config.Arch:
++            self.window.show_toast(
++                _("This installer needs a {0} bottle.").format(converted.entry["Arch"])
++            )
++            return
++
++        self.manager.installer_manager.register_local(
++            converted.key, converted.manifest
++        )
++        installer = (converted.key, converted.entry)
++        installer_dialog = InstallerDialog(self.window, self.config, installer)
++        if converted.warnings:
++            installer_dialog.status_init.set_description(
++                "\n".join(converted.warnings)
++                + "\n\n"
++                + _("Do you want to proceed with the installation?")
++            )
++        installer_dialog.present()
+diff --git a/bottles/tests/backend/utils/test_lutris.py b/bottles/tests/backend/utils/test_lutris.py
+new file mode 100644
+index 0000000..58c3b03
+--- /dev/null
++++ b/bottles/tests/backend/utils/test_lutris.py
+@@ -0,0 +1,160 @@
++import pytest
++
++from bottles.backend.utils import lutris
++
++GOG_SCRIPT = """
++name: Example Game
++game_slug: example-game
++version: GOG
++slug: example-game-gog
++runner: wine
++
++script:
++  files:
++    - installer: "N/A:Select the GOG installer"
++    - patch:
++        url: https://example.org/files/patch.zip?x=1
++        checksum: md5:0123
++
++  game:
++    exe: drive_c/GOG Games/Example/example.exe
++    args: -windowed
++    prefix: $GAMEDIR
++
++  installer:
++    - task:
++        name: create_prefix
++        prefix: $GAMEDIR
++    - task:
++        name: winetricks
++        app: vcrun2022 corefonts
++    - task:
++        name: wineexec
++        executable: installer
++        args: /SILENT
++    - extract:
++        file: patch
++        dst: $GAMEDIR/drive_c/GOG Games/Example
++    - task:
++        name: winecfg
++
++  wine:
++    version: lutris-GE-Proton8-26
++    dxvk: true
++    esync: true
++    overrides:
++      d3d9: native,builtin
++
++  system:
++    env:
++      DXVK_ASYNC: 1
++"""
++
++
++def test_convert_gog_script():
++    converted = lutris.convert(lutris.load(GOG_SCRIPT), "example.yaml")
++    manifest = converted.manifest
++
++    assert converted.key == "lutris:example-game"
++    assert manifest["Executable"] == {
++        "name": "Example Game",
++        "file": "example.exe",
++        "path": "GOG Games/Example/example.exe",
++        "arguments": "-windowed",
++    }
++    assert manifest["Parameters"] == {"dxvk": True, "sync": "esync"}
++    assert manifest["LocalResources"] == ["Select the GOG installer"]
++
++    kinds = [s["kind"] for s in manifest["Steps"]]
++    # winecfg is dropped, files come first and config last
++    assert kinds == ["files"] + ["command"] * 4 + ["config"]
++
++    files = {f["id"]: f for f in manifest["Lutris"]["files"]}
++    assert files["installer"]["url"] is None
++    assert files["patch"]["filename"] == "patch.zip"
++    assert manifest["Lutris"]["overrides"] == {"d3d9": "n,b"}
++    assert manifest["Lutris"]["env"] == {"DXVK_ASYNC": "1"}
++    assert manifest["Lutris"]["gamedir"] == "$BOTTLE_PREFIX"
++
++    assert any("winecfg" in w for w in converted.warnings)
++    assert any("lutris-GE-Proton8-26" in w for w in converted.warnings)
++
++
++def test_bare_script_and_separate_prefix():
++    text = """
++files:
++  - setup: https://example.org/setup.exe
++game:
++  exe: $GAMEDIR/game.exe
++  prefix: $GAMEDIR/prefix
++installer:
++  - task:
++      name: wineexec
++      executable: setup
++"""
++    converted = lutris.convert(lutris.load(text), "/tmp/my-game.yaml")
++    manifest = converted.manifest
++
++    assert manifest["Name"] == "my-game"
++    assert manifest["Lutris"]["gamedir"] == "$BOTTLE_PREFIX/drive_c/Games/my-game"
++    assert manifest["Executable"]["path"] == "Games/my-game/game.exe"
++
++
++def test_api_response_with_embedded_content():
++    text = """
++count: 1
++results:
++  - name: From API
++    game_slug: from-api
++    runner: wine
++    content: |
++      game:
++        exe: drive_c/a.exe
++"""
++    converted = lutris.convert(lutris.load(text))
++    assert converted.manifest["Executable"]["path"] == "a.exe"
++
++
++@pytest.mark.parametrize(
++    "text,message",
++    [
++        ("runner: dosbox\nscript: {}", "dosbox"),
++        ("game: {exe: drive_c/a.exe}\ninstaller:\n  - insert-disc: {}", "insert-disc"),
++        ("game: {exe: drive_c/a.exe}\ninstaller:\n  - task: {name: dosexec}", "dosexec"),
++        ("installer: []", "game.exe"),
++        ("game: {exe: /usr/bin/true}", "outside the Wine prefix"),
++        ("files:\n  - a: $STEAM:123:x\ngame: {exe: drive_c/a.exe}", "Steam"),
++    ],
++)
++def test_rejected_scripts(text, message):
++    with pytest.raises(lutris.LutrisScriptError, match=message):
++        lutris.convert(lutris.load(text))
++
++
++def test_expand_leaves_unknown_variables():
++    assert lutris.expand("$GAMEDIR/${CACHE}/$PATH", {"GAMEDIR": "/g", "CACHE": "/c"}) == (
++        "/g//c/$PATH"
++    )
++
++
++def test_winetricks_dependencies():
++    available = {"vcredist2022": {}, "d3dx9": {}, "arial32": {}}
++    assert lutris.winetricks_dependencies("vcrun2022", available) == ["vcredist2022"]
++    assert lutris.winetricks_dependencies("d3dx9", available) == ["d3dx9"]
++    # corefonts needs more than what is available
++    assert lutris.winetricks_dependencies("corefonts", available) is None
++    assert lutris.winetricks_dependencies("unknownverb", available) is None
++
++
++def test_duplicate_local_labels_are_made_unique():
++    text = """
++files:
++  - disc1: "N/A:Select the disc"
++  - disc2: "N/A:Select the disc"
++game: {exe: drive_c/a.exe}
++"""
++    manifest = lutris.convert(lutris.load(text)).manifest
++    assert manifest["LocalResources"] == [
++        "disc1: Select the disc",
++        "disc2: Select the disc",
++    ]

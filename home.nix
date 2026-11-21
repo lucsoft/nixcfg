@@ -137,7 +137,16 @@ in
     resources
 
     # unstable until bottles v67 is stable
-    (unstable.bottles.override { removeWarningPopup = true; })
+    (unstable.bottles.override {
+      removeWarningPopup = true;
+      # Adds "Import Lutris Installer…" to a bottle's Installers page.
+      bottles-unwrapped = unstable.bottles-unwrapped.overrideAttrs (old: {
+        patches = old.patches ++ [ ./bottles/lutris-import.patch ];
+      });
+      # extract needs innoextract for GOG setups; winetricks covers the
+      # verbs Bottles has no dependency for.
+      extraPkgs = pkgs: [ pkgs.innoextract pkgs.winetricks ];
+    })
 
     (lutris.override {
       extraPkgs = pkgs: with pkgs; [
