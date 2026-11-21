@@ -6,3 +6,6 @@ bench-results/
 # python bytecode from running npins-ui.py directly
 __pycache__/
 .claude/
+
+# local Lutris installer scripts, see lutris-configs/
+lutris-configs/
