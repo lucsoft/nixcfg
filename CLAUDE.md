@@ -164,6 +164,15 @@ To see what a pin actually changed, before switching:
 
 ## Worth knowing
 
+- **Missing CLI tools are one `nix-shell` away.** `gh`, `jq` and friends
+  are not installed; run them ad hoc instead of working around them:
+
+      nix-shell -p gh jq --run 'gh api repos/owner/repo | jq .tag_name'
+
+  `nix run nixpkgs#…` does not work here, since flakes and `nix-command`
+  are off. `nix-shell -p` resolves `<nixpkgs>` to the same pin the
+  system is built from.
+
 - **NixOS 26.05 reaches end of life on 2026-12-31.** The pins, both
   `stateVersion` markers and the Bottles workaround are all tied to that
   release.
