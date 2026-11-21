@@ -22,8 +22,13 @@ G_DECLARE_FINAL_TYPE (WpeBgPlayer, wpebg_player, WPEBG, PLAYER, GObject)
  */
 WpeBgPlayer *wpebg_player_new (CoglContext *context);
 
-/* A file:// URI, or NULL to stop and let go of the file. Starts paused or
- * playing, whichever was asked for last. */
+/**
+ * wpebg_player_set_uri:
+ * @self: the player
+ * @uri: (nullable): a file:// URI, or NULL to stop and let go of the file
+ *
+ * Starts paused or playing, whichever was asked for last.
+ */
 void wpebg_player_set_uri (WpeBgPlayer *self,
                            const char  *uri);
 
