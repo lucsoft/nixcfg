@@ -114,8 +114,6 @@ let
 in
 
 {
-  imports = [ "${sources.nix-flatpak}/modules/home-manager.nix" ];
-
   home.username = "lucsoft";
   home.homeDirectory = "/home/lucsoft";
 
@@ -271,45 +269,16 @@ in
     Install.WantedBy = [ "graphical-session.target" ];
   };
 
-  # ilo ships for Linux only as a Flatpak from its own repo. The flatpakref
-  # is the same file in every release, so the hash holds across updates; the
-  # app itself follows the repo's master branch and moves on each switch.
-  #
-  # The mprisence bridge runs inside ilo's sandbox, as the browser's child:
-  # it needs the store to exec from, and to own the MPRIS name it publishes
-  # the tab under.
-  services.flatpak = {
-    enable = true;
-    update.onActivation = true;
-    packages = [{
-      appId = "app.ilo.browser";
-      flatpakref = "https://github.com/MartinPTielemans/ilo/releases/latest/download/ilo.flatpakref";
-      sha256 = "4310a4e3d43e0e528aff4f14330fce8e15a1c12a4421dbaba0e268dd31dd8599";
-    } {
-      # Compass, on trial next to ilo: the canary branch of its own OCI remote.
-      appId = "io.github.Compass_Browser.Compass";
-      flatpakref = "https://raw.githubusercontent.com/Compass-Browser/Compass/flatpak/compass-canary.flatpakref";
-      sha256 = "955cd861818cceaa02a77e66845281befcfb1911e6b16f61b655ccebe4343934";
-    }];
-    overrides."app.ilo.browser" = {
-      Context.filesystems = [ "/nix/store:ro" ];
-      "Session Bus Policy"."org.mpris.MediaPlayer2.mprisence_web.*" = "own";
-    };
-  };
-
   # The native messaging host, pointing the browsers at the binary to speak
   # to. It goes in each profile directory — Helium's application ID, Ardia's
-  # name, ilo's `ilo` under its Flatpak config — not the `chromium` that
-  # `mprisence web install` assumes; that command would also bake in the
-  # store path of whichever mprisence ran it, so it would go stale at the
-  # next update.
-  # Declared here it is rewritten on every switch. The second origin is the
-  # extension's unlisted build, carried along because upstream ships both IDs.
+  # name — not the `chromium` that `mprisence web install` assumes; that
+  # command would also bake in the store path of whichever mprisence ran it,
+  # so it would go stale at the next update. Declared here it is rewritten on
+  # every switch. The second origin is the extension's unlisted build,
+  # carried along because upstream ships both IDs.
   home.file.".config/net.imput.helium/NativeMessagingHosts/mprisence.web.bridge.json".text =
     mprisenceHost;
   home.file.".config/ardia/NativeMessagingHosts/mprisence.web.bridge.json".text =
-    mprisenceHost;
-  home.file.".var/app/app.ilo.browser/config/ilo/NativeMessagingHosts/mprisence.web.bridge.json".text =
     mprisenceHost;
 
   # Widevine, which the DRM-protected tracks on SoundCloud ask for. Helium

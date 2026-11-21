@@ -56,22 +56,6 @@
       "url": "https://github.com/nix-community/home-manager/archive/5643e73425b85ac359ba2aaf83deae8ce1cd7968.tar.gz",
       "hash": "sha256-Qkh6uNyMsic61gfyOO8VXnC+HEBdti6Xe2kKiMf66O0="
     },
-    "nix-flatpak": {
-      "type": "GitRelease",
-      "repository": {
-        "type": "GitHub",
-        "owner": "gmodena",
-        "repo": "nix-flatpak"
-      },
-      "pre_releases": false,
-      "version_upper_bound": null,
-      "release_prefix": null,
-      "submodules": false,
-      "version": "v0.8.0",
-      "revision": "f1f045fc8b35ff59f88982c1752d3f3a42ca6a61",
-      "url": "https://api.github.com/repos/gmodena/nix-flatpak/tarball/refs/tags/v0.8.0",
-      "hash": "sha256-OsZ/I7v3ArCrk0XOUvkiU1dFtGtE1qZTHRGjvBXIKUU="
-    },
     "nixpkgs": {
       "type": "Channel",
       "name": "nixos-26.05",
