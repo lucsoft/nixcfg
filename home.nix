@@ -37,6 +37,8 @@ let
 
   epic-games-launcher = pkgs.callPackage ./epic-games-launcher { };
 
+  ardia = pkgs.callPackage ./ardia { };
+
   mprisenceHost = builtins.toJSON {
     name = "mprisence.web.bridge";
     description = "mprisence - sends browser media to MPRIS";
@@ -127,6 +129,7 @@ in
     signal-desktop
     gnome-secrets
     helium
+    ardia
     claude-desktop
     epic-games-launcher
     resources
