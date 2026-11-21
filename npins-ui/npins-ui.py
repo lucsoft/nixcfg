@@ -1209,7 +1209,7 @@ TAIL_BUDGET = 40_000
 
 # Which view a rebuild opens in when nothing has said otherwise. The schema
 # carries the same default; this is what a run from a checkout falls back to.
-DEFAULT_PLAN_VIEW = "graph"
+DEFAULT_PLAN_VIEW = "progress"
 
 # pkexec is how a GNOME app asks for root: polkit puts up the password dialog
 # and gnome-shell is already the agent. Absolute paths are required — pkexec
@@ -3303,6 +3303,309 @@ class LogPane(Gtk.Box):
 
 
 
+# -----------------------------------------------------------------------------
+# the plan, as boxes
+# -----------------------------------------------------------------------------
+# A step's last piece of work: what runs once everything is built and here.
+# It is no derivation, so the tree has no node for it, but it is the part
+# that takes the switch live and the run is not over until it is.
+ACTIVATE = "activate"
+
+# One colour per kind of work, from Adwaita's own palette so it sits right in
+# either theme. Kind and not state is what the colour says; state is told by
+# whether a box is filled at all.
+KIND_COLOUR = {
+    DOWNLOAD: (0x35 / 255, 0x84 / 255, 0xe4 / 255),   # blue 3
+    BUILD: (0x91 / 255, 0x41 / 255, 0xac / 255),      # purple 3
+    ACTIVATE: (0x2e / 255, 0xc2 / 255, 0x7e / 255),   # green 4
+}
+FAILED_COLOUR = (0xe0 / 255, 0x1b / 255, 0x24 / 255)  # red 3
+VERB = {DOWNLOAD: "Downloading", BUILD: "Building", ACTIVATE: "Activating"}
+
+
+def progress_items(step):
+    """A step node as the boxes it is drawn with: (kind, state) for every
+    download and build, and the activation last.
+
+    Sorted, so that a step fills like a bar from the left — done, then
+    working, then waiting — rather than as dots scattered in whatever order
+    the tree happened to walk.
+    """
+    builds, downloads = [], []
+    for kid in step["kids"]:
+        if kid["key"][0] == "downloads":
+            downloads += kid["kids"]
+        else:
+            builds += walk_plan([kid])
+    rows = downloads + builds
+    outstanding = any(row["state"] != DONE for row in rows)
+    if step["state"] == DONE:
+        activate = DONE
+    elif step["state"] == RUNNING and not outstanding:
+        activate = RUNNING
+    else:
+        activate = PLANNED
+
+    rank = {DONE: 0, FAILED: 0, RUNNING: 1, PLANNED: 2}
+    items = [(DOWNLOAD, row["state"]) for row in downloads]
+    items.sort(key=lambda item: rank[item[1]])
+    tail = [(BUILD, row["state"]) for row in builds]
+    tail.sort(key=lambda item: rank[item[1]])
+    return items + tail + [(ACTIVATE, activate)]
+
+
+def chunk_state(states):
+    """What a box that stands for several pieces of work shows."""
+    if FAILED in states:
+        return FAILED
+    if all(state == DONE for state in states):
+        return DONE
+    if any(state != PLANNED for state in states):
+        return RUNNING
+    return PLANNED
+
+
+class BoxStrip(Gtk.Widget):
+    """One box per piece of work, wrapped to the width it is given.
+
+    Dark is waiting, pulsing is being worked on, filled is done. A pin move
+    can mean a thousand downloads, so the boxes shrink to keep the strip
+    within MAX_ROWS — and below MIN they stop shrinking and start standing
+    for more than one piece each.
+    """
+
+    CELL, MIN, GAP, MAX_ROWS = 12, 5, 3, 6
+
+    def __init__(self, items=()):
+        super().__init__()
+        self.items = list(items)
+        self.pulse = 0
+
+    def set_items(self, items):
+        if items == self.items:
+            return
+        self.items = list(items)
+        self.queue_resize()
+        self.queue_draw()
+        running = any(state == RUNNING for _kind, state in items)
+        if running and not self.pulse:
+            self.pulse = self.add_tick_callback(self.tick)
+        elif not running and self.pulse:
+            self.remove_tick_callback(self.pulse)
+            self.pulse = 0
+
+    def tick(self, _widget, _clock):
+        self.queue_draw()
+        return GLib.SOURCE_CONTINUE
+
+    def layout(self, width):
+        """(cell size, boxes per row, pieces per box) for a width."""
+        count = max(len(self.items), 1)
+        per_row = 1
+        for size in range(self.CELL, self.MIN - 1, -1):
+            per_row = max(1, (width + self.GAP) // (size + self.GAP))
+            if math.ceil(count / per_row) <= self.MAX_ROWS:
+                return size, per_row, 1
+        return self.MIN, per_row, math.ceil(count / (per_row * self.MAX_ROWS))
+
+    def boxes(self, group):
+        if group == 1:
+            return self.items
+        return [(self.items[start][0],
+                 chunk_state([state for _kind, state
+                              in self.items[start:start + group]]))
+                for start in range(0, len(self.items), group)]
+
+    def do_get_request_mode(self):
+        return Gtk.SizeRequestMode.HEIGHT_FOR_WIDTH
+
+    def do_measure(self, orientation, for_size):
+        if orientation == Gtk.Orientation.HORIZONTAL:
+            wide = min(len(self.items), 8) * (self.CELL + self.GAP)
+            return (self.CELL, max(self.CELL, wide), -1, -1)
+        size, per_row, group = self.layout(for_size if for_size > 0 else 400)
+        rows = math.ceil(max(len(self.boxes(group)), 1) / per_row)
+        tall = rows * (size + self.GAP) - self.GAP
+        return (tall, tall, -1, -1)
+
+    def do_snapshot(self, snapshot):
+        width = self.get_width()
+        size, per_row, group = self.layout(width)
+        cr = snapshot.append_cairo(Graphene.Rect().init(
+            0, 0, width, self.get_height()))
+        fg = Palette(self).fg
+        # One wave for every box, rather than a phase each: a strip of boxes
+        # all breathing out of step reads as noise, not as work.
+        glow = .45 + .55 * (.5 + .5 * math.sin(GLib.get_monotonic_time() / 1e6
+                                                * 2 * math.pi / 1.2))
+        radius = size / 4
+        for index, (kind, state) in enumerate(self.boxes(group)):
+            x = (index % per_row) * (size + self.GAP)
+            y = (index // per_row) * (size + self.GAP)
+            cr.new_sub_path()
+            cr.arc(x + size - radius, y + radius, radius, -math.pi / 2, 0)
+            cr.arc(x + size - radius, y + size - radius, radius, 0, math.pi / 2)
+            cr.arc(x + radius, y + size - radius, radius, math.pi / 2, math.pi)
+            cr.arc(x + radius, y + radius, radius, math.pi, 3 * math.pi / 2)
+            cr.close_path()
+            if state == FAILED:
+                cr.set_source_rgba(*FAILED_COLOUR, 1)
+            elif state == DONE:
+                cr.set_source_rgba(*KIND_COLOUR[kind], 1)
+            elif state == RUNNING:
+                cr.set_source_rgba(*KIND_COLOUR[kind], glow)
+            else:
+                cr.set_source_rgba(*fg, .14)
+            cr.fill()
+
+
+class ProgressView(Gtk.Box):
+    """The rebuild as one strip of boxes per step, and a line or three on
+    what is being worked on right now.
+
+    The graph and the list say how the work hangs together; this says how
+    far along it is, which is what a rebuild is mostly watched for. Every
+    one of them reads the same composed tree.
+    """
+
+    NOW = 3
+
+    def __init__(self):
+        super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=6,
+                         margin_top=24, margin_bottom=24,
+                         margin_start=24, margin_end=24)
+        self.on_select = lambda key: None
+        self.started = 0
+
+        top = Gtk.Box(spacing=12)
+        self.title = Gtk.Label(xalign=0, hexpand=True, ellipsize=Pango.EllipsizeMode.END,
+                               css_classes=["title-2"])
+        self.clock = Gtk.Label(css_classes=["numeric", "dim-label"])
+        top.append(self.title)
+        top.append(self.clock)
+        self.subtitle = Gtk.Label(xalign=0, css_classes=["dim-label"],
+                                  margin_bottom=12)
+        self.append(top)
+        self.append(self.subtitle)
+
+        self.steps = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=16)
+        self.sections = []
+        self.append(self.steps)
+
+        self.append(Gtk.Separator(margin_top=12, margin_bottom=6))
+        self.now = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        self.now_rows = []
+        for _ in range(self.NOW):
+            strip = BoxStrip()
+            strip.set_valign(Gtk.Align.CENTER)
+            verb = Gtk.Label(xalign=0, ellipsize=Pango.EllipsizeMode.END,
+                             hexpand=True)
+            detail = Gtk.Label(css_classes=["dim-label", "caption", "numeric"])
+            line = Gtk.Box(spacing=10)
+            line.append(strip)
+            line.append(verb)
+            line.append(detail)
+            button = Gtk.Button(child=line, css_classes=["flat", "progress-now"],
+                                visible=False, can_focus=False)
+            button.key = None
+            button.connect("clicked", lambda b: b.key and self.on_select(b.key))
+            self.now.append(button)
+            self.now_rows.append((button, strip, verb, detail))
+        self.append(self.now)
+
+        legend = Gtk.Box(spacing=14, margin_top=12)
+        for kind, label in ((DOWNLOAD, "Download"), (BUILD, "Build"),
+                            (ACTIVATE, "Activate"), (None, "Waiting")):
+            entry = Gtk.Box(spacing=6)
+            swatch = BoxStrip([(kind or BUILD, DONE if kind else PLANNED)])
+            swatch.set_valign(Gtk.Align.CENTER)
+            entry.append(swatch)
+            entry.append(Gtk.Label(label=label,
+                                   css_classes=["dim-label", "caption"]))
+            legend.append(entry)
+        self.append(legend)
+
+        self.add_tick_callback(self.tock)
+
+    def section(self, index):
+        while len(self.sections) <= index:
+            heading = Gtk.Box(spacing=12)
+            name = Gtk.Label(xalign=0, hexpand=True,
+                             css_classes=["caption-heading"])
+            count = Gtk.Label(css_classes=["dim-label", "caption", "numeric"])
+            heading.append(name)
+            heading.append(count)
+            strip = BoxStrip()
+            box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+            box.append(heading)
+            box.append(strip)
+            self.steps.append(box)
+            self.sections.append((box, name, count, strip))
+        return self.sections[index]
+
+    def update(self, plan):
+        root = plan[0] if plan else None
+        steps = root["kids"] if root else []
+        for box, *_rest in self.sections[len(steps):]:
+            box.set_visible(False)
+        total = finished = 0
+        for index, step in enumerate(steps):
+            box, name, count, strip = self.section(index)
+            items = progress_items(step)
+            done = sum(1 for _kind, state in items if state == DONE)
+            total += len(items)
+            finished += done
+            box.set_visible(True)
+            name.set_label(step["name"])
+            count.set_label(f"{done} of {len(items)}")
+            strip.set_items(items)
+
+        live = next((step for step in steps if step["state"] == RUNNING), None)
+        if not root:
+            title = ""
+        elif root["state"] == FAILED:
+            title = "Rebuild failed"
+        elif root["state"] == DONE:
+            title = "Rebuild finished"
+        else:
+            title = (live or root)["name"]
+        self.title.set_label(title)
+        self.subtitle.set_label(
+            f"{finished} of {total} done · {round(100 * finished / total)}%"
+            if total else "")
+        self.started = root["started"] if root and root["state"] == RUNNING else 0
+        self.clock.set_visible(bool(self.started))
+
+        working = [row for row in walk_plan(steps)
+                   if row["state"] == RUNNING
+                   and row["key"][0] in ("node", DOWNLOAD)]
+        # Builds before downloads: there are fewer of them, they take
+        # longer, and they are the ones worth clicking through to read.
+        working.sort(key=lambda row: row["kind"] != BUILD)
+        if live and not working and all(
+                state != PLANNED for _kind, state in progress_items(live)[:-1]):
+            working = [{"key": live["key"], "kind": ACTIVATE,
+                        "name": "the new generation", "state": RUNNING,
+                        "detail": "", "started": 0}]
+        for index, (button, strip, verb, detail) in enumerate(self.now_rows):
+            row = working[index] if index < len(working) else None
+            button.set_visible(row is not None)
+            if row is None:
+                continue
+            button.key = row["key"]
+            strip.set_items([(row["kind"], RUNNING)])
+            verb.set_label(f"{VERB[row['kind']]} {row['name']}")
+            detail.set_label(describe(row))
+        self.now.set_visible(bool(working))
+
+    def tock(self, _widget, _clock):
+        if self.started:
+            label = clock(time.monotonic() - self.started)
+            if label != self.clock.get_label():
+                self.clock.set_label(label)
+        return GLib.SOURCE_CONTINUE
+
+
 def problem_row(problem):
     """What nix called an error or a warning, with the output that explains
     it where there is any.
@@ -3375,6 +3678,7 @@ class Window(Adw.ApplicationWindow):
         self.check_button.connect("clicked", lambda _b: self.check())
 
         view_menu = Gio.Menu()
+        view_menu.append("Progress", "win.plan-view::progress")
         view_menu.append("Graph", "win.plan-view::graph")
         view_menu.append("List", "win.plan-view::list")
 
@@ -3420,13 +3724,20 @@ class Window(Adw.ApplicationWindow):
         # is part of the tree rather than chrome around it.
         self.graph = PlanGraph()
         self.list = PlanList()
+        self.progress = ProgressView()
         self.graph.on_select = self.watch
         self.list.on_select = self.watch
+        self.progress.on_select = self.watch
         # The graph draws itself at whatever width it is given and folds
         # away what will not fit, so it never asks the window to grow. The
         # scroller is for the other axis: a card listing what it stands for
         # is a tall card, and a plan of those can outrun the window down.
         self.plan_views = Gtk.Stack(vexpand=True)
+        self.plan_views.add_named(
+            Gtk.ScrolledWindow(child=Adw.Clamp(child=self.progress,
+                                               maximum_size=760),
+                               hscrollbar_policy=Gtk.PolicyType.NEVER,
+                               vexpand=True), "progress")
         self.plan_views.add_named(
             Gtk.ScrolledWindow(child=self.graph, vexpand=True), "graph")
         self.plan_views.add_named(self.list, "list")
@@ -4288,6 +4599,7 @@ class Window(Adw.ApplicationWindow):
         self.watching = None
         self.graph.update([])
         self.list.update([])
+        self.progress.update([])
         self.pane.show(None)
 
     def pick_reading(self):
@@ -4341,6 +4653,7 @@ class Window(Adw.ApplicationWindow):
         """
         self.graph.update(prune(plan, GRAPH_CARDS))
         self.list.update(plan)
+        self.progress.update(plan)
         self.plan_views.set_visible(bool(plan))
         return plan
 
@@ -4669,6 +4982,10 @@ listview.plan-list > row { padding: 0; }
 }
 
 .plan-log { font-family: monospace; font-size: .85em; }
+
+/* A line under the boxes reads as text that can be clicked, not as a
+   button: Adwaita sets button labels bold. */
+.progress-now label { font-weight: normal; }
 """
 
 
