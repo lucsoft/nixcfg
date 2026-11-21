@@ -1,4 +1,4 @@
-{ appimageTools, fetchurl }:
+{ appimageTools, fetchurl, makeWrapper }:
 
 # Ardia ships Linux only as nightlies, with no Flatpak and nothing in
 # nixpkgs; the AppImage is the one format that carries its own libraries.
@@ -19,7 +19,12 @@ in
 appimageTools.wrapType2 {
   inherit pname version src;
 
+  # XWayland until ardia-browser/ardia#3340 is fixed: on native Wayland a
+  # tab dragged in the sidebar moves the whole window instead.
   extraInstallCommands = ''
+    source ${makeWrapper}/nix-support/setup-hook
+    wrapProgram $out/bin/ardia --add-flags --ozone-platform=x11
+
     install -Dm444 ${contents}/ardia.desktop $out/share/applications/ardia.desktop
     substituteInPlace $out/share/applications/ardia.desktop \
       --replace-fail 'Exec=AppRun' 'Exec=ardia'
