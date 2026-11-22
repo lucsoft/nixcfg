@@ -220,6 +220,9 @@ in
   # The stylesheet the extension above reads.
   xdg.configFile."gnome-shell/gnome-shell.css".source = ./gnome-shell.css;
 
+  # Offers LM Studio's local models in pi's /model
+  home.file.".pi/agent/extensions/lmstudio.ts".source = ./pi/lmstudio.ts;
+
   dconf.settings."org/gnome/desktop/input-sources".sources = [
     (lib.hm.gvariant.mkTuple [ "xkb" "de+mac" ])
   ];
