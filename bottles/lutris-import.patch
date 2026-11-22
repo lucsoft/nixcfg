@@ -138,10 +138,10 @@ index 619a5be..08a807f 100644
                  return Result(
 diff --git a/bottles/backend/managers/lutris.py b/bottles/backend/managers/lutris.py
 new file mode 100644
-index 0000000..5084bf3
+index 0000000..ca548d2
 --- /dev/null
 +++ b/bottles/backend/managers/lutris.py
-@@ -0,0 +1,480 @@
+@@ -0,0 +1,482 @@
 +# lutris.py
 +#
 +# This program is free software: you can redistribute it and/or modify
@@ -182,6 +182,7 @@ index 0000000..5084bf3
 +from bottles.backend.utils.lutris import (
 +    PREFIX_VAR,
 +    menu_spec,
++    wine_args,
 +    expand,
 +    winetricks_dependencies,
 +)
@@ -520,6 +521,7 @@ index 0000000..5084bf3
 +        args = self.resolve(str(params.get("args", "")))
 +        env = {str(k): str(v) for k, v in self.resolve(params.get("env") or {}).items()}
 +        self.activity(os.path.basename(executable))
++        args = wine_args(args)
 +        self.log(f"Running {executable} {args}".strip())
 +
 +        if executable.lower() in WINE_BUILTINS:
@@ -636,10 +638,10 @@ index 6581b6e..9623362 100644
    'versioning.py',
 diff --git a/bottles/backend/utils/lutris.py b/bottles/backend/utils/lutris.py
 new file mode 100644
-index 0000000..8ab0604
+index 0000000..5bb76e7
 --- /dev/null
 +++ b/bottles/backend/utils/lutris.py
-@@ -0,0 +1,447 @@
+@@ -0,0 +1,461 @@
 +# lutris.py
 +#
 +# This program is free software: you can redistribute it and/or modify
@@ -666,6 +668,7 @@ index 0000000..8ab0604
 +
 +import os
 +import re
++import shlex
 +from dataclasses import dataclass, field
 +from typing import Any
 +
@@ -1087,6 +1090,19 @@ index 0000000..8ab0604
 +    if all(c in available for c in candidates):
 +        return candidates
 +    return None
++
++
++def wine_args(args: str) -> str:
++    """
++    Lutris hands wineexec args to wine as an argument list, while Bottles
++    pastes them into a shell command line. Split them like a shell would,
++    but keep backslashes literal (they are Windows paths here), and quote
++    each one so redirections and backslashes reach the Windows program.
++    """
++    lexer = shlex.shlex(args, posix=True)
++    lexer.whitespace_split = True
++    lexer.escape = ""
++    return " ".join(shlex.quote(arg) for arg in lexer)
 diff --git a/bottles/backend/utils/meson.build b/bottles/backend/utils/meson.build
 index 0ec6e58..8c04ece 100644
 --- a/bottles/backend/utils/meson.build
@@ -1303,10 +1319,10 @@ index 8a6d516..45085a7 100644
      def __installed(self):
 diff --git a/bottles/tests/backend/utils/test_lutris.py b/bottles/tests/backend/utils/test_lutris.py
 new file mode 100644
-index 0000000..534e01b
+index 0000000..4bac31d
 --- /dev/null
 +++ b/bottles/tests/backend/utils/test_lutris.py
-@@ -0,0 +1,191 @@
+@@ -0,0 +1,200 @@
 +import pytest
 +
 +from bottles.backend.utils import lutris
@@ -1498,3 +1514,12 @@ index 0000000..534e01b
 +    ]
 +    assert [s.get("input") for s in converted.manifest["Steps"]] == ["lang", "input1"]
 +    assert converted.warnings == []
++
++
++def test_wine_args_keep_backslashes_and_shell_characters():
++    assert lutris.wine_args(r"/c echo hi > C:\Games\a.exe") == (
++        "/c echo hi '>' 'C:\\Games\\a.exe'"
++    )
++    assert lutris.wine_args(r'/SILENT /DIR="C:\Program Files\Foo"') == (
++        "/SILENT '/DIR=C:\\Program Files\\Foo'"
++    )
