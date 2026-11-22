@@ -175,6 +175,7 @@ in
     btop
     fastfetch
     claude-code
+    pi-coding-agent
     mprisence
 
     # claude-code paste a screenshot
