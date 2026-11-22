@@ -135,6 +135,7 @@ in
     claude-desktop
     epic-games-launcher
     resources
+    lmstudio
     gnome-boxes
     swtpm   # Boxes' session libvirtd looks for it on PATH, not the system one's
 
