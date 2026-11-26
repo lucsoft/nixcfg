@@ -227,6 +227,14 @@ in
   # Offers LM Studio's local models in pi's /model
   home.file.".pi/agent/extensions/lmstudio.ts".source = ./pi/lmstudio.ts;
 
+  # The OpenRouter key stays in the GNOME keyring, not in this public repo;
+  # pi asks for it on every request. Store it once with
+  # `secret-tool store --label="OpenRouter API key" service openrouter`.
+  home.file.".pi/agent/models.json".text = builtins.toJSON {
+    providers.openrouter.apiKey =
+      "!${pkgs.libsecret}/bin/secret-tool lookup service openrouter";
+  };
+
   dconf.settings."org/gnome/desktop/input-sources".sources = [
     (lib.hm.gvariant.mkTuple [ "xkb" "de+mac" ])
   ];
