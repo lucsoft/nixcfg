@@ -178,7 +178,7 @@ in
     # CLI
     btop
     fastfetch
-    claude-code
+    unstable.claude-code   # stable falls far behind upstream
     pi-coding-agent
     mprisence
 
