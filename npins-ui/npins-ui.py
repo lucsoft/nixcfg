@@ -89,6 +89,9 @@ def pin_version(pin):
             return segments[-2].removeprefix("nixos-")
     if kind == "Git":
         return pin.get("revision", "?")[:12]
+    if kind == "Tarball":
+        # Nothing but the hash tells one snapshot from the next.
+        return pin.get("hash", "?").removeprefix("sha256-")[:12]
     return pin.get("version") or pin.get("revision") or "?"
 
 
@@ -149,6 +152,13 @@ def probe_updates(lockfile, workdir):
     probe = Path(workdir) / "sources.json"
     shutil.copy(lockfile, probe)
     npins("update", lockfile=probe)
+    # A tarball pin on a moving URL (rex's snapshot.tar.gz) has no version
+    # for a plain update to compare, so npins keeps its hash even after the
+    # file behind the URL changed. --full re-fetches it.
+    moving = [name for name, pin in read_pins(probe).items()
+              if pin.get("type") == "Tarball" and not pin.get("frozen")]
+    if moving:
+        npins("update", "--full", *moving, lockfile=probe)
 
     before, after = read_pins(lockfile), read_pins(probe)
     updates = [
@@ -1875,6 +1885,20 @@ def commit_lockfile(repo, updates, changes=None):
          "--", LOCKFILE],
         check=True, capture_output=True, text=True,
     )
+
+
+HASH_MISMATCH = re.compile(r"hash mismatch in file downloaded from '([^']+)'")
+
+
+def stale_pin(error, pins):
+    """The pin whose URL now serves a file its hash does not match, if that
+    is what an evaluation failed on."""
+    found = HASH_MISMATCH.search(error)
+    if found:
+        for name, pin in pins.items():
+            if pin.get("url") == found.group(1):
+                return name
+    return None
 
 
 def describe_error(error):
@@ -4040,12 +4064,27 @@ class Window(Adw.ApplicationWindow):
         changes = self.detail.get("changes")
         if changes is not None:
             self.render_changes(changes)
-        elif self.detail.get("changes_error"):
+        elif error := self.detail.get("changes_error"):
             group = boxed_list()
-            group.append(Adw.ActionRow(
-                title="Cannot tell what this changes for you",
-                subtitle=self.detail["changes_error"].splitlines()[-1][:120],
-            ))
+            # Both evaluations read the repo's own lock file, so one stale
+            # hash in it fails them all; say which pin, not nix's last line.
+            stale = stale_pin(error, read_pins(self.lockfile))
+            if stale:
+                fix = ("Applying the update takes the new hash."
+                       if any(u["name"] == stale for u in self.updates)
+                       else f"npins update --full {stale} takes the new hash.")
+                group.append(Adw.ActionRow(
+                    title=f"{stale} no longer matches its download",
+                    subtitle="Its URL now serves a different file than the "
+                             "lock file records, so nothing can be evaluated "
+                             f"until the pin moves. {fix}",
+                    subtitle_lines=0,
+                ))
+            else:
+                group.append(Adw.ActionRow(
+                    title="Cannot tell what this changes for you",
+                    subtitle=error.splitlines()[-1][:120],
+                ))
             self.content.append(group)
 
         if self.content.get_first_child() is None:
@@ -4411,7 +4450,10 @@ class Window(Adw.ApplicationWindow):
         affected = sum(len(changes.get(key, [])) for key, _ in CATEGORIES)
         commits = sum(v["behind"] for k, v in self.detail.items()
                       if isinstance(v, dict) and v.get("behind"))
-        if commits and affected:
+        if commits and "changes" not in self.detail:
+            # The evaluation failed, so "none" would be a guess.
+            line = f"{commits} commits"
+        elif commits and affected:
             line = f"{affected} of your packages change, out of {commits} commits"
         elif commits:
             line = f"{commits} commits, none of them touch your packages"
