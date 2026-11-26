@@ -39,9 +39,9 @@
       },
       "branch": "main",
       "submodules": false,
-      "revision": "6b7088a2caec0218ceddee38097800afb9f37b04",
-      "url": "https://github.com/oxcl/nix-flake-helium-browser/archive/6b7088a2caec0218ceddee38097800afb9f37b04.tar.gz",
-      "hash": "sha256-XlujG//pSVsAnqOtL5OsogghW2pASLXmmB169fuKc8o="
+      "revision": "5ffc9e7498b8d893fa33122bb994249a723e788b",
+      "url": "https://github.com/oxcl/nix-flake-helium-browser/archive/5ffc9e7498b8d893fa33122bb994249a723e788b.tar.gz",
+      "hash": "sha256-cAJyi5Bzj0NmeG0Li2VvLFcAsM0Wf7VBHjCX+kj/nvY="
     },
     "home-manager": {
       "type": "Git",
@@ -52,21 +52,26 @@
       },
       "branch": "release-26.05",
       "submodules": false,
-      "revision": "5643e73425b85ac359ba2aaf83deae8ce1cd7968",
-      "url": "https://github.com/nix-community/home-manager/archive/5643e73425b85ac359ba2aaf83deae8ce1cd7968.tar.gz",
-      "hash": "sha256-Qkh6uNyMsic61gfyOO8VXnC+HEBdti6Xe2kKiMf66O0="
+      "revision": "6480d7d8533b88c78cc6dcda395ab89cd546e450",
+      "url": "https://github.com/nix-community/home-manager/archive/6480d7d8533b88c78cc6dcda395ab89cd546e450.tar.gz",
+      "hash": "sha256-XYoMPsqRFZ6jOaYI1KAAu8fzqif4tkCX8mhEKrViDXQ="
     },
     "nixpkgs": {
       "type": "Channel",
       "name": "nixos-26.05",
-      "url": "https://releases.nixos.org/nixos/26.05/nixos-26.05.14894.ab5c18fdedfc/nixexprs.tar.xz",
-      "hash": "sha256-xVwloUjz7paCDnvN5dkrasmAGV+O6uyRUPFHxv2w3VA="
+      "url": "https://releases.nixos.org/nixos/26.05/nixos-26.05.15079.0dc498bfe49b/nixexprs.tar.xz",
+      "hash": "sha256-RThZ6/XvhVczW74iClJaGo9+fXjvfm5mvvzTy6hrcYU="
     },
     "nixpkgs-unstable": {
       "type": "Channel",
       "name": "nixos-unstable",
-      "url": "https://releases.nixos.org/nixos/unstable/nixos-26.11pre1124497.0bb8272318b4/nixexprs.tar.xz",
-      "hash": "sha256-kqy60mdSH4GQAv3kzSeefteaiCv9arf3P+auosZrpo0="
+      "url": "https://releases.nixos.org/nixos/unstable/nixos-26.11pre1125864.2786a2a72088/nixexprs.tar.xz",
+      "hash": "sha256-pAEASBc6wof0S58XcSEdZoQ2iFQDkCnZwH+wFLrkd1Q="
+    },
+    "rex": {
+      "type": "Tarball",
+      "url": "https://pkgs.superlogical.com/rex/nix/snapshot.tar.gz",
+      "hash": "sha256-52aUJUzMub7btGorbGpbhW9vkuyM7jB7AxvbTVXdJ0w="
     },
     "steamos-manager": {
       "type": "GitRelease",
@@ -83,6 +88,19 @@
       "revision": "a0d399defebd60db30ba38325d9cf47dbda49bee",
       "url": "https://gitlab.steamos.cloud/api/v4/projects/holo%2Fsteamos-manager/repository/archive.tar.gz?sha=v26.4.1",
       "hash": "sha256-NVbYXZOd7+cUf0wDqptoHUBzHN/ukctcltir2axvAJo="
+    },
+    "xcl": {
+      "type": "Git",
+      "repository": {
+        "type": "GitHub",
+        "owner": "ivall",
+        "repo": "xcl"
+      },
+      "branch": "main",
+      "submodules": false,
+      "revision": "8b957bec6f82495aec940944c6bf47faa02db590",
+      "url": "https://github.com/ivall/xcl/archive/8b957bec6f82495aec940944c6bf47faa02db590.tar.gz",
+      "hash": "sha256-BuWPrZZ6iFuM1sMrlw+9nL8UEBm4zxIFbFe2IdBskNY="
     }
   },
   "version": 7
