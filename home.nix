@@ -136,6 +136,7 @@ in
     ardia
     claude-desktop
     the-knife
+    unstable.t3code   # stable is stuck at 0.0.24
     epic-games-launcher
     resources
     lmstudio
