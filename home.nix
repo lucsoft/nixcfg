@@ -41,6 +41,20 @@ let
 
   the-knife = pkgs.callPackage ./knife { };
 
+  # T3 Code calls its window com.t3tools.T3Code, while the package's
+  # launcher expects "t3code", so GNOME showed the open window as a second,
+  # unrelated app. Stable is stuck at 0.0.24, hence unstable.
+  t3code = pkgs.symlinkJoin {
+    inherit (unstable.t3code) name;
+    paths = [ unstable.t3code ];
+    postBuild = ''
+      rm $out/share/applications/t3code.desktop
+      sed 's/^StartupWMClass=.*/StartupWMClass=com.t3tools.T3Code/' \
+        ${unstable.t3code}/share/applications/t3code.desktop \
+        > $out/share/applications/t3code.desktop
+    '';
+  };
+
   widevineHint = builtins.toJSON {
     Path = "${pkgs.widevine-cdm}/share/google/chrome/WidevineCdm";
   };
@@ -136,7 +150,7 @@ in
     ardia
     claude-desktop
     the-knife
-    unstable.t3code   # stable is stuck at 0.0.24
+    t3code
     epic-games-launcher
     resources
     lmstudio
