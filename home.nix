@@ -39,6 +39,8 @@ let
 
   ardia = pkgs.callPackage ./ardia { };
 
+  the-knife = pkgs.callPackage ./knife { };
+
   widevineHint = builtins.toJSON {
     Path = "${pkgs.widevine-cdm}/share/google/chrome/WidevineCdm";
   };
@@ -133,6 +135,7 @@ in
     helium
     ardia
     claude-desktop
+    the-knife
     epic-games-launcher
     resources
     lmstudio
