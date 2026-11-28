@@ -1,5 +1,5 @@
 diff --git a/bottles/backend/managers/installer.py b/bottles/backend/managers/installer.py
-index 619a5be..08a807f 100644
+index 619a5be..05003a8 100644
 --- a/bottles/backend/managers/installer.py
 +++ b/bottles/backend/managers/installer.py
 @@ -29,8 +29,10 @@ import pycurl
@@ -88,15 +88,16 @@ index 619a5be..08a807f 100644
  
      def install(
          self,
-@@ -681,6 +704,7 @@ class InstallerManager:
+@@ -681,6 +704,8 @@ class InstallerManager:
          progress_fn: Optional[Callable[[Optional[float]], None]] = None,
          activity_fn: Optional[Callable[[Optional[str]], None]] = None,
          log_fn: Optional[Callable[[str], None]] = None,
 +        inputs: Optional[dict] = None,
++        cancel_event: Optional[threading.Event] = None,
      ):
          manifest = self.get_installer(installer[0])
          if not isinstance(manifest, dict):
-@@ -762,14 +786,31 @@ class InstallerManager:
+@@ -762,14 +787,32 @@ class InstallerManager:
          # execute steps
          if steps:
              logging.info("Executing installer steps")
@@ -116,6 +117,7 @@ index 619a5be..08a807f 100644
 +                    manifest["Lutris"],
 +                    self.__local_resources,
 +                    inputs=inputs,
++                    cancel_event=cancel_event,
 +                    progress_fn=progress_fn if is_final else None,
 +                    activity_fn=activity_fn if is_final else None,
 +                    log_fn=log_fn if is_final else None,
@@ -136,12 +138,30 @@ index 619a5be..08a807f 100644
              if not result.ok:
                  message = result.message or "Installer step failed."
                  return Result(
+@@ -888,10 +931,15 @@ class InstallerManager:
+                 config=config, key=_uuid, value=_program, scope="External_Programs"
+             )
+ 
+-        # create Desktop entry
++        # create Desktop entry; Lutris installs ask about it up front
++        desktop_entry = executable.get("desktop_entry", "portal")
++        if desktop_entry == "none":
++            return True
+         bottles_icons_path = os.path.join(ManagerUtils.get_bottle_path(config), "icons")
+         icon = executable.get("icon")
+         icon_path = os.path.join(bottles_icons_path, icon) if icon else ""
+-        ManagerUtils.create_desktop_entry(config, _program, False, icon_path)
++        ManagerUtils.create_desktop_entry(
++            config, _program, False, icon_path, use_portal=desktop_entry != "manual"
++        )
+ 
+         return True
 diff --git a/bottles/backend/managers/lutris.py b/bottles/backend/managers/lutris.py
 new file mode 100644
-index 0000000..ca548d2
+index 0000000..d648a7d
 --- /dev/null
 +++ b/bottles/backend/managers/lutris.py
-@@ -0,0 +1,482 @@
+@@ -0,0 +1,903 @@
 +# lutris.py
 +#
 +# This program is free software: you can redistribute it and/or modify
@@ -161,15 +181,19 @@ index 0000000..ca548d2
 +See bottles.backend.utils.lutris for the conversion itself.
 +"""
 +
++import bisect
 +import configparser
 +import hashlib
 +import json
 +import os
++import re
 +import shlex
 +import shutil
++import signal
 +import stat
 +import subprocess
 +import tempfile
++import threading
 +import urllib.request
 +from typing import Callable, Optional
 +
@@ -181,6 +205,8 @@ index 0000000..ca548d2
 +from bottles.backend.models.result import Result
 +from bottles.backend.utils.lutris import (
 +    PREFIX_VAR,
++    script_command,
++    script_steps,
 +    menu_spec,
 +    wine_args,
 +    expand,
@@ -202,6 +228,254 @@ index 0000000..ca548d2
 +    pass
 +
 +
++# region process watching
++
++# Wine's own background processes, never what a step is waiting on.
++WINE_SERVICES = {
++    "conhost.exe", "explorer.exe", "plugplay.exe", "rpcss.exe", "rundll32.exe",
++    "services.exe", "start.exe", "svchost.exe", "tabtip.exe", "winedevice.exe",
++    "wineboot.exe", "winemenubuilder.exe", "wineserver",
++}
++SHELLS = {"bash", "sh", "dash", "env", "timeout", "xargs", "nice"}
++CANCELLED = "The installation was aborted."
++
++# Files smaller than this finish too fast to be worth a progress bar.
++MIN_TRACKED_SIZE = 4 << 20
++
++
++def _children() -> dict[int, list[int]]:
++    children: dict[int, list[int]] = {}
++    for entry in os.listdir("/proc"):
++        if not entry.isdigit():
++            continue
++        try:
++            with open(f"/proc/{entry}/stat", encoding="utf-8", errors="replace") as f:
++                # comm may hold spaces and parentheses; ppid follows the last ")"
++                ppid = int(f.read().rsplit(")", 1)[1].split()[1])
++        except (OSError, IndexError, ValueError):
++            continue
++        children.setdefault(ppid, []).append(int(entry))
++    return children
++
++
++def _descendants(pid: int, children: dict[int, list[int]]) -> list[int]:
++    """Breadth first, so the deepest processes come last."""
++    found, queue = [], list(children.get(pid, []))
++    while queue:
++        child = queue.pop(0)
++        found.append(child)
++        queue.extend(children.get(child, []))
++    return found
++
++
++def _process_name(pid: int) -> Optional[str]:
++    """What a process runs, as the user would name it; None for plumbing."""
++    try:
++        with open(f"/proc/{pid}/cmdline", "rb") as f:
++            args = [a.decode(errors="replace") for a in f.read().split(b"\0") if a]
++        with open(f"/proc/{pid}/comm", encoding="utf-8", errors="replace") as f:
++            comm = f.read().strip()
++    except OSError:
++        return None
++    for arg in args:
++        if arg.lower().endswith(".exe"):
++            name = arg.replace("\\", "/").rsplit("/", 1)[-1]
++            return None if name.lower() in WINE_SERVICES else name
++    if comm in SHELLS or comm in WINE_SERVICES or comm.startswith("wine"):
++        return None
++    return comm
++
++
++def _read_progress(pid: int) -> Optional[tuple[str, float]]:
++    """
++    How far a process has read into the biggest file it has open
++    read-only, the way progress(1) works it out from fdinfo.
++    """
++    best = None
++    try:
++        fds = os.listdir(f"/proc/{pid}/fd")
++    except OSError:
++        return None
++    for fd in fds:
++        try:
++            target = os.readlink(f"/proc/{pid}/fd/{fd}")
++            if not target.startswith("/"):
++                continue
++            with open(f"/proc/{pid}/fdinfo/{fd}", encoding="utf-8") as f:
++                info = dict(
++                    line.split(":", 1) for line in f.read().splitlines() if ":" in line
++                )
++            if int(info["flags"].strip(), 8) & os.O_ACCMODE != os.O_RDONLY:
++                continue
++            pos = int(info["pos"])
++            st = os.stat(target)
++        except (OSError, KeyError, ValueError):
++            continue
++        if not stat.S_ISREG(st.st_mode) or st.st_size < MIN_TRACKED_SIZE:
++            continue
++        if best is None or st.st_size > best[2]:
++            best = (target, pos, st.st_size)
++    if best is None:
++        return None
++    return os.path.basename(best[0]), min(1.0, best[1] / best[2])
++
++
++class ProcessWatcher:
++    """
++    While a step runs, show which program its child processes are running
++    and, where one reads a big file, how far it has got.
++    """
++
++    def __init__(self, activity_fn=None, progress_fn=None, interval: float = 0.5,
++                 cancel_event: Optional[threading.Event] = None, describe=None):
++        # describe(names, progress) -> (text, fraction) replaces the default
++        # "deepest program +others" text, e.g. for scripts.
++        self.describe = describe
++        self.activity_fn = activity_fn
++        self.progress_fn = progress_fn
++        self.cancel_event = cancel_event
++        self.interval = interval
++        self.stop = threading.Event()
++        self.thread = threading.Thread(target=self.__run, daemon=True)
++        self.before: set[int] = set()
++        self.last_text: Optional[str] = None
++        self.last_fraction: Optional[float] = None
++
++    def __enter__(self):
++        self.before = set(_descendants(os.getpid(), _children()))
++        self.thread.start()
++        return self
++
++    def __exit__(self, *_exc):
++        self.stop.set()
++        self.thread.join()
++        if self.last_fraction is not None and self.progress_fn:
++            self.progress_fn(None)
++
++    def __run(self):
++        while not self.stop.wait(self.interval):
++            if self.cancel_event is not None and self.cancel_event.is_set():
++                self.kill()
++                continue
++            try:
++                self.poll()
++            except Exception as e:  # never let watching break an install
++                logging.warning(f"Process watcher: {e}")
++
++    def kill(self):
++        """End what the step started: TERM first, KILL what is left."""
++        for sig, wait in ((signal.SIGTERM, 2.0), (signal.SIGKILL, 0)):
++            pids = [
++                p
++                for p in _descendants(os.getpid(), _children())
++                if p not in self.before
++            ]
++            for pid in pids:
++                try:
++                    os.kill(pid, sig)
++                except OSError:
++                    pass
++            if not pids or self.stop.wait(wait):
++                return
++
++    def poll(self):
++        pids = [
++            p
++            for p in _descendants(os.getpid(), _children())
++            if p not in self.before
++        ]
++        names: list[str] = []
++        progress = None
++        for pid in reversed(pids):
++            name = _process_name(pid)
++            if name and name not in names:
++                names.append(name)
++            progress = progress or _read_progress(pid)
++        if self.describe:
++            text, fraction = self.describe(names, progress)
++        elif not names:
++            return
++        else:
++            # The deepest program, plus how many others run alongside it.
++            text = f"{names[0]} ({progress[0]})" if progress else names[0]
++            if len(names) > 1:
++                text += f" +{len(names) - 1}"
++            fraction = progress[1] if progress else None
++        if text and text != self.last_text and self.activity_fn:
++            self.activity_fn(text)
++            self.last_text = text
++        if self.progress_fn and (
++            fraction is None
++            and self.last_fraction is not None
++            or fraction is not None
++            and abs(fraction - (self.last_fraction or -1)) >= 0.005
++        ):
++            self.progress_fn(fraction)
++            self.last_fraction = fraction
++
++
++class ScriptTrace:
++    """
++    Follow an execute script through bash's xtrace, sent to a pipe of its
++    own: which command runs and how many of the script's commands are left.
++    """
++
++    PREFIX = "PS4='+[${LINENO}] '; set -x\n"  # shifts the script down a line
++
++    def __init__(self, script: str):
++        self.wrapped = self.PREFIX + script
++        self.steps = script_steps(script)
++        self.read_fd, self.write_fd = os.pipe()
++        self.index = 0
++        self.command: Optional[str] = None
++        self.thread = threading.Thread(target=self.__read, daemon=True)
++
++    def run(self, argv, **kwargs) -> subprocess.CompletedProcess:
++        self.thread.start()
++        try:
++            proc = subprocess.Popen(
++                argv,
++                pass_fds=(self.write_fd,),
++                stdout=subprocess.PIPE,
++                stderr=subprocess.PIPE,
++                text=True,
++                **kwargs,
++            )
++        finally:
++            os.close(self.write_fd)  # so the reader sees EOF with the script
++        stdout, stderr = proc.communicate()
++        self.thread.join(timeout=5)
++        return subprocess.CompletedProcess(argv, proc.returncode, stdout, stderr)
++
++    def __read(self):
++        with os.fdopen(self.read_fd, encoding="utf-8", errors="replace") as trace:
++            for line in trace:
++                match = re.match(r"^\++\[(\d+)\] (.*)", line)
++                if not match:
++                    continue
++                number = int(match.group(1)) - 1
++                index = max(0, bisect.bisect_right(self.steps, number) - 1)
++                self.index = max(self.index, index)
++                self.command = script_command(match.group(2)) or self.command
++
++    @property
++    def left(self) -> int:
++        return len(self.steps) - self.index - 1
++
++    def describe(self, names, progress):
++        name = self.command or (names[0] if names else None)
++        text = name or ""
++        if name and progress:
++            text += f" ({progress[0]})"
++        if self.left > 0:
++            text = f"{text} +{self.left}".strip()
++        fraction = (self.index + (progress[1] if progress else 0)) / len(self.steps)
++        return text or None, fraction
++
++
++# endregion
++
++
 +class LutrisSession:
 +    """State shared by the steps of one Lutris install."""
 +
@@ -215,8 +489,10 @@ index 0000000..ca548d2
 +        progress_fn: Optional[Callable[[Optional[float]], None]] = None,
 +        activity_fn: Optional[Callable[[Optional[str]], None]] = None,
 +        log_fn: Optional[Callable[[str], None]] = None,
++        cancel_event: Optional[threading.Event] = None,
 +    ):
 +        self.manager = manager
++        self.cancel_event = cancel_event or threading.Event()
 +        self.config = config
 +        self.lutris = lutris
 +        self.local_resources = local_resources
@@ -237,6 +513,7 @@ index 0000000..ca548d2
 +        }
 +        self.variables["GAMEDIR"] = expand(lutris["gamedir"], self.variables)
 +        os.makedirs(self.variables["GAMEDIR"], exist_ok=True)
++        self._disc_counter = 0  # Tracks total discs inserted (not cleared on eject)
 +
 +    # region helpers
 +
@@ -280,6 +557,8 @@ index 0000000..ca548d2
 +    # endregion
 +
 +    def run(self, step: dict) -> Result:
++        if self.cancel_event.is_set():
++            return Result(False, message=CANCELLED)
 +        try:
 +            kind = step.get("kind")
 +            if kind == "files":
@@ -288,22 +567,45 @@ index 0000000..ca548d2
 +                self.__apply_config()
 +            elif kind == "command":
 +                name, params = next(iter(step["command"].items()))
-+                if name == "input_menu":
++                method_name = name.replace("-", "_")
++                if method_name == "input_menu":
 +                    self._cmd_input_menu(params, step.get("input", ""))
++                elif self.__reports_itself(method_name, params):
++                    getattr(self, f"_cmd_{method_name}")(params)
 +                else:
-+                    getattr(self, f"_cmd_{name}")(params)
++                    with ProcessWatcher(
++                        self.activity_fn, self.progress_fn, cancel_event=self.cancel_event
++                    ):
++                        getattr(self, f"_cmd_{method_name}")(params)
 +            else:
 +                raise LutrisStepError(f"Unknown Lutris step: {kind}")
-+        except LutrisStepError as e:
-+            self.log(str(e))
-+            return Result(False, message=str(e))
-+        except (OSError, subprocess.SubprocessError, ValueError) as e:
-+            message = f"Lutris step failed: {e}"
++        except (LutrisStepError, OSError, subprocess.SubprocessError, ValueError) as e:
++            if self.cancel_event.is_set():
++                return self.__aborted()
++            message = str(e) if isinstance(e, LutrisStepError) else f"Lutris step failed: {e}"
 +            self.log(message)
 +            return Result(False, message=message)
 +        finally:
 +            self.activity(None)
++        if self.cancel_event.is_set():
++            return self.__aborted()
 +        return Result(True)
++
++    @staticmethod
++    def __reports_itself(method_name: str, params) -> bool:
++        """Commands that tell the dialog more than the process watcher can."""
++        params = params if isinstance(params, dict) else {}
++        if method_name == "execute":
++            return bool(params.get("command"))
++        return method_name == "task" and params.get("name") == "winetricks"
++
++    def __aborted(self) -> Result:
++        self.log(CANCELLED)
++        try:
++            WineServer(self.config).kill()
++        except (OSError, subprocess.SubprocessError):
++            pass
++        return Result(False, message=CANCELLED)
 +
 +    # region files
 +
@@ -330,6 +632,8 @@ index 0000000..ca548d2
 +            done = 0
 +            with open(path, "wb") as out:
 +                while chunk := response.read(1 << 20):
++                    if self.cancel_event.is_set():
++                        raise LutrisStepError(CANCELLED)
 +                    out.write(chunk)
 +                    done += len(chunk)
 +                    if total and self.progress_fn:
@@ -429,8 +733,12 @@ index 0000000..ca548d2
 +        env["WINEPREFIX"] = self.prefix
 +        cwd = self.path(params["working_dir"]) if params.get("working_dir") else self.cache
 +
++        trace = None
 +        if params.get("command"):
-+            argv = ["bash", "-c", self.resolve(str(params["command"]))]
++            script = self.resolve(str(params["command"]))
++            trace = ScriptTrace(script)
++            argv = ["bash", "-c", trace.wrapped]
++            env["BASH_XTRACEFD"] = str(trace.write_fd)
 +            label = "shell command"
 +        else:
 +            program = self.path(params["file"])
@@ -439,9 +747,16 @@ index 0000000..ca548d2
 +
 +        self.activity(label)
 +        self.log(f"Running {' '.join(argv)}")
-+        proc = subprocess.run(
-+            argv, cwd=cwd, env=env, capture_output=True, text=True
-+        )
++        if trace is None:
++            proc = subprocess.run(argv, cwd=cwd, env=env, capture_output=True, text=True)
++        else:
++            with ProcessWatcher(
++                self.activity_fn,
++                self.progress_fn,
++                cancel_event=self.cancel_event,
++                describe=trace.describe,
++            ):
++                proc = trace.run(argv, cwd=cwd, env=env)
 +        for line in f"{proc.stdout}\n{proc.stderr}".splitlines():
 +            if line and self.log_fn:
 +                self.log_fn(line[:500])
@@ -505,6 +820,101 @@ index 0000000..ca548d2
 +        if params.get("id"):
 +            self.variables[f"INPUT_{params['id']}"] = str(choice)
 +
++    def _cmd_insert_disc(self, params):
++        self.log(f"DEBUG _cmd_insert_disc called with params: {params}")
++        params = params or {}
++        file_id = params.get("file") or params.get("src")
++        if not file_id:
++            raise LutrisStepError("insert-disc requires a 'file' or 'src' parameter.")
++
++        # Resolve the file path (ISO) using the same mechanism as extract
++        iso_path = self.path(file_id)
++        if not os.path.isfile(iso_path):
++            raise LutrisStepError(f"insert-disc: file not found: {iso_path}")
++
++        self.activity(os.path.basename(iso_path))
++        self.log(f"Inserting disc {iso_path} as D:")
++
++        # Extract ISO to a cache directory using 7z (patoolib has issues with ISOs)
++        disc_dir = tempfile.mkdtemp(prefix="disc-", dir=self.cache)
++        self.log(f"Extracting ISO {iso_path} to {disc_dir}")
++        try:
++            # Use 7z for reliable ISO extraction
++            result = subprocess.run(
++                ["7z", "x", iso_path, f"-o{disc_dir}", "-y"],
++                capture_output=True,
++                text=True,
++                timeout=300,
++            )
++            if result.returncode != 0:
++                shutil.rmtree(disc_dir, ignore_errors=True)
++                raise LutrisStepError(f"Failed to extract ISO: {result.stderr}")
++        except subprocess.TimeoutExpired:
++            shutil.rmtree(disc_dir, ignore_errors=True)
++            raise LutrisStepError("ISO extraction timed out")
++        except Exception as e:
++            shutil.rmtree(disc_dir, ignore_errors=True)
++            raise LutrisStepError(f"Failed to extract ISO: {e}")
++
++        # Map D: drive in Wine using dosdevices symlink (primary method)
++        # Wine reads drive mappings from <prefix>/dosdevices/<letter>:
++        dosdevices = os.path.join(self.prefix, "dosdevices")
++        os.makedirs(dosdevices, exist_ok=True)
++        d_drive = os.path.join(dosdevices, "d:")
++        if os.path.lexists(d_drive):
++            os.unlink(d_drive)
++        os.symlink(disc_dir, d_drive)
++        self.log(f"Mapped D: to {disc_dir} via dosdevices symlink")
++
++        # Also set registry key for compatibility (HKCU\Software\Wine\Drives)
++        reg = Reg(self.config)
++        reg.add(
++            key=r"Software\Wine\Drives",
++            value="d:",
++            data=disc_dir,
++            value_type="REG_SZ",
++        )
++        self.log(f"Set D: registry mapping to {disc_dir}")
++
++        # Store for eject_disc to clean up
++        if not hasattr(self, "_disc_dirs"):
++            self._disc_dirs = []
++        self._disc_dirs.append(disc_dir)
++
++        # Also store as variable for use in execute steps (DISC1, DISC2, etc.)
++        self._disc_counter += 1
++        disc_num = self._disc_counter
++        self.variables[f"DISC{disc_num}"] = disc_dir
++        self.log(f"DEBUG: Set variable DISC{disc_num} = {disc_dir}")
++        self.log(f"Disc {disc_num} available as $DISC{disc_num} = {disc_dir}")
++
++    def _cmd_eject_disc(self, params):
++        self.activity("Eject disc")
++        self.log("Ejecting disc (removing D: mapping)")
++
++        # Remove D: drive dosdevices symlink
++        dosdevices = os.path.join(self.prefix, "dosdevices")
++        d_drive = os.path.join(dosdevices, "d:")
++        if os.path.lexists(d_drive):
++            os.unlink(d_drive)
++            self.log("Removed D: dosdevices symlink")
++
++        # Remove D: drive registry mapping
++        reg = Reg(self.config)
++        reg.launch(
++            r"delete 'HKCU\Software\Wine\Drives' /v d: /f",
++            communicate=True,
++            minimal=True,
++            action_name="delete",
++        )
++        self.log("Removed D: registry mapping")
++
++        # Clean up extracted disc directories
++        if hasattr(self, "_disc_dirs"):
++            for disc_dir in self._disc_dirs:
++                shutil.rmtree(disc_dir, ignore_errors=True)
++            self._disc_dirs.clear()
++
 +    def _cmd_task(self, params):
 +        getattr(self, f"_task_{params['name']}")(params)
 +
@@ -546,21 +956,37 @@ index 0000000..ca548d2
 +
 +    def _task_winetricks(self, params):
 +        available = self.manager.supported_dependencies
++        units = []  # (dependency or None, winetricks verb)
 +        for verb in str(params.get("app", "")).split():
 +            deps = winetricks_dependencies(verb, available)
 +            if deps is None:
++                units.append((None, verb))
++            else:
++                units += [
++                    (dep, verb)
++                    for dep in deps
++                    if dep not in self.config.Installed_Dependencies
++                ]
++
++        # Show only what installs right now, plus how many are left.
++        for i, (dep, verb) in enumerate(units):
++            if self.cancel_event.is_set():
++                raise LutrisStepError(CANCELLED)
++            left = len(units) - i - 1
++            self.activity(f"{dep or verb} +{left}" if left else dep or verb)
++            if self.progress_fn:
++                self.progress_fn(i / len(units))
++            if dep is None:
 +                self.__winetricks(verb)
 +                continue
-+            for dep in deps:
-+                if dep in self.config.Installed_Dependencies:
-+                    continue
-+                self.activity(dep)
-+                self.log(f"Installing dependency {dep} for winetricks {verb}")
-+                res = self.manager.dependency_manager.install(
-+                    self.config, [dep, available.get(dep)]
-+                )
-+                if not res.ok:
-+                    raise LutrisStepError(res.message or f"Failed to install {dep}.")
++            self.log(f"Installing dependency {dep} for winetricks {verb}")
++            res = self.manager.dependency_manager.install(
++                self.config, [dep, available.get(dep)]
++            )
++            if not res.ok:
++                raise LutrisStepError(res.message or f"Failed to install {dep}.")
++        if units and self.progress_fn:
++            self.progress_fn(None)
 +
 +    def __winetricks(self, verb: str):
 +        winetricks = shutil.which("winetricks")
@@ -582,7 +1008,6 @@ index 0000000..ca548d2
 +        if wine:
 +            env["WINE"] = wine
 +            env["WINESERVER"] = os.path.join(os.path.dirname(wine), "wineserver")
-+        self.activity(f"winetricks {verb}")
 +        self.log(f"Running winetricks {verb}")
 +        proc = subprocess.run(
 +            [winetricks, "--unattended", verb], env=env, capture_output=True, text=True
@@ -606,6 +1031,22 @@ index 0000000..ca548d2
 +        Reg(self.config).launch(
 +            f"delete '{key}' /f", communicate=True, minimal=True, action_name="delete"
 +        )
++
++    def __wait_for(self, command: str, arguments: str = ""):
++        """Open a Wine tool and wait until the user closes it."""
++        self.activity("Waiting for you to close the window")
++        self.log(f"Running {command} {arguments}".strip())
++        result = WineCommand(
++            self.config, command=command, arguments=arguments, communicate=True
++        ).run()
++        if not result.ok:
++            raise LutrisStepError(result.message or f"{command} failed.")
++
++    def _task_winecfg(self, params):
++        self.__wait_for("winecfg")
++
++    def _task_joycpl(self, params):
++        self.__wait_for("control", "joy.cpl")
 +
 +    def _task_winekill(self, params):
 +        WineServer(self.config).stop()
@@ -638,10 +1079,10 @@ index 6581b6e..9623362 100644
    'versioning.py',
 diff --git a/bottles/backend/utils/lutris.py b/bottles/backend/utils/lutris.py
 new file mode 100644
-index 0000000..5bb76e7
+index 0000000..93156d7
 --- /dev/null
 +++ b/bottles/backend/utils/lutris.py
-@@ -0,0 +1,461 @@
+@@ -0,0 +1,681 @@
 +# lutris.py
 +#
 +# This program is free software: you can redistribute it and/or modify
@@ -670,7 +1111,7 @@ index 0000000..5bb76e7
 +import re
 +import shlex
 +from dataclasses import dataclass, field
-+from typing import Any
++from typing import Any, Optional
 +
 +from bottles.backend.utils import yaml
 +
@@ -687,6 +1128,8 @@ index 0000000..5bb76e7
 +    "execute",
 +    "extract",
 +    "input_menu",
++    "insert-disc",
++    "eject_disc",
 +    "merge",
 +    "move",
 +    "rename",
@@ -701,13 +1144,12 @@ index 0000000..5bb76e7
 +    "create_prefix",
 +    "delete_registry_key",
 +    "set_regedit",
++    "joycpl",
 +    "wineexec",
++    "winecfg",
 +    "winekill",
 +    "winetricks",
 +}
-+
-+# Tasks that only matter interactively; skipped with a warning.
-+SKIPPED_TASKS = {"winecfg", "joycpl"}
 +
 +# Winetricks verbs whose Bottles dependency has a different name.
 +# Verbs that are not listed here are tried under their own name first.
@@ -876,7 +1318,7 @@ index 0000000..5bb76e7
 +    return files
 +
 +
-+def _check_command(command: Any, errors: list[str], warnings: list[str]) -> bool:
++def _check_command(command: Any, errors: list[str], warnings: list[str], known_file_ids: set[str] | None = None) -> bool:
 +    """Validate one installer command; return whether it should run."""
 +    if not isinstance(command, dict) or len(command) != 1:
 +        errors.append(f"Malformed installer step: {command!r}")
@@ -889,9 +1331,6 @@ index 0000000..5bb76e7
 +
 +    if name == "task":
 +        task = (params or {}).get("name")
-+        if task in SKIPPED_TASKS:
-+            warnings.append(f"Skipping interactive task '{task}'.")
-+            return False
 +        if task not in SUPPORTED_TASKS:
 +            errors.append(f"Wine task '{task}' is not supported.")
 +            return False
@@ -900,6 +1339,24 @@ index 0000000..5bb76e7
 +        if not menu_options((params or {}).get("options")):
 +            errors.append("An input_menu step has no options.")
 +            return False
++
++    if name == "insert-disc":
++        # insert-disc must reference a known file-id
++        file_id = (params or {}).get("file") or (params or {}).get("src")
++        if not file_id:
++            errors.append("insert-disc requires a 'file' or 'src' parameter referencing a file id.")
++            return False
++        if not isinstance(file_id, str):
++            errors.append("insert-disc 'file'/'src' parameter must be a string (file id).")
++            return False
++        if known_file_ids is not None and file_id not in known_file_ids:
++            errors.append(f"insert-disc references unknown file id: '{file_id}'.")
++            return False
++
++    if name == "eject_disc":
++        # eject_disc takes no parameters
++        if params and len(params) > 0:
++            warnings.append("eject_disc does not take parameters; ignoring them.")
 +    return True
 +
 +
@@ -1007,8 +1464,11 @@ index 0000000..5bb76e7
 +    inputs: list[dict] = []
 +    if files:
 +        steps.append({"action": "lutris", "kind": "files"})
++    # Collect known file IDs for insert-disc validation
++    file_ids = {f.id for f in files}
++
 +    for command in script.get("installer") or []:
-+        if not _check_command(command, errors, warnings):
++        if not _check_command(command, errors, warnings, file_ids):
 +            continue
 +        step = {"action": "lutris", "kind": "command", "command": command}
 +        if "input_menu" in command:
@@ -1103,6 +1563,246 @@ index 0000000..5bb76e7
 +    lexer.whitespace_split = True
 +    lexer.escape = ""
 +    return " ".join(shlex.quote(arg) for arg in lexer)
++
++
++def _file_name(value: Any, files: dict[str, dict]) -> str:
++    """A file id or path as the user would recognise it."""
++    value = str(value or "")
++    f = files.get(value)
++    if f:
++        return f["filename"] or f["label"] or value
++    return os.path.basename(value.replace("\\", "/").rstrip("/")) or value
++
++
++# Wrappers in front of the program a one-line command runs.
++_COMMAND_WRAPPERS = {"env", "exec", "wine", "wine64", "nice", "timeout"}
++
++
++def _single_program(command: str) -> str | None:
++    """The program a command runs, when it is one plain command line."""
++    command = command.strip()
++    if not command or "\n" in command:
++        return None
++    if any(op in command for op in (";", "&", "|", "`", "$(", "<", ">")):
++        return None
++    try:
++        args = shlex.split(command)
++    except ValueError:
++        return None
++    for arg in args:
++        if re.match(r"^\w+=", arg) or arg in _COMMAND_WRAPPERS or arg.startswith("-"):
++            continue
++        return arg
++    return None
++
++
++def _describe_command(command: dict, files: dict[str, dict]) -> tuple[str, str]:
++    name, params = next(iter(command.items()))
++    params = params if isinstance(params, dict) else {}
++    src = _file_name(params.get("file") or params.get("src"), files)
++
++    if name == "task":
++        task = params.get("name")
++        if task == "wineexec":
++            exe = _file_name(params.get("executable"), files)
++            if re.search(r"setup|install", exe, re.IGNORECASE):
++                return "Run installer", exe
++            return "Run program", exe
++        if task == "winetricks":
++            return "Install dependencies", ", ".join(str(params.get("app", "")).split())
++        if task == "winecfg":
++            return "Open Wine settings", "Waits until you close it"
++        if task == "joycpl":
++            return "Open controller settings", "Waits until you close it"
++        if task == "set_regedit":
++            return "Set registry key", str(params.get("key", ""))
++        if task == "delete_registry_key":
++            return "Remove registry key", ""
++        if task == "winekill":
++            return "Stop Wine", ""
++        return "Prepare Wine prefix", ""
++
++    if name == "execute":
++        if params.get("file"):
++            return "Run program", _file_name(params["file"], files)
++        program = _single_program(str(params.get("command", "")))
++        if program:
++            return "Run program", _file_name(program, files)
++        return "Run script", ""
++    if name == "extract":
++        return "Extract files", src
++    if name in ("copy", "merge"):
++        return "Copy files", src
++    if name in ("move", "rename"):
++        return "Move files", src
++    if name == "chmodx":
++        return "Make executable", _file_name(params or command[name], files)
++    if name in ("write_config", "write_json"):
++        return "Write config", _file_name(params.get("file"), files)
++    if name == "write_file":
++        return "Write file", _file_name(params.get("file"), files)
++    if name == "insert-disc":
++        return "Insert disc", src
++    if name == "eject_disc":
++        return "Eject disc", ""
++    return name, ""
++
++
++_INPUT_RE = re.compile(r"\$\{?INPUT_(\w+?)\}?(?![\w}])")
++
++
++def describe_steps(manifest: dict) -> list[dict]:
++    """
++    One entry per step_fn call InstallerManager.install makes for this
++    manifest, in order: the parameters, each step, then registering the
++    game. "hidden" entries are steps the dialog already asked about.
++    "inputs" lists the input_menu ids a step uses.
++    """
++    lutris = manifest["Lutris"]
++    files = {f["id"]: f for f in lutris["files"]}
++    entries = []
++
++    def add(title, subtitle="", hidden=False, inputs=()):
++        entries.append(
++            {"title": title, "subtitle": subtitle, "hidden": hidden, "inputs": list(inputs)}
++        )
++
++    if manifest.get("Parameters"):
++        add("Configure bottle", ", ".join(manifest["Parameters"]))
++
++    for step in manifest["Steps"]:
++        kind = step.get("kind")
++        if kind == "files":
++            downloads = [f["filename"] for f in lutris["files"] if f["url"]]
++            add("Download files", ", ".join(downloads), hidden=not downloads)
++        elif kind == "config":
++            add("Apply Wine settings", "")
++        else:
++            command = step["command"]
++            if "input_menu" in command:
++                add("", hidden=True)
++                continue
++            title, subtitle = _describe_command(command, files)
++            # Lutris shows a command's description as its status line.
++            params = next(iter(command.values()))
++            if isinstance(params, dict) and params.get("description"):
++                title = str(params["description"]).strip()
++            used = dict.fromkeys(m.group(1) for m in _INPUT_RE.finditer(str(command)))
++            add(title, subtitle, inputs=used)
++
++    add("Add to library", manifest["Executable"]["file"])
++    return entries
++
++
++# Shell keywords and builtins that are never what a script step "runs".
++_SCRIPT_NOISE = {
++    "[", "[[", ":", "cd", "echo", "export", "false", "for", "if", "local",
++    "printf", "read", "set", "shift", "test", "true", "while", "case",
++}
++_SCRIPT_CLOSERS = re.compile(r"(do|done|then|else|fi|esac|in|;;|[{}()])\s*;?")
++
++
++def _scan_line(line: str, quote: Optional[str]) -> tuple[str, Optional[str]]:
++    """
++    The parts of a line outside quotes and comments, and the quote still
++    open at its end. Enough shell to find where commands start.
++    """
++    outside, i = [], 0
++    while i < len(line):
++        c = line[i]
++        if quote == "'":
++            if c == "'":
++                quote = None
++        elif quote == '"':
++            if c == "\\":
++                i += 1
++            elif c == '"':
++                quote = None
++        elif c == "\\":
++            i += 1
++        elif c in "'\"":
++            quote = c
++        elif c == "#" and (i == 0 or line[i - 1].isspace()):
++            break
++        else:
++            outside.append(c)
++        i += 1
++    return "".join(outside), quote
++
++
++def script_steps(script: str) -> list[int]:
++    """Line numbers where a script's commands start, skipping blanks,
++    comments, continuations, multi-line strings, here-documents and lone
++    keywords."""
++    steps, heredoc, quote, continued = [], None, None, False
++    for number, raw in enumerate(script.splitlines(), 1):
++        if heredoc:
++            if raw.strip() == heredoc:
++                heredoc = None
++            continue
++        starts_inside = quote is not None or continued
++        outside, quote = _scan_line(raw, quote)
++        continued = quote is None and raw.rstrip().endswith("\\")
++        if re.search(r"(?<!<)<<(?!<)", outside):
++            # The delimiter may be quoted (<<'EOF'), so read it from the raw line.
++            match = re.search(r"(?<!<)<<-?\s*['\"]?(\w+)", raw)
++            heredoc = match.group(1) if match else None
++        line = outside.strip()
++        if starts_inside or not line or _SCRIPT_CLOSERS.fullmatch(line):
++            continue
++        steps.append(number)
++    return steps or [1]
++
++
++def script_command(traced: str) -> Optional[str]:
++    """The program in an xtrace line, as the user would name it."""
++    for word in traced.split():
++        word = word.strip("'\"")
++        if re.match(r"^\w+=", word) or word in ("env", "exec", "wine", "wine64", "nice"):
++            continue
++        if word in _SCRIPT_NOISE:
++            return None
++        return word.replace("\\", "/").rsplit("/", 1)[-1] or None
++    return None
+diff --git a/bottles/backend/utils/manager.py b/bottles/backend/utils/manager.py
+index 533d57f..f70569c 100644
+--- a/bottles/backend/utils/manager.py
++++ b/bottles/backend/utils/manager.py
+@@ -385,7 +385,12 @@ class ManagerUtils:
+         on_created=None,
+         on_failed=None,
+         on_cancelled=None,
++        use_portal: bool = True,
+     ):
++        """
++        use_portal=False writes the entry straight into the application
++        menu, without the portal's confirmation dialog.
++        """
+         icon = "com.usebottles.bottles-program"
+ 
+         if not skip_icon and not custom_icon:
+@@ -477,7 +482,7 @@ class ManagerUtils:
+             desktop_dir = GLib.get_user_special_dir(
+                 GLib.UserDirectory.DIRECTORY_DESKTOP
+             )
+-            if desktop_dir:
++            if desktop_dir and use_portal:
+                 desktop_path = os.path.join(desktop_dir, filename)
+                 try:
+                     with open(desktop_path, "w") as f:
+@@ -492,6 +497,12 @@ class ManagerUtils:
+ 
+             notify_created("manual", paths, "\n".join(errors))
+ 
++        if not use_portal:
++            if icon != "com.usebottles.bottles-program" and not os.path.exists(icon):
++                icon = "com.usebottles.bottles-program"
++            create_manual_fallback(icon)
++            return
++
+         portal_entry_state = ManagerUtils.get_portal_desktop_entry_state(
+             config, program
+         )
 diff --git a/bottles/backend/utils/meson.build b/bottles/backend/utils/meson.build
 index 0ec6e58..8c04ece 100644
 --- a/bottles/backend/utils/meson.build
@@ -1131,47 +1831,47 @@ index 26de77f..00499fc 100644
      $GtkModelButton btn_help {
        tooltip-text: _("Read Documentation");
        text: _("Documentation");
-diff --git a/bottles/frontend/ui/dialog-installer.blp b/bottles/frontend/ui/dialog-installer.blp
-index 280c21e..d6ae8e4 100644
---- a/bottles/frontend/ui/dialog-installer.blp
-+++ b/bottles/frontend/ui/dialog-installer.blp
-@@ -56,6 +56,11 @@ template $InstallerDialog: Adw.Window {
-         name: "page_resources";
- 
-         child: Adw.PreferencesPage {
-+          Adw.PreferencesGroup group_inputs {
-+            title: _("Options");
-+            visible: false;
-+          }
+diff --git a/bottles/frontend/ui/window.blp b/bottles/frontend/ui/window.blp
+index 190abcb..cd16423 100644
+--- a/bottles/frontend/ui/window.blp
++++ b/bottles/frontend/ui/window.blp
+@@ -113,6 +113,12 @@ Popover pop_add {
+     $GtkModelButton btn_install_umu {
+       text: _("Install a Game with UMU");
+     }
 +
-           Adw.PreferencesGroup group_resources {
-             description: _("This installer requires some local resources which cannot be provided otherwise.");
-           }
++    Separator {}
++
++    $GtkModelButton btn_install_lutris {
++      text: _("Install from Lutris Script…");
++    }
+   }
+ }
+ 
 diff --git a/bottles/frontend/views/bottle_installers.py b/bottles/frontend/views/bottle_installers.py
-index 94c719f..81291ed 100644
+index 94c719f..a3d3c7d 100644
 --- a/bottles/frontend/views/bottle_installers.py
 +++ b/bottles/frontend/views/bottle_installers.py
-@@ -16,14 +16,18 @@
+@@ -16,6 +16,7 @@
  #
  
  import time
 +from gettext import gettext as _
  
--from gi.repository import Adw, GLib, Gtk
-+from gi.repository import Adw, Gio, GLib, Gtk
+ from gi.repository import Adw, GLib, Gtk
  
- from bottles.backend.models.config import BottleConfig
- from bottles.backend.models.result import Result
-+from bottles.backend.utils import lutris
+@@ -24,6 +25,10 @@ from bottles.backend.models.result import Result
  from bottles.backend.utils.threading import RunAsync
  from bottles.frontend.utils.common import open_doc_url
  from bottles.frontend.widgets.installer import InstallerEntry
-+from bottles.frontend.windows.generic import TextDialog
-+from bottles.frontend.windows.installer import InstallerDialog
++from bottles.frontend.windows.lutris_installer import (
++    LutrisInstallerDialog,
++    choose_lutris_script,
++)
  
  
  @Gtk.Template(resource_path="/com/usebottles/bottles/details-installers.ui")
-@@ -34,6 +38,7 @@ class InstallersView(Adw.Bin):
+@@ -34,6 +39,7 @@ class InstallersView(Adw.Bin):
      # region Widgets
      list_installers = Gtk.Template.Child()
      btn_help = Gtk.Template.Child()
@@ -1179,7 +1879,7 @@ index 94c719f..81291ed 100644
      btn_toggle_search = Gtk.Template.Child()
      entry_search = Gtk.Template.Child()
      search_bar = Gtk.Template.Child()
-@@ -57,6 +62,7 @@ class InstallersView(Adw.Bin):
+@@ -57,6 +63,7 @@ class InstallersView(Adw.Bin):
  
          self.search_bar.set_key_capture_widget(self.window)
          self.btn_help.connect("clicked", open_doc_url, "bottles/installers")
@@ -1187,142 +1887,802 @@ index 94c719f..81291ed 100644
          self.entry_search.connect("changed", self.__search_installers)
  
      def __search_installers(self, *_args):
-@@ -141,3 +147,56 @@ class InstallersView(Adw.Bin):
+@@ -141,3 +148,16 @@ class InstallersView(Adw.Bin):
              return Result(True)
  
          RunAsync(process_installers, callback)
 +
 +    def __choose_lutris_script(self, *_args):
-+        filters = Gio.ListStore.new(Gtk.FileFilter)
-+        file_filter = Gtk.FileFilter()
-+        file_filter.set_name(_("Lutris Installers"))
-+        for pattern in ("*.yml", "*.yaml", "*.json", "*.lutris"):
-+            file_filter.add_pattern(pattern)
-+        filters.append(file_filter)
++        choose_lutris_script(self.window, self.__lutris_script_chosen)
 +
-+        dialog = Gtk.FileDialog.new()
-+        dialog.set_title(_("Select a Lutris Installer"))
-+        dialog.set_modal(True)
-+        dialog.set_filters(filters)
-+        dialog.open(self.window, None, self.__lutris_script_chosen)
++    def __lutris_script_chosen(self, converted, path):
++        if converted.entry["Arch"] != self.config.Arch:
++            self.window.show_toast(
++                _("This installer needs a {0} bottle.").format(converted.entry["Arch"])
++            )
++            return
++        LutrisInstallerDialog(
++            self.window, converted, path, config=self.config
++        ).present(self.window)
+diff --git a/bottles/frontend/windows/lutris_installer.py b/bottles/frontend/windows/lutris_installer.py
+new file mode 100644
+index 0000000..a015e91
+--- /dev/null
++++ b/bottles/frontend/windows/lutris_installer.py
+@@ -0,0 +1,703 @@
++# lutris_installer.py
++#
++# This program is free software: you can redistribute it and/or modify
++# it under the terms of the GNU General Public License as published by
++# the Free Software Foundation, in version 3 of the License.
++#
++# This program is distributed in the hope that it will be useful,
++# but WITHOUT ANY WARRANTY; without even the implied warranty of
++# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++# GNU General Public License for more details.
++#
++# You should have received a copy of the GNU General Public License
++# along with this program.  If not, see <http://www.gnu.org/licenses/>.
++#
++"""
++Install a game from a Lutris installer script: review what the script
++will do, collect files and choices up front, then show the same step
++list live while it runs. Without a bottle it creates one first.
++"""
 +
-+    def __lutris_script_chosen(self, dialog, result):
++import os
++import threading
++import urllib.parse
++from gettext import gettext as _
++from typing import Callable, Optional
++
++from gi.repository import Adw, Gdk, Gio, GLib, GObject, Gtk
++
++from bottles.backend.utils import lutris
++from bottles.backend.utils.threading import RunAsync
++from bottles.frontend.utils.gtk import GtkUtils
++from bottles.frontend.windows.generic import TextDialog
++from bottles.frontend.windows.installer import fetch_installer_icon
++
++LUTRIS_ICON_URL = "https://lutris.net/games/icon/{0}.png"
++
++def choose_lutris_script(
++    window, on_converted: Callable[[lutris.ConvertedScript, str], None]
++):
++    """Ask for a Lutris script and hand over the converted installer."""
++    filters = Gio.ListStore.new(Gtk.FileFilter)
++    file_filter = Gtk.FileFilter()
++    file_filter.set_name(_("Lutris Installers"))
++    for pattern in ("*.yml", "*.yaml", "*.json", "*.lutris"):
++        file_filter.add_pattern(pattern)
++    filters.append(file_filter)
++
++    def chosen(dialog, result):
 +        try:
 +            file = dialog.open_finish(result)
 +        except GLib.Error:
 +            return
 +        if not file or not file.get_path():
 +            return
-+
 +        path = file.get_path()
 +        try:
 +            with open(path, encoding="utf-8") as f:
 +                converted = lutris.convert(lutris.load(f.read()), source=path)
 +        except (OSError, UnicodeDecodeError, lutris.LutrisScriptError) as e:
 +            TextDialog(
-+                parent=self.window,
++                parent=window,
 +                title=_("Cannot Import Lutris Installer"),
 +                message=str(e),
 +            ).present()
 +            return
++        on_converted(converted, path)
 +
-+        if converted.entry["Arch"] != self.config.Arch:
-+            self.window.show_toast(
-+                _("This installer needs a {0} bottle.").format(converted.entry["Arch"])
-+            )
-+            return
++    dialog = Gtk.FileDialog.new()
++    dialog.set_title(_("Select a Lutris Installer"))
++    dialog.set_modal(True)
++    dialog.set_filters(filters)
++    dialog.open(window, None, chosen)
 +
-+        self.manager.installer_manager.register_local(
-+            converted.key, converted.manifest
++
++class StepRow(Adw.ActionRow):
++    """One step, with its state as the prefix icon."""
++
++    def __init__(self, number: int, title: str, subtitle: str = ""):
++        super().__init__(title=title, use_markup=False, subtitle_lines=1)
++        self.subtitle = subtitle
++
++        self.state = Gtk.Stack(width_request=24, valign=Gtk.Align.CENTER)
++        self.state.add_named(
++            Gtk.Label(label=str(number), css_classes=["dim-label", "numeric"]),
++            "pending",
 +        )
-+        installer = (converted.key, converted.entry)
-+        installer_dialog = InstallerDialog(self.window, self.config, installer)
-+        if converted.warnings:
-+            installer_dialog.status_init.set_description(
-+                "\n".join(converted.warnings)
-+                + "\n\n"
-+                + _("Do you want to proceed with the installation?")
-+            )
-+        installer_dialog.present()
-diff --git a/bottles/frontend/windows/installer.py b/bottles/frontend/windows/installer.py
-index 8a6d516..45085a7 100644
---- a/bottles/frontend/windows/installer.py
-+++ b/bottles/frontend/windows/installer.py
-@@ -116,6 +116,7 @@ class InstallerDialog(Adw.Window):
-     details_revealer = Gtk.Template.Child()
-     details_view = Gtk.Template.Child()
-     group_resources = Gtk.Template.Child()
-+    group_inputs = Gtk.Template.Child()
-     install_status_page = Gtk.Template.Child()
-     img_icon = Gtk.Template.Child()
-     img_icon_install = Gtk.Template.Child()
-@@ -133,6 +134,10 @@ class InstallerDialog(Adw.Window):
-         self.installer = installer
-         self.__sections = []
-         self.__steps = 0
-+        # Per dialog; the class attributes would be shared between dialogs.
-+        self.__local_resources = []
-+        self.__final_resources = {}
-+        self.__inputs = {}
-         self.__current_step = 0
-         self.__log_lines = []
-         self.__elapsed_source = None
-@@ -194,17 +199,40 @@ class InstallerDialog(Adw.Window):
-         self.__local_resources = self.manager.installer_manager.has_local_resources(
-             self.installer
-         )
--        if len(self.__local_resources) == 0:
-+        inputs = manifest.get("LutrisInputs") or []
-+        if len(self.__local_resources) == 0 and not inputs:
-             self.__install()
-             return
- 
-+        for spec in inputs:
-+            self.group_inputs.add(self.__input_row(spec))
-+        self.group_inputs.set_visible(bool(inputs))
++        spinner = Adw.Spinner() if hasattr(Adw, "Spinner") else Gtk.Spinner(spinning=True)
++        self.state.add_named(spinner, "running")
++        self.state.add_named(
++            Gtk.Image(icon_name="object-select-symbolic", css_classes=["success"]),
++            "done",
++        )
++        self.state.add_named(
++            Gtk.Image(icon_name="dialog-error-symbolic", css_classes=["error"]),
++            "failed",
++        )
++        self.add_prefix(self.state)
 +
-         for resource in self.__local_resources:
-             _entry = LocalResourceEntry(self, resource)
-             GLib.idle_add(self.group_resources.add, _entry)
-+        self.group_resources.set_visible(bool(self.__local_resources))
- 
-         self.btn_proceed.set_visible(True)
-+        self.btn_proceed.set_sensitive(not self.__local_resources)
-         self.stack.set_visible_child_name("page_resources")
- 
++        self.progress = Gtk.ProgressBar(
++            visible=False, valign=Gtk.Align.CENTER, width_request=80
++        )
++        self.add_suffix(self.progress)
++        self.set_subtitle(subtitle)
++
++    def set_subtitle(self, subtitle: str):
++        self.subtitle = subtitle
++        self.show_subtitle(subtitle)
++
++    def show_subtitle(self, text: Optional[str]):
++        """Show text without forgetting the step's own subtitle."""
++        text = (text or self.subtitle or "").strip().splitlines()
++        super().set_subtitle(text[0] if text else "")
++
++    def set_state(self, state: str):
++        self.state.set_visible_child_name(state)
++        if state != "running":
++            self.progress.set_visible(False)
++            self.show_subtitle(None)
++
++    def set_progress(self, fraction: Optional[float]):
++        self.progress.set_visible(fraction is not None)
++        if fraction is not None:
++            self.progress.set_fraction(max(0.0, min(1.0, fraction)))
++
++
++class LutrisInstallerDialog(Adw.Dialog):
++    def __init__(self, window, converted: lutris.ConvertedScript, source: str,
++                 config=None, **kwargs):
++        super().__init__(**kwargs)
++        self.window = window
++        self.manager = window.manager
++        self.converted = converted
++        self.manifest = converted.manifest
++        self.config = config
++        self.new_bottle = config is None
++        self.entries = lutris.describe_steps(self.manifest)
++
++        self.inputs: dict[str, str] = {}
++        self.input_labels: dict[str, str] = {}
++        self.resources: dict[str, str] = {}
++        self.install_rows: dict[int, StepRow] = {}
++        self.create_row: Optional[StepRow] = None
++        self.current = -1
++        self.log_lines: list[str] = []
++        self.cancel_event = threading.Event()
++        self.delete_on_abort = False
++        self.connect("close-attempt", self.__ask_abort)
++
++        name = self.manifest["Name"]
++        self.set_title(name)
++        self.set_content_width(520)
++        self.set_content_height(640)
++
++        files = self.manifest["Lutris"]["files"]
++        self.local_files = [f for f in files if f["url"] is None]
++        self.specs = self.manifest.get("LutrisInputs") or []
++
++        # Setup: bottle and options first, then the files, then installing.
++        self.nav = Adw.NavigationView()
++        self.btn_setup = None
++        self.btn_files = None
++        self.nav.add(self.__setup_page(name, source))
++        if self.local_files:
++            self.nav.add(self.__files_page(name, source))
++
++        self.stack = Gtk.Stack(transition_type=Gtk.StackTransitionType.CROSSFADE)
++        self.stack.add_named(self.nav, "setup")
++        self.stack.add_named(self.__run_view(name), "run")
++        self.set_child(self.stack)
++
++        self.__refresh_subtitles()
++        self.__validate()
++
++    # region setup
++
++    def __page(self, title: str, tag: str, content: Gtk.Widget, button: Gtk.Button,
++               cancel: bool) -> Adw.NavigationPage:
++        header = Adw.HeaderBar(show_end_title_buttons=False,
++                               show_start_title_buttons=False)
++        if cancel:
++            btn_cancel = Gtk.Button(label=_("Cancel"))
++            btn_cancel.connect("clicked", lambda *_: self.close())
++            header.pack_start(btn_cancel)
++        header.pack_end(button)
++        toolbar = Adw.ToolbarView(content=content)
++        toolbar.add_top_bar(header)
++        return Adw.NavigationPage(title=title, tag=tag, child=toolbar)
++
++    def __hero(self, name: str, source: str) -> Adw.PreferencesGroup:
++        hero = Adw.PreferencesGroup()
++        box = Gtk.Box(spacing=14)
++        icon = Gtk.Image(icon_name="applications-games-symbolic", pixel_size=64)
++        box.append(icon)
++        self.__fetch_icon(icon)
++        text = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, valign=Gtk.Align.CENTER)
++        text.append(Gtk.Label(label=name, xalign=0, wrap=True, css_classes=["title-2"]))
++        text.append(
++            Gtk.Label(label=os.path.basename(source), xalign=0, css_classes=["dim-label"])
++        )
++        box.append(text)
++        hero.add(box)
++        return hero
++
++    def __fetch_icon(self, image: Gtk.Image):
++        """The game's icon from lutris.net, if it has one for the slug."""
++        url = LUTRIS_ICON_URL.format(urllib.parse.quote(self.manifest["Lutris"]["slug"]))
++
++        def set_icon(data, error=None):
++            if error or not data:
++                return
++            try:
++                image.set_from_paintable(Gdk.Texture.new_from_bytes(GLib.Bytes.new(data)))
++            except GLib.Error:
++                pass
++
++        RunAsync(fetch_installer_icon, callback=set_icon, url=url)
++
++    def __notes(self) -> Optional[Adw.PreferencesGroup]:
++        if not self.converted.warnings:
++            return None
++        return Adw.PreferencesGroup(
++            title=_("Notes"), description="\n".join(self.converted.warnings)
++        )
++
++    def __setup_page(self, name: str, source: str) -> Adw.NavigationPage:
++        page = Adw.PreferencesPage()
++        page.add(self.__hero(name, source))
++
++        if self.new_bottle:
++            group = Adw.PreferencesGroup(title=_("New Bottle"))
++            self.entry_name = Adw.EntryRow(title=_("Name"), text=name)
++            self.entry_name.connect("changed", self.__validate)
++            group.add(self.entry_name)
++            self.runners = list(self.manager.runners_available)
++            self.combo_runner = Adw.ComboRow(
++                title=_("Runner"), model=Gtk.StringList.new(self.runners)
++            )
++            latest = self.manager.get_latest_runner()
++            if latest in self.runners:
++                self.combo_runner.set_selected(self.runners.index(latest))
++            group.add(self.combo_runner)
++            page.add(group)
++
++        group = Adw.PreferencesGroup(title=_("Options"))
++        for spec in self.specs:
++            group.add(self.__input_row(spec))
++        self.switch_menu = Adw.SwitchRow(
++            title=_("Add to App Menu"), active=True
++        )
++        group.add(self.switch_menu)
++        page.add(group)
++
++        if notes := self.__notes():
++            page.add(notes)
++
++        if self.local_files:
++            self.btn_setup = Gtk.Button(label=_("Next"), css_classes=["suggested-action"])
++            self.btn_setup.connect("clicked", lambda *_: self.nav.push_by_tag("files"))
++        else:
++            self.btn_setup = Gtk.Button(label=_("Install"), css_classes=["suggested-action"])
++            self.btn_setup.connect("clicked", self.__install)
++        return self.__page(_("Lutris Installer"), "setup", page, self.btn_setup, True)
++
++    def __files_page(self, name: str, source: str) -> Adw.NavigationPage:
++        page = Adw.PreferencesPage()
++        group = Adw.PreferencesGroup(
++            title=_("Your Files"),
++            description=_("The installer needs these files from you."),
++        )
++        for f in self.local_files:
++            group.add(self.__file_row(f))
++        page.add(group)
++
++        downloads = [f for f in self.manifest["Lutris"]["files"] if f["url"]]
++        if downloads:
++            group = Adw.PreferencesGroup(
++                title=_("Downloads"),
++                description=_("Fetched during the installation."),
++            )
++            for f in downloads:
++                group.add(
++                    Adw.ActionRow(
++                        title=f["filename"],
++                        subtitle=urllib.parse.urlsplit(f["url"]).hostname or "",
++                        use_markup=False,
++                    )
++                )
++            page.add(group)
++
++        self.btn_files = Gtk.Button(label=_("Install"), css_classes=["suggested-action"])
++        self.btn_files.connect("clicked", self.__install)
++        return self.__page(_("Files"), "files", page, self.btn_files, False)
++
++    def __file_row(self, f: dict) -> Adw.ActionRow:
++        row = Adw.ActionRow(title=f["label"], subtitle=_("No file chosen"))
++        check = Gtk.Image(
++            icon_name="object-select-symbolic", visible=False, css_classes=["success"]
++        )
++        button = Gtk.Button(
++            icon_name="document-open-symbolic",
++            tooltip_text=_("Choose File"),
++            valign=Gtk.Align.CENTER,
++            css_classes=["flat"],
++        )
++        row.add_suffix(check)
++        row.add_suffix(button)
++        row.set_activatable_widget(button)
++
++        def chosen(dialog, result):
++            try:
++                file = dialog.open_finish(result)
++            except GLib.Error:
++                return
++            if not file or not file.get_path():
++                return
++            self.resources[f["label"]] = file.get_path()
++            row.set_subtitle(file.get_path())
++            check.set_visible(True)
++            self.__refresh_subtitles()
++            self.__validate()
++
++        def choose(*_args):
++            dialog = Gtk.FileDialog.new()
++            dialog.set_title(f["label"])
++            dialog.set_modal(True)
++            dialog.open(self.get_root(), None, chosen)
++
++        button.connect("clicked", choose)
++        return row
++
 +    def __input_row(self, spec: dict) -> Adw.ComboRow:
-+        """A dropdown for one choice the installer asks for."""
 +        values = [value for value, _label in spec["options"]]
-+        row = Adw.ComboRow(
-+            title=spec["description"],
-+            model=Gtk.StringList.new([label for _value, label in spec["options"]]),
-+        )
++        labels = [label for _value, label in spec["options"]]
++        row = Adw.ComboRow(title=spec["description"], model=Gtk.StringList.new(labels))
 +        row.set_selected(values.index(spec["default"]))
-+        self.__inputs[spec["key"]] = spec["default"]
++        key = spec["key"]
++        self.inputs[key] = spec["default"]
++        self.input_labels[key] = labels[values.index(spec["default"])]
 +
 +        def changed(combo, _param):
-+            self.__inputs[spec["key"]] = values[combo.get_selected()]
++            self.inputs[key] = values[combo.get_selected()]
++            self.input_labels[key] = labels[combo.get_selected()]
++            self.__refresh_subtitles()
 +
 +        row.connect("notify::selected", changed)
 +        return row
 +
-     def __install(self, *_args):
-         self.set_deletable(False)
-         self.stack.set_visible_child_name("page_install")
-@@ -238,6 +266,7 @@ class InstallerDialog(Adw.Window):
-             progress_fn=self.update_progress,
-             activity_fn=self.update_activity,
-             log_fn=self.add_log,
-+            inputs=self.__inputs,
-         )
++    def __step_list(self, rows: dict[int, StepRow]) -> Gtk.ListBox:
++        listbox = Gtk.ListBox(
++            selection_mode=Gtk.SelectionMode.NONE, css_classes=["boxed-list"]
++        )
++        number = 1
++        if self.new_bottle:
++            self.create_row = StepRow(number, _("Create bottle"))
++            listbox.append(self.create_row)
++            number += 1
++        for i, entry in enumerate(self.entries):
++            if entry["hidden"]:
++                continue
++            row = StepRow(number, entry["title"], entry["subtitle"])
++            listbox.append(row)
++            rows[i] = row
++            number += 1
++        return listbox
++
++    def __refresh_subtitles(self):
++        """Steps show the files and choices picked above."""
++        for i, row in self.install_rows.items():
++            entry = self.entries[i]
++            used = [self.input_labels[k] for k in entry["inputs"]
++                    if k in self.input_labels]
++            if used:
++                row.set_subtitle(", ".join(used))
++            elif entry["subtitle"] in self.resources:
++                row.set_subtitle(os.path.basename(self.resources[entry["subtitle"]]))
++
++    def __validate(self, *_args):
++        setup_ok = True
++        if self.new_bottle:
++            name = self.entry_name.get_text().strip()
++            taken = name in self.manager.local_bottles
++            if taken:
++                self.entry_name.add_css_class("error")
++            else:
++                self.entry_name.remove_css_class("error")
++            setup_ok = bool(name) and not taken and bool(self.runners)
++        files_ok = all(f["label"] in self.resources for f in self.local_files)
++        if self.btn_setup:
++            self.btn_setup.set_sensitive(setup_ok)
++        if self.btn_files:
++            self.btn_files.set_sensitive(setup_ok and files_ok)
++
++    # endregion
++
++    # region install
++
++    def __run_view(self, name: str) -> Gtk.Widget:
++        """Installing and done, under a header of their own."""
++        self.run_title = Adw.WindowTitle(title=_("Installing {0}").format(name))
++        header = Adw.HeaderBar(
++            title_widget=self.run_title,
++            show_start_title_buttons=False,
++            show_end_title_buttons=False,
++        )
++        self.btn_log = Gtk.ToggleButton(label=_("Log"))
++        self.btn_close = Gtk.Button(label=_("Close"), visible=False)
++        self.btn_close.connect("clicked", lambda *_: self.close())
++        self.btn_abort = Gtk.Button(label=_("Abort"))
++        self.btn_abort.connect("clicked", self.__ask_abort)
++        header.pack_start(self.btn_close)
++        header.pack_start(self.btn_abort)
++        header.pack_end(self.btn_log)
++        self.progress = Gtk.ProgressBar(css_classes=["osd"])
++
++        self.run_stack = Gtk.Stack(transition_type=Gtk.StackTransitionType.CROSSFADE)
++        self.run_stack.add_named(self.__install_page(), "install")
++        self.run_stack.add_named(self.__done_page(name), "done")
++        toolbar = Adw.ToolbarView(content=self.run_stack)
++        toolbar.add_top_bar(header)
++        toolbar.add_top_bar(self.progress)
++        return toolbar
++
++    def __install_page(self) -> Gtk.Widget:
++        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
++        box.set_margin_top(12)
++        box.set_margin_bottom(12)
++        box.set_margin_start(12)
++        box.set_margin_end(12)
++        self.install_list = self.__step_list(self.install_rows)
++        box.append(self.install_list)
++
++        self.log_view = Gtk.TextView(
++            editable=False,
++            cursor_visible=False,
++            monospace=True,
++            wrap_mode=Gtk.WrapMode.WORD_CHAR,
++            top_margin=8,
++            bottom_margin=8,
++            left_margin=8,
++            right_margin=8,
++        )
++        scrolled_log = Gtk.ScrolledWindow(
++            height_request=180, child=self.log_view, css_classes=["card"]
++        )
++        revealer = Gtk.Revealer(child=scrolled_log)
++        self.btn_log.bind_property(
++            "active", revealer, "reveal-child", GObject.BindingFlags.SYNC_CREATE
++        )
++        box.append(revealer)
++
++        clamp = Adw.Clamp(maximum_size=600, child=box)
++        return Gtk.ScrolledWindow(
++            child=clamp, hscrollbar_policy=Gtk.PolicyType.NEVER
++        )
++
++    def __done_page(self, name: str) -> Gtk.Widget:
++        self.status_done = Adw.StatusPage(
++            icon_name="selection-mode-symbolic", title=_("Installed")
++        )
++        button = Gtk.Button(
++            label=_("Show Programs"),
++            halign=Gtk.Align.CENTER,
++            css_classes=["pill", "suggested-action"],
++        )
++        button.connect("clicked", self.__show_programs)
++        self.status_done.set_child(button)
++        return self.status_done
++
++    def __install(self, *_args):
++        self.set_can_close(False)
++        self.__refresh_subtitles()
++        self.stack.set_visible_child_name("run")
++
++        if not self.new_bottle:
++            self.__start_install()
++            return
++
++        name = self.entry_name.get_text().strip()
++        self.create_row.set_state("running")
++        RunAsync(
++            task_func=self.manager.create_bottle,
++            callback=self.__created,
++            name=name,
++            environment="gaming",
++            runner=self.runners[self.combo_runner.get_selected()],
++            arch=self.manifest["Arch"],
++            dxvk=self.manager.dxvk_available[0] if self.manager.dxvk_available else False,
++            fn_logger=self.__creation_log,
++            cancel_event=self.cancel_event,
++        )
++
++    @GtkUtils.run_in_main_loop
++    def __creation_log(self, text: str):
++        text = text.strip()
++        if text:
++            self.create_row.show_subtitle(text)
++            self.__log(text)
++
++    @GtkUtils.run_in_main_loop
++    def __created(self, result, error=None):
++        config = (result.data or {}).get("config") if result else None
++        if self.cancel_event.is_set():
++            if config and result.status:
++                self.manager.check_bottles()
++                self.config = self.manager.local_bottles.get(config.Name, config)
++            self.__aborted()
++            return
++        if error or not result or not result.status or not config:
++            self.__fail(self.create_row, _("The bottle could not be created."))
++            return
++        self.manager.check_bottles()
++        # check_bottles reloads every config; install into the one the UI holds.
++        self.config = self.manager.local_bottles.get(config.Name, config)
++        self.window.page_list.update_bottles_list()
++        self.create_row.set_state("done")
++        self.__start_install()
++
++    def __start_install(self):
++        im = self.manager.installer_manager
++        self.manifest["Executable"]["desktop_entry"] = (
++            "manual" if self.switch_menu.get_active() else "none"
++        )
++        im.register_local(self.converted.key, self.manifest)
++        RunAsync(
++            task_func=im.install,
++            callback=self.__finished,
++            config=self.config,
++            installer=(self.converted.key, self.converted.entry),
++            step_fn=self.__next_step,
++            local_resources=self.resources,
++            progress_fn=self.__step_progress,
++            activity_fn=self.__step_activity,
++            log_fn=self.__log_threadsafe,
++            inputs=self.inputs,
++            cancel_event=self.cancel_event,
++        )
++
++    def __total(self) -> int:
++        return len(self.entries) + (1 if self.new_bottle else 0)
++
++    def __completed(self) -> int:
++        return max(self.current, 0) + (1 if self.new_bottle else 0)
++
++    def __overall(self, fraction: float = 0.0):
++        self.progress.set_fraction((self.__completed() + fraction) / self.__total())
++
++    @GtkUtils.run_in_main_loop
++    def __next_step(self, *_args):
++        if row := self.install_rows.get(self.current):
++            row.set_state("done")
++        self.current += 1
++        if row := self.install_rows.get(self.current):
++            row.set_state("running")
++            row.grab_focus()
++        self.__overall()
++
++    @GtkUtils.run_in_main_loop
++    def __step_progress(self, fraction: Optional[float]):
++        if row := self.install_rows.get(self.current):
++            row.set_progress(fraction)
++        self.__overall(fraction or 0.0)
++
++    @GtkUtils.run_in_main_loop
++    def __step_activity(self, text: Optional[str]):
++        if row := self.install_rows.get(self.current):
++            row.show_subtitle(text)
++
++    def __log_threadsafe(self, line: str):
++        GLib.idle_add(self.__log, line)
++
++    def __log(self, line: str):
++        if not line:
++            return
++        self.log_lines = (self.log_lines + [line])[-300:]
++        buffer = self.log_view.get_buffer()
++        buffer.set_text("\n".join(self.log_lines))
++        self.log_view.scroll_to_iter(buffer.get_end_iter(), 0, False, 0, 0)
++
++    @GtkUtils.run_in_main_loop
++    def __finished(self, result, error=None):
++        if self.cancel_event.is_set():
++            self.__aborted()
++            return
++        if result is not None and result.ok and not error:
++            self.btn_abort.set_visible(False)
++            for row in self.install_rows.values():
++                row.set_state("done")
++            self.progress.set_fraction(1)
++            self.progress.set_visible(False)
++            self.btn_log.set_visible(False)
++            self.status_done.set_description(
++                _("{0} is now in the programs of “{1}”.").format(
++                    self.manifest["Name"], self.config.Name
++                )
++            )
++            self.run_title.set_title("")
++            self.run_stack.set_visible_child_name("done")
++            self.set_can_close(True)
++            self.__reload_programs()
++            return
++
++        message = str(error) if error else _("Installer failed unexpectedly")
++        if result is not None:
++            message = result.message or (result.data or {}).get("message") or message
++        row = self.install_rows.get(self.current)
++        if row is None:
++            # A hidden step failed; blame the next visible one.
++            row = next(
++                (r for i, r in sorted(self.install_rows.items()) if i > self.current),
++                None,
++            )
++        self.__fail(row, message)
++
++    def __fail(self, row: Optional[StepRow], message: str):
++        if row:
++            row.set_state("failed")
++            row.set_subtitle(message)
++        self.__log(message)
++        self.run_title.set_title(_("Installation Failed"))
++        self.btn_log.set_active(True)
++        self.btn_abort.set_visible(False)
++        self.btn_close.set_visible(True)
++        self.progress.set_visible(False)
++        self.set_can_close(True)
++
++    def __ask_abort(self, *_args):
++        if self.stack.get_visible_child_name() != "run" or self.cancel_event.is_set():
++            return
++        dialog = Adw.AlertDialog(
++            heading=_("Abort Installation?"),
++            body=_("The running step is stopped right away."),
++        )
++        dialog.add_response("continue", _("_Continue Installing"))
++        dialog.add_response("abort", _("_Abort"))
++        dialog.set_response_appearance("abort", Adw.ResponseAppearance.DESTRUCTIVE)
++        dialog.set_default_response("continue")
++        dialog.set_close_response("continue")
++
++        check = None
++        if self.new_bottle:
++            name = self.entry_name.get_text().strip()
++            check = Gtk.CheckButton(
++                label=_("Delete the bottle “{0}”").format(name),
++                active=True,
++                halign=Gtk.Align.CENTER,
++            )
++            dialog.set_extra_child(check)
++        else:
++            dialog.set_body(
++                _("The running step is stopped right away. Whatever the "
++                  "installer already put into the bottle stays there.")
++            )
++
++        def response(_dialog, response_id):
++            if response_id != "abort":
++                return
++            self.delete_on_abort = bool(check and check.get_active())
++            self.cancel_event.set()
++            self.btn_abort.set_sensitive(False)
++            self.btn_log.set_sensitive(False)
++            self.run_title.set_title(_("Aborting…"))
++            row = self.install_rows.get(self.current) or (
++                self.create_row if self.current < 0 else None
++            )
++            if row:
++                row.show_subtitle(_("Stopping…"))
++
++        dialog.connect("response", response)
++        dialog.present(self)
++
++    def __aborted(self):
++        if self.delete_on_abort and self.new_bottle and self.config is not None:
++            config = self.config
++            try:
++                self.window.page_list.disable_bottle(config)
++            except (KeyError, AttributeError):
++                pass
++            RunAsync(
++                self.manager.delete_bottle,
++                callback=lambda *_: self.window.page_list.update_bottles_list(),
++                config=config,
++            )
++        self.window.show_toast(_("Installation aborted"))
++        self.force_close()
++
++    def __reload_programs(self):
++        """Refresh the bottle's programs however the dialog gets closed."""
++        self.window.page_list.update_bottles_list()
++        details = self.window.page_details
++        shown = getattr(details, "config", None)
++        if shown is not None and shown.get("Name") == self.config.Name:
++            details.view_bottle.update_programs(config=self.config, force_update=True)
++
++    def __show_programs(self, *_args):
++        self.close()
++        if self.new_bottle:
++            self.window.show_details_view(config=self.config)
++        self.window.page_details.view_bottle.update_programs(
++            config=self.config, force_update=True
++        )
++        self.window.page_details.go_back_sidebar()
++
++    # endregion
+diff --git a/bottles/frontend/windows/meson.build b/bottles/frontend/windows/meson.build
+index d683720..d3dc99e 100644
+--- a/bottles/frontend/windows/meson.build
++++ b/bottles/frontend/windows/meson.build
+@@ -30,6 +30,7 @@ bottles_sources = [
+   'bulkupdate.py',
+   'sandbox.py',
+   'installer.py',
++  'lutris_installer.py',
+   'depscheck.py',
+   'exclusionpatterns.py',
+   'registry_rules.py',
+diff --git a/bottles/frontend/windows/window.py b/bottles/frontend/windows/window.py
+index 86fc884..ca670d8 100644
+--- a/bottles/frontend/windows/window.py
++++ b/bottles/frontend/windows/window.py
+@@ -50,6 +50,10 @@ from bottles.frontend.windows.crash import CrashReportDialog
+ from bottles.frontend.windows.depscheck import DependenciesCheckDialog
+ from bottles.frontend.windows.eagleintel import EagleIntelDialog
+ from bottles.frontend.windows.funding import FundingDialog
++from bottles.frontend.windows.lutris_installer import (
++    LutrisInstallerDialog,
++    choose_lutris_script,
++)
+ from bottles.frontend.windows.onboard import OnboardDialog
+ from bottles.frontend.windows.umu import (
+     UmuAddGameDialog,
+@@ -72,6 +76,7 @@ class BottlesWindow(Adw.ApplicationWindow):
+     btn_create_bottle = Gtk.Template.Child()
+     btn_create_direct = Gtk.Template.Child()
+     btn_install_umu = Gtk.Template.Child()
++    btn_install_lutris = Gtk.Template.Child()
+     btn_search = Gtk.Template.Child()
+     btn_donate = Gtk.Template.Child()
+     btn_noconnection = Gtk.Template.Child()
+@@ -194,6 +199,7 @@ class BottlesWindow(Adw.ApplicationWindow):
+         self.__update_add_button()
+         self.settings.connect("changed::show-umu", self.__update_add_button)
+         self.btn_install_umu.connect("clicked", self.show_umu_search)
++        self.btn_install_lutris.connect("clicked", self.show_lutris_install)
+         self.btn_search.connect("toggled", self.__toggle_search)
+         self.btn_noconnection.connect("clicked", self.check_for_connection)
+         self.banner_offline.connect("button-clicked", self.check_for_connection)
+@@ -520,9 +526,17 @@ class BottlesWindow(Adw.ApplicationWindow):
+         GLib.idle_add(self.__continue_startup_dialogs)
  
-     def __installed(self):
+     def __update_add_button(self, *_args):
+-        self.btn_add.set_visible_child_name(
+-            "umu" if self.settings.get_boolean("show-umu") else "bottle"
+-        )
++        # Always the menu: it also holds the Lutris entry.
++        self.btn_add.set_visible_child_name("umu")
++        self.btn_install_umu.set_visible(self.settings.get_boolean("show-umu"))
++
++    def show_lutris_install(self, *_args):
++        self.pop_add.popdown()
++
++        def converted(script, path):
++            LutrisInstallerDialog(self, script, path).present(self)
++
++        choose_lutris_script(self, converted)
+ 
+     def show_add_view(self, widget=False):
+         self.pop_add.popdown()
 diff --git a/bottles/tests/backend/utils/test_lutris.py b/bottles/tests/backend/utils/test_lutris.py
 new file mode 100644
-index 0000000..4bac31d
+index 0000000..de79f8f
 --- /dev/null
 +++ b/bottles/tests/backend/utils/test_lutris.py
-@@ -0,0 +1,200 @@
+@@ -0,0 +1,383 @@
 +import pytest
 +
 +from bottles.backend.utils import lutris
@@ -1391,8 +2751,8 @@ index 0000000..4bac31d
 +    assert manifest["LocalResources"] == ["Select the GOG installer"]
 +
 +    kinds = [s["kind"] for s in manifest["Steps"]]
-+    # winecfg is dropped, files come first and config last
-+    assert kinds == ["files"] + ["command"] * 4 + ["config"]
++    # files come first and config last
++    assert kinds == ["files"] + ["command"] * 5 + ["config"]
 +
 +    files = {f["id"]: f for f in manifest["Lutris"]["files"]}
 +    assert files["installer"]["url"] is None
@@ -1401,7 +2761,6 @@ index 0000000..4bac31d
 +    assert manifest["Lutris"]["env"] == {"DXVK_ASYNC": "1"}
 +    assert manifest["Lutris"]["gamedir"] == "$BOTTLE_PREFIX"
 +
-+    assert any("winecfg" in w for w in converted.warnings)
 +    assert any("lutris-GE-Proton8-26" in w for w in converted.warnings)
 +
 +
@@ -1444,7 +2803,6 @@ index 0000000..4bac31d
 +    "text,message",
 +    [
 +        ("runner: dosbox\nscript: {}", "dosbox"),
-+        ("game: {exe: drive_c/a.exe}\ninstaller:\n  - insert-disc: {}", "insert-disc"),
 +        ("game: {exe: drive_c/a.exe}\ninstaller:\n  - task: {name: dosexec}", "dosexec"),
 +        ("installer: []", "game.exe"),
 +        ("game: {exe: /usr/bin/true}", "outside the Wine prefix"),
@@ -1523,3 +2881,188 @@ index 0000000..4bac31d
 +    assert lutris.wine_args(r'/SILENT /DIR="C:\Program Files\Foo"') == (
 +        "/SILENT '/DIR=C:\\Program Files\\Foo'"
 +    )
++
++
++# --- insert-disc / eject_disc tests ---
++
++
++def test_insert_disc_accepted():
++    """insert-disc with a valid file reference should be accepted."""
++    text = """
++files:
++  - disc1: "N/A:Select disc 1"
++game: {exe: drive_c/a.exe}
++installer:
++  - insert-disc: {file: disc1}
++"""
++    converted = lutris.convert(lutris.load(text))
++    manifest = converted.manifest
++    steps = [s for s in manifest["Steps"] if s.get("kind") == "command"]
++    assert any("insert-disc" in s["command"] for s in steps)
++
++
++def test_eject_disc_accepted():
++    """eject_disc should be accepted (no parameters)."""
++    text = """
++files:
++  - disc1: "N/A:Select disc 1"
++game: {exe: drive_c/a.exe}
++installer:
++  - insert-disc: {file: disc1}
++  - eject_disc: {}
++"""
++    converted = lutris.convert(lutris.load(text))
++    manifest = converted.manifest
++    steps = [s for s in manifest["Steps"] if s.get("kind") == "command"]
++    commands = [list(s["command"].keys())[0] for s in steps]
++    assert "insert-disc" in commands
++    assert "eject_disc" in commands
++
++
++def test_insert_disc_unknown_file_id_rejected():
++    """insert-disc referencing an unknown file-id should be rejected."""
++    text = """
++files:
++  - disc1: "N/A:Select disc 1"
++game: {exe: drive_c/a.exe}
++installer:
++  - insert-disc: {file: nonexistent}
++"""
++    with pytest.raises(lutris.LutrisScriptError, match="insert-disc references unknown file id"):
++        lutris.convert(lutris.load(text))
++
++
++def test_insert_disc_missing_parameter_rejected():
++    """insert-disc without file/src parameter should be rejected."""
++    text = """
++files:
++  - disc1: "N/A:Select disc 1"
++game: {exe: drive_c/a.exe}
++installer:
++  - insert-disc: {}
++"""
++    with pytest.raises(lutris.LutrisScriptError, match="insert-disc requires a 'file' or 'src' parameter"):
++        lutris.convert(lutris.load(text))
++
++
++def test_insert_disc_with_src_parameter():
++    """insert-disc should accept 'src' as alias for 'file'."""
++    text = """
++files:
++  - disc1: "N/A:Select disc 1"
++game: {exe: drive_c/a.exe}
++installer:
++  - insert-disc: {src: disc1}
++"""
++    converted = lutris.convert(lutris.load(text))
++    manifest = converted.manifest
++    steps = [s for s in manifest["Steps"] if s.get("kind") == "command"]
++    assert any("insert-disc" in s["command"] for s in steps)
++
++
++def test_eject_disc_ignores_parameters():
++    """eject_disc should accept but warn about extra parameters."""
++    text = """
++files:
++  - disc1: "N/A:Select disc 1"
++game: {exe: drive_c/a.exe}
++installer:
++  - eject_disc: {foo: bar}
++"""
++    converted = lutris.convert(lutris.load(text))
++    manifest = converted.manifest
++    # Should have a warning about ignored parameters
++    assert any("eject_disc does not take parameters" in w for w in converted.warnings)
++    steps = [s for s in manifest["Steps"] if s.get("kind") == "command"]
++    assert any("eject_disc" in s["command"] for s in steps)
++
++def test_describe_steps():
++    text = """
++files:
++  - installer: "N/A:Select the GOG installer"
++  - patch: https://example.org/patch.zip
++game:
++  exe: drive_c/Game/game.exe
++installer:
++  - input_menu:
++      id: LANG
++      options:
++        - de: Deutsch
++        - en: English
++  - task:
++      name: wineexec
++      executable: installer
++  - write_config:
++      file: $GAMEDIR/drive_c/Game/game.ini
++      section: GAME
++      key: language
++      value: $INPUT_LANG
++  - task:
++      name: winecfg
++wine:
++  dxvk: true
++"""
++    manifest = lutris.convert(lutris.load(text), "game.yaml").manifest
++    steps = lutris.describe_steps(manifest)
++    # parameters, files, input_menu, wineexec, write_config, winecfg, register
++    assert len(steps) == 1 + len(manifest["Steps"]) + 1
++    assert [s["title"] for s in steps if not s["hidden"]] == [
++        "Configure bottle",
++        "Download files",
++        "Run installer",
++        "Write config",
++        "Open Wine settings",
++        "Add to library",
++    ]
++    assert steps[3]["subtitle"] == "Select the GOG installer"
++    assert steps[4]["inputs"] == ["LANG"]
++    assert steps[-1]["subtitle"] == "game.exe"
++
++
++def test_describe_execute_commands():
++    text = """
++game:
++  exe: drive_c/game.exe
++installer:
++  - execute:
++      command: WINEDLLOVERRIDES=d3d9=n wine "$GAMEDIR/drive_c/LaunchGame.exe" -silent
++  - execute:
++      command: |
++        cd "$GAMEDIR"
++        ./fix.sh
++      description: Apply the widescreen fix
++  - execute:
++      command: test -f a && rm a
++"""
++    manifest = lutris.convert(lutris.load(text), "game.yaml").manifest
++    steps = [(s["title"], s["subtitle"]) for s in lutris.describe_steps(manifest)]
++    assert steps[:3] == [
++        ("Run program", "LaunchGame.exe"),
++        ("Apply the widescreen fix", ""),
++        ("Run script", ""),
++    ]
++
++
++def test_script_steps():
++    script = """# prepare
++mkdir -p out
++for f in a b; do
++  echo "$f"
++done
++python -c "import time
++f = open('x', 'rb')
++while f.read(4<<20): pass"
++cat <<'END' > out/x.txt
++hello
++END
++cp a \\
++  b
++true
++"""
++    assert lutris.script_steps(script) == [2, 3, 4, 6, 9, 12, 14]
++
++
++def test_script_command():
++    assert lutris.script_command("WINEDEBUG=-all wine /g/LaunchGTAIV.exe -x") == "LaunchGTAIV.exe"
++    assert lutris.script_command("/nix/store/abc/bin/unshield -d out x a.cab") == "unshield"
++    assert lutris.script_command('echo "hi"') is None
